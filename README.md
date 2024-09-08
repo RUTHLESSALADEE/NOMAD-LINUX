@@ -7,4 +7,15 @@ Tabs:
 
 The program is set to request elevation since any commands that modify the routing table or a NIC are required to be run as an administrator. 
 
+NIC Tab:
+![image](https://github.com/user-attachments/assets/e37cd314-97d2-4cba-8dd0-3faa197ae232)
+
+Routing Table Tab:
+![image](https://github.com/user-attachments/assets/ce43098e-7e4b-420a-afb9-679cb0687f4b)
+
+MTU Tab:
+![image](https://github.com/user-attachments/assets/d9809bb0-f1e3-4d29-86b7-0aec12695b8b)
+
+
 Happy toubleshooting!
+
