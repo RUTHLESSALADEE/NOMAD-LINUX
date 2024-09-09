@@ -16,6 +16,7 @@ from PyQt5.QtGui import QTextCursor
 # Automatically request elevated privileges
 elevate()
 
+
 def get_nic_names():
     """Use netsh to get network interface names."""
     try:
