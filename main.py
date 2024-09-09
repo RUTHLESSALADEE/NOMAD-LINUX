@@ -535,9 +535,13 @@ class NICViewer(QWidget):
 
         # Entry for Maximum MTU
         self.max_mtu_input = QLineEdit(self)
+        self.max_mtu_input.setText("1500")  # Set default value
         self.min_mtu_input = QLineEdit(self)
+        self.min_mtu_input.setText("1100")  # Set default value
         self.remote_host_input = QLineEdit(self)
+        self.remote_host_input.setText("8.8.8.8")  # Set default value
         self.timeout_input = QLineEdit(self)
+        self.timeout_input.setText("2000")  # Set default value
 
         mtu_form_layout = QFormLayout()
         mtu_form_layout.addRow("Maximum MTU:", self.max_mtu_input)
@@ -895,9 +899,16 @@ class NICViewer(QWidget):
 
         # Entry for ping remote host
         self.ping_remote_host_input = QLineEdit(self)
+        self.ping_remote_host_input.setText("8.8.8.8")  # Set default value for remote host
+
         self.ping_timeout_input = QLineEdit(self)
+        self.ping_timeout_input.setText("2000")  # Set default value for timeout
+
         self.ping_size_input = QLineEdit(self)
+        self.ping_size_input.setText("32")  # Set default value for size
+
         self.ping_repeat_count_input = QLineEdit(self)
+        self.ping_repeat_count_input.setText("4")  # Set default value for repeat count
 
         # Initialize checkboxes with labels
         self.df_check = QCheckBox("DF", self)
@@ -919,7 +930,7 @@ class NICViewer(QWidget):
 
         # Debug output text area for showing ping results
         self.ping_output = QTextEdit(self)
-        self.ping_output.setReadOnly(True)  # Ping output goes here
+        self.ping_output.setReadOnly(True)
         ping_layout.addWidget(self.ping_output)
 
         # Add the form layout to the main ping layout
