@@ -261,7 +261,7 @@ class NICViewer(QWidget):
     def initUI(self):
         """Initialize the GUI components."""
         self.setWindowTitle('NIC Manager')
-        self.setGeometry(300, 300, 475, 500)
+        self.setGeometry(300, 300, 560, 500)
 
         layout = QVBoxLayout()
 
@@ -386,13 +386,15 @@ class NICViewer(QWidget):
         label = QLabel('Windows Routing Table:')
         routing_layout.addWidget(label)
 
-
         # Create a table widget to display the routing table
         self.routing_table_widget = QTableWidget()
-        self.routing_table_widget.setColumnCount(5)
+        self.routing_table_widget.setColumnCount(6)  # One extra column for the delete button
         self.routing_table_widget.setHorizontalHeaderLabels(
-            ['Network Destination', 'Netmask', 'Gateway', 'Interface', 'Metric'])
+            ['Network Destination', 'Netmask', 'Gateway', 'Interface', 'Metric', 'Delete'])
         routing_layout.addWidget(self.routing_table_widget)
+
+        # Enable table cells for editing
+        self.routing_table_widget.setEditTriggers(QTableWidget.DoubleClicked)
 
         # Create entry boxes for adding/deleting routes
         self.destination_input = QLineEdit(self)
@@ -408,20 +410,24 @@ class NICViewer(QWidget):
         route_form_layout.addRow("Metric:", self.metric_input)
         routing_layout.addLayout(route_form_layout)
 
-        # Add and Delete buttons
+        # Add, Delete, and Update buttons
         self.add_button = QPushButton("Add Route", self)
         self.delete_button = QPushButton("Delete Route", self)
         self.route_refresh_button = QPushButton("Refresh", self)
+        self.update_route_button = QPushButton("Update Route", self)
 
+        # Connect buttons to their respective functions
         self.add_button.clicked.connect(self.add_route)
         self.delete_button.clicked.connect(self.delete_route)
         self.route_refresh_button.clicked.connect(self.populate_routing_table)
+        self.update_route_button.clicked.connect(self.update_route_from_table)
 
         # Horizontal layout for buttons
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.add_button)
         button_layout.addWidget(self.delete_button)
         button_layout.addWidget(self.route_refresh_button)
+        button_layout.addWidget(self.update_route_button)
         routing_layout.addLayout(button_layout)
 
         self.routing_tab.setLayout(routing_layout)
@@ -429,12 +435,87 @@ class NICViewer(QWidget):
         # Populate the routing table when the tab is displayed
         self.populate_routing_table()
 
+    def update_route_from_table(self):
+        """Update a route from the table based on user-edited data."""
+        try:
+            # Get the currently selected row in the table
+            current_row = self.routing_table_widget.currentRow()
+            if current_row == -1:
+                raise ValueError("No route selected for updating.")
+
+            # Extract the current (before update) route details from the table
+            current_destination = self.routing_table_widget.item(current_row, 0).text()
+            current_netmask = self.routing_table_widget.item(current_row, 1).text()
+            current_gateway = self.routing_table_widget.item(current_row, 2).text()
+            current_metric = self.routing_table_widget.item(current_row, 4).text()
+
+            # Delete the route using the current details (before any update)
+            delete_command = f'route delete {current_destination} mask {current_netmask} {current_gateway}'
+            print(f"[DEBUG] Running command: {delete_command}")
+            result = subprocess.run(delete_command, capture_output=True, text=True, shell=True)
+
+            if result.returncode != 0:
+                raise Exception(f"Failed to delete route: {result.stderr}")
+
+            # Now, add the new route with updated values (user-modified)
+            new_destination = self.routing_table_widget.item(current_row, 0).text()
+            new_netmask = self.routing_table_widget.item(current_row, 1).text()
+            new_gateway = self.routing_table_widget.item(current_row, 2).text()
+            new_metric = self.routing_table_widget.item(current_row, 4).text()
+
+            # Add the updated route
+            add_command = f'route add {new_destination} mask {new_netmask} {new_gateway} metric {new_metric}'
+            print(f"[DEBUG] Running command: {add_command}")
+            result = subprocess.run(add_command, capture_output=True, text=True, shell=True)
+
+            if result.returncode != 0:
+                raise Exception(f"Failed to add new route: {result.stderr}")
+
+            print("[DEBUG] Route successfully updated")
+            QMessageBox.information(self, "Success", "Route successfully updated.")
+
+            # Refresh the routing table after updating the route
+            self.populate_routing_table()
+
+        except Exception as e:
+            print(f"[ERROR] Failed to update route: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to update route: {str(e)}")
+
+    def get_interface_id_from_ip(self, ip_address):
+        """Retrieve the interface ID based on the provided IP address."""
+        try:
+            print(f"[DEBUG] Retrieving interface ID for IP: {ip_address}")
+            output = subprocess.run(["route", "print"], capture_output=True, text=True).stdout
+            lines = output.splitlines()
+
+            # Look for the interface list
+            for i, line in enumerate(lines):
+                if "Interface List" in line:
+                    interface_list_start = i + 2  # Start after the header
+                    break
+
+            # Search for the IP address in the interface list and extract the interface ID
+            for line in lines[interface_list_start:]:
+                if ip_address in line:
+                    # Extract the interface ID (it's the first field in the line)
+                    parts = line.split()
+                    if len(parts) > 0:
+                        interface_id = parts[0]
+                        print(f"[DEBUG] Found interface ID: {interface_id} for IP: {ip_address}")
+                        return interface_id
+
+            print(f"[DEBUG] No interface ID found for IP: {ip_address}")
+            return None
+
+        except Exception as e:
+            print(f"[ERROR] Failed to retrieve interface ID: {e}")
+            return None
+
     def populate_routing_table(self):
         """Populate the routing table in the routing tab."""
         try:
             ipv4_table = get_routing_table()
 
-            # Filter and add routes to the table
             if ipv4_table:
                 self.routing_table_widget.setRowCount(len(ipv4_table))  # Set row count based on valid rows
                 row_index = 0
@@ -452,14 +533,50 @@ class NICViewer(QWidget):
                     self.routing_table_widget.setItem(row_index, 2, QTableWidgetItem(parts[2]))  # Gateway
                     self.routing_table_widget.setItem(row_index, 3, QTableWidgetItem(parts[3]))  # Interface
                     self.routing_table_widget.setItem(row_index, 4, QTableWidgetItem(parts[4]))  # Metric
+
+                    # Create a delete button for each row
+                    delete_button = QPushButton("Delete", self)
+                    delete_button.clicked.connect(lambda _, row=row_index: self.delete_route_by_row(row))
+                    self.routing_table_widget.setCellWidget(row_index, 5,
+                                                            delete_button)  # Add delete button to the last column
+
                     row_index += 1
 
-                    # Automatically resize columns to fit the contents
-                    self.routing_table_widget.resizeColumnsToContents()
+                # Automatically resize columns to fit the contents
+                self.routing_table_widget.resizeColumnsToContents()
 
         except Exception as e:
             print(f"[ERROR] Failed to populate routing table: {e}")
             QMessageBox.critical(self, "Error", f"Failed to populate routing table: {str(e)}")
+
+    def delete_route_by_row(self, row):
+        """Delete the route in the specified row."""
+        try:
+            # Get the details from the specified row
+            destination = self.routing_table_widget.item(row, 0).text()
+            netmask = self.routing_table_widget.item(row, 1).text()
+            gateway = self.routing_table_widget.item(row, 2).text()
+
+            if not destination or not netmask or not gateway:
+                raise ValueError("Network Destination, Netmask, and Gateway are required to delete a route.")
+
+            # Delete the route using the details from the row
+            delete_command = f'route delete {destination} mask {netmask} {gateway}'
+            print(f"[DEBUG] Running command: {delete_command}")
+            result = subprocess.run(delete_command, capture_output=True, text=True, shell=True)
+
+            if result.returncode != 0:
+                raise Exception(f"Failed to delete route: {result.stderr}")
+
+            print("[DEBUG] Route successfully deleted")
+            QMessageBox.information(self, "Success", "Route successfully deleted.")
+
+            # Refresh the routing table after deletion
+            self.populate_routing_table()
+
+        except Exception as e:
+            print(f"[ERROR] Failed to delete route: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to delete route: {str(e)}")
 
     def add_route(self):
         """Add a new route to the Windows routing table using 'route add'."""
