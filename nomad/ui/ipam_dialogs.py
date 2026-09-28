@@ -1,0 +1,536 @@
+"""IPAM dialogs: editing networks, subnets and addresses, and reviewing a spreadsheet before importing it."""
+import logging
+
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QColor, QKeySequence
+from PyQt5.QtWidgets import QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, \
+    QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QSplitter, QTableWidget, QTableWidgetItem, \
+    QShortcut, QTabWidget, QVBoxLayout, QWidget
+
+from ..ipam.spreadsheet import DETAIL, SKIP, SUMMARY, SpreadsheetError, import_page
+from ..ipam.store import STATUSES, IpamError
+from .common import set_hint
+from .theme import COLORS
+
+log = logging.getLogger(__name__)
+
+
+class FieldsEditor(QTableWidget):
+    """Extra details as name/value pairs (such as ASN or Telephony Rng from an imported spreadsheet)."""
+
+    def __init__(self, fields):
+        super().__init__(0, 2)
+        self.setHorizontalHeaderLabels(["Detail", "Value"])
+        self.verticalHeader().setVisible(False)
+        self.horizontalHeader().setStretchLastSection(True)
+        self.setMinimumHeight(120)
+        for name, value in fields.items():
+            self.add_row(name, value)
+        self.add_row()
+
+    def add_row(self, name="", value=""):
+        row = self.rowCount()
+        self.insertRow(row)
+        self.setItem(row, 0, QTableWidgetItem(name))
+        self.setItem(row, 1, QTableWidgetItem(value))
+
+    def fields(self):
+        """{name: value}; blank rows are dropped, so clearing a name removes that detail."""
+        result = {}
+        for row in range(self.rowCount()):
+            name = (self.item(row, 0).text() if self.item(row, 0) else "").strip()
+            value = (self.item(row, 1).text() if self.item(row, 1) else "").strip()
+            if name:
+                result[name] = value
+        return result
+
+    def keyPressEvent(self, event):
+        super().keyPressEvent(event)
+        last = self.rowCount() - 1
+        if last < 0 or (self.item(last, 0) and self.item(last, 0).text()):
+            self.add_row()  # Always leave an empty row to type a new detail into
+
+
+class _EditDialog(QDialog):
+    """A form with OK/Cancel and a line for errors; subclasses save in apply(), raising IpamError to stay open."""
+
+    def __init__(self, parent, title):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(480)
+        self.layout = QVBoxLayout(self)
+        self.form = QFormLayout()
+        self.layout.addLayout(self.form)
+        self.result_item = None
+
+    def finish_layout(self):
+        self.error_label = QLabel()
+        self.error_label.setWordWrap(True)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.save)
+        buttons.rejected.connect(self.reject)
+        self.layout.addWidget(self.error_label)
+        self.layout.addWidget(buttons)
+
+    def save(self):
+        try:
+            self.result_item = self.apply()
+        except IpamError as error:
+            set_hint(self.error_label, str(error), "error")
+            return
+        self.accept()
+
+    def apply(self):
+        raise NotImplementedError
+
+
+class NetworkDialog(_EditDialog):
+    def __init__(self, parent, store, network=None):
+        super().__init__(parent, "Edit Network" if network else "New Network")
+        self.store, self.network = store, network
+        self.name_input = QLineEdit(network.name if network else "")
+        self.name_input.setPlaceholderText("Such as the unit, like 11AB")
+        self.description_input = QLineEdit(network.description if network else "")
+        self.fields_editor = FieldsEditor(network.fields if network else {})
+        self.form.addRow("Name:", self.name_input)
+        self.form.addRow("Description:", self.description_input)
+        self.form.addRow("Details:", self.fields_editor)
+        self.finish_layout()
+
+    def apply(self):
+        values = dict(name=self.name_input.text(), description=self.description_input.text().strip(),
+                      fields=self.fields_editor.fields())
+        if self.network is None:
+            return self.store.add_network(**values)
+        return self.store.update_network(self.network.id, **values)
+
+
+class SubnetDialog(_EditDialog):
+    def __init__(self, parent, store, network_id, subnet=None, cidr=""):
+        super().__init__(parent, "Edit Subnet" if subnet else "New Subnet")
+        self.store, self.network_id, self.subnet = store, network_id, subnet
+        self.cidr_input = QLineEdit(subnet.cidr if subnet else cidr)
+        self.cidr_input.setPlaceholderText("10.1.2.0/24 or 10.1.2.0 255.255.255.0")
+        if subnet:
+            self.cidr_input.setReadOnly(True)
+            self.cidr_input.setToolTip("To change the range, add a new subnet and delete this one.")
+        self.name_input = QLineEdit(subnet.name if subnet else "")
+        self.gateway_input = QLineEdit(subnet.gateway if subnet else "")
+        self.description_input = QLineEdit(subnet.description if subnet else "")
+        self.fields_editor = FieldsEditor(subnet.fields if subnet else {})
+        self.form.addRow("Subnet:", self.cidr_input)
+        self.form.addRow("Name:", self.name_input)
+        self.form.addRow("Gateway:", self.gateway_input)
+        self.form.addRow("Description:", self.description_input)
+        self.form.addRow("Details:", self.fields_editor)
+        self.finish_layout()
+
+    def apply(self):
+        values = dict(name=self.name_input.text(), gateway=self.gateway_input.text(),
+                      description=self.description_input.text().strip(), fields=self.fields_editor.fields())
+        if self.subnet is None:
+            return self.store.add_subnet(self.network_id, self.cidr_input.text(), **values)
+        return self.store.update_subnet(self.subnet.id, **values)
+
+
+class AddressDialog(_EditDialog):
+    def __init__(self, parent, store, network_id, ip, address=None, note=""):
+        super().__init__(parent, f"Address {ip}")
+        self.store, self.network_id, self.ip = store, network_id, ip
+        self.status_combo = QComboBox()
+        for status, label in STATUSES.items():
+            self.status_combo.addItem(label, status)
+        self.status_combo.setToolTip("Used: a device has it. Reserved: held for something (the Reserved column "
+                                     "of the spreadsheet).")
+        if address is not None:
+            self.status_combo.setCurrentIndex(self.status_combo.findData(address.status))
+        self.name_input = QLineEdit(address.name if address else "")
+        self.name_input.setPlaceholderText("Host name or what it's for")
+        self.mac_input = QLineEdit(address.mac if address else "")
+        self.description_input = QLineEdit(address.description if address else "")
+        address_label = QLabel(ip)
+        address_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.form.addRow("Address:", address_label)
+        if note:
+            note_label = QLabel(note)
+            note_label.setWordWrap(True)
+            set_hint(note_label, note, "warning")
+            self.form.addRow("", note_label)
+        self.form.addRow("Status:", self.status_combo)
+        self.form.addRow("Name:", self.name_input)
+        self.form.addRow("MAC address:", self.mac_input)
+        self.form.addRow("Description:", self.description_input)
+        if address is not None and address.modified_by:
+            self.form.addRow("Last changed:", QLabel(f"{address.modified[:16].replace('T', ' ')} UTC by "
+                                                     f"{address.modified_by}"))
+        self.finish_layout()
+
+    def apply(self):
+        return self.store.set_address(self.network_id, self.ip, self.status_combo.currentData(),
+                                      self.name_input.text(), self.mac_input.text(),
+                                      self.description_input.text().strip())
+
+
+# --------------------------------------------------------------------- Import
+
+PAGE_COLUMNS = ["Page", "Import as network", "Subnets", "Addresses", "To decide", "Gateways to check", "Problems",
+                "Result"]
+UNDECIDED_COLUMN, GATEWAYS_COLUMN, PROBLEMS_COLUMN, RESULT_COLUMN = 4, 5, 6, 7
+GATEWAY_COLUMNS = ["Where", "Subnet", "Name", "Sheet's gateway", "What's wrong", "Use gateway", "Why this one"]
+GATEWAY_EDIT_COLUMN, GATEWAY_WHY_COLUMN = 5, 6
+DIFFERENCE_COLUMNS = ["Subnet", "Choice", "Summary says", "Detailed info says", "What differs"]
+CHOICE_COLUMN = 1
+
+
+def _subnet_text(subnet):
+    if subnet is None:
+        return "(not listed)"
+    parts = [subnet.name or "(no name)"]
+    if subnet.gateway:
+        parts.append(f"gateway {subnet.gateway}")
+    parts.extend(f"{name} {value}" for name, value in subnet.fields.items())
+    return ", ".join(parts)
+
+
+class ImportDialog(QDialog):
+    """Review each page of a spreadsheet: the network to import it as, a choice for every place the summary and
+    the detailed info disagree, the gateway to use where the sheet's isn't in its subnet, and the rows that can't
+    be used. It can be maximized or shown full screen (F11) for room."""
+
+    def __init__(self, parent, store, file_name, sheets, skipped=()):
+        super().__init__(parent)
+        self.store, self.sheets = store, sheets
+        self.imported = []
+        self.gateway_errors = {}  # {id(GatewayFix): message} for gateways typed in that aren't usable
+        self.setWindowTitle(f"Import {file_name}")
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint | Qt.WindowMinimizeButtonHint)
+        self.resize(1280, 760)
+        layout = QVBoxLayout(self)
+        intro = QLabel("Tick the pages to import. Where the summary at the top of a page and its Detailed Info "
+                       "disagree, choose which to keep. SNMP strings are never imported.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        if skipped:
+            skipped_label = QLabel(f"Skipped {len(skipped)} page{'' if len(skipped) == 1 else 's'} without a Subnet "
+                                   "and Mask header (not addressing pages): " + ", ".join(skipped))
+            skipped_label.setWordWrap(True)
+            set_hint(skipped_label, skipped_label.text(), "info")
+            layout.addWidget(skipped_label)
+
+        splitter = QSplitter(Qt.Vertical)
+        self.page_table = QTableWidget(len(sheets), len(PAGE_COLUMNS))
+        self.page_table.setHorizontalHeaderLabels(PAGE_COLUMNS)
+        self.page_table.verticalHeader().setVisible(False)
+        self.page_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.page_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.page_table.horizontalHeader().setStretchLastSection(True)
+        for row, sheet in enumerate(sheets):
+            check = QTableWidgetItem(sheet.title)
+            check.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            check.setCheckState(Qt.Checked)
+            self.page_table.setItem(row, 0, check)
+            self.page_table.setItem(row, 1, QTableWidgetItem(sheet.suggested_name))
+            for column, value in ((2, len(sheet.matched) + len(sheet.differences)), (3, len(sheet.addresses)),
+                                  (PROBLEMS_COLUMN, len(sheet.problems))):
+                item = QTableWidgetItem(str(value))
+                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                self.page_table.setItem(row, column, item)
+            for column in (UNDECIDED_COLUMN, GATEWAYS_COLUMN, RESULT_COLUMN):
+                item = QTableWidgetItem()
+                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                self.page_table.setItem(row, column, item)
+        self.page_table.resizeColumnsToContents()
+        splitter.addWidget(self.page_table)
+
+        self.detail_tabs = QTabWidget()
+        differences_page = QWidget()
+        differences_layout = QVBoxLayout(differences_page)
+        differences_layout.setContentsMargins(0, 4, 0, 0)
+        bulk_row = QHBoxLayout()
+        bulk_row.addWidget(QLabel("For every difference on this page:"))
+        # In the same order as the Summary says and Detailed info says columns below
+        for label, preference in (("Use the Summary", SUMMARY), ("Use the Detailed Info", DETAIL),
+                                  ("Clear choices", None)):
+            button = QPushButton(label)
+            button.clicked.connect(lambda _, preference=preference: self.choose_all(preference))
+            bulk_row.addWidget(button)
+        bulk_row.addStretch()
+        differences_layout.addLayout(bulk_row)
+        self.difference_table = QTableWidget(0, len(DIFFERENCE_COLUMNS))
+        self.difference_table.setHorizontalHeaderLabels(DIFFERENCE_COLUMNS)
+        self.difference_table.verticalHeader().setVisible(False)
+        self.difference_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.difference_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        differences_layout.addWidget(self.difference_table)
+        gateways_page = QWidget()
+        gateways_layout = QVBoxLayout(gateways_page)
+        gateways_layout.setContentsMargins(0, 4, 0, 0)
+        gateways_note = QLabel("The sheet gives these subnets a gateway that can't be right (outside the subnet, or "
+                               "not an address). NOMAD suggests one under Use gateway and says why. Double-click it "
+                               "to type another, or clear it to import the subnet without a gateway.")
+        gateways_note.setWordWrap(True)
+        gateways_layout.addWidget(gateways_note)
+        self.gateway_table = QTableWidget(0, len(GATEWAY_COLUMNS))
+        self.gateway_table.setHorizontalHeaderLabels(GATEWAY_COLUMNS)
+        self.gateway_table.verticalHeader().setVisible(False)
+        self.gateway_table.horizontalHeader().setStretchLastSection(True)
+        self.gateway_table.setWordWrap(True)  # The explanations wrap rather than being cut off
+        gateways_layout.addWidget(self.gateway_table)
+        self.problem_table = self._read_only_table(["Row", "Problem"])
+        self.details_table = self._read_only_table(["Detail", "Value"])
+        self.detail_tabs.addTab(differences_page, "Differences")
+        self.detail_tabs.addTab(gateways_page, "Gateways")
+        self.detail_tabs.addTab(self.problem_table, "Problems")
+        self.detail_tabs.addTab(self.details_table, "Network details")
+        splitter.addWidget(self.detail_tabs)
+        splitter.setSizes([180, 520])
+        layout.addWidget(splitter, 1)
+
+        self.status_label = QLabel()
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        self.full_screen_button = buttons.addButton("Full Screen (F11)", QDialogButtonBox.ActionRole)
+        self.full_screen_button.clicked.connect(self.toggle_full_screen)
+        QShortcut(QKeySequence("F11"), self, self.toggle_full_screen)
+        self.import_button = buttons.addButton("Import", QDialogButtonBox.AcceptRole)
+        self.import_button.setProperty("accent", True)
+        buttons.accepted.connect(self.run_import)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.page_table.itemSelectionChanged.connect(self.show_page)
+        self.page_table.itemChanged.connect(lambda _: self.update_state())
+        self.gateway_table.itemChanged.connect(self.on_gateway_edited)
+        self.page_table.selectRow(0)
+        self.update_state()
+
+    def toggle_full_screen(self):
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
+        self.full_screen_button.setText("Exit Full Screen (F11)" if self.isFullScreen() else "Full Screen (F11)")
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape and self.isFullScreen():
+            self.toggle_full_screen()  # Escape leaves full screen before it cancels
+            return
+        super().keyPressEvent(event)
+
+    @staticmethod
+    def _read_only_table(headers):
+        table = QTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.setWordWrap(True)
+        return table
+
+    def current_sheet(self):
+        row = self.page_table.currentRow()
+        return self.sheets[row] if 0 <= row < len(self.sheets) else None
+
+    def show_page(self):
+        sheet = self.current_sheet()
+        if sheet is None:
+            return
+        table = self.difference_table
+        # Remove the previous page's choice boxes now: Qt only deletes replaced cell widgets later, and until then
+        # they can show over the new rows
+        for row in range(table.rowCount()):
+            widget = table.cellWidget(row, CHOICE_COLUMN)
+            if widget is not None:
+                widget.hide()
+                widget.deleteLater()
+        table.setRowCount(0)
+        table.setRowCount(len(sheet.differences))
+        for row, difference in enumerate(sheet.differences):
+            for column, text in zip((0, 2, 3, 4), (difference.cidr, _subnet_text(difference.summary),
+                                                   _subnet_text(difference.detail), difference.describe())):
+                item = QTableWidgetItem(text)
+                item.setToolTip(text)
+                table.setItem(row, column, item)
+            combo = QComboBox()
+            combo.addItem("Choose...", None)
+            for choice, label in difference.options():
+                combo.addItem(label, choice)
+            combo.setCurrentIndex(max(0, combo.findData(difference.choice)))
+            combo.currentIndexChanged.connect(
+                lambda _, difference=difference, combo=combo: self.set_choice(difference, combo.currentData()))
+            table.setCellWidget(row, CHOICE_COLUMN, combo)
+        table.resizeColumnsToContents()
+        table.setColumnWidth(CHOICE_COLUMN, table.fontMetrics().horizontalAdvance("Use the detailed info's") + 48)
+        for column in (2, 3, 4):
+            table.setColumnWidth(column, min(table.columnWidth(column), 320))
+
+        self.fill_gateways(sheet)
+        self.problem_table.setRowCount(len(sheet.problems))
+        for row, (number, message) in enumerate(sheet.problems):
+            self.problem_table.setItem(row, 0, QTableWidgetItem(str(number)))
+            self.problem_table.setItem(row, 1, QTableWidgetItem(message))
+        self.problem_table.resizeColumnToContents(0)
+        self.problem_table.resizeRowsToContents()
+        self.details_table.setRowCount(len(sheet.fields))
+        for row, (name, value) in enumerate(sheet.fields.items()):
+            self.details_table.setItem(row, 0, QTableWidgetItem(name))
+            self.details_table.setItem(row, 1, QTableWidgetItem(value))
+        self.detail_tabs.setTabText(0, f"Differences ({len(sheet.differences)})")
+        self.detail_tabs.setTabText(1, f"Gateways ({len(sheet.gateway_fixes)})")
+        self.detail_tabs.setTabText(2, f"Problems ({len(sheet.problems)})")
+
+    def fill_gateways(self, sheet):
+        table = self.gateway_table
+        table.blockSignals(True)
+        table.setRowCount(len(sheet.gateway_fixes))
+        for row, fix in enumerate(sheet.gateway_fixes):
+            values = [f"{fix.section} row {fix.subnet.row}", fix.subnet.cidr, fix.subnet.name, fix.given,
+                      fix.problem, fix.gateway, fix.reason]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column != GATEWAY_EDIT_COLUMN:
+                    item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                item.setData(Qt.UserRole, row)
+                item.setToolTip(value)
+                table.setItem(row, column, item)
+            self.mark_gateway(row, fix)
+        table.blockSignals(False)
+        table.resizeColumnsToContents()
+        text_width = table.fontMetrics().averageCharWidth()
+        table.setColumnWidth(2, min(table.columnWidth(2), 20 * text_width))  # Name
+        table.setColumnWidth(4, 28 * text_width)  # What's wrong; Why this one takes the rest of the width
+        table.resizeRowsToContents()
+
+    def mark_gateway(self, row, fix):
+        """Colour the chosen gateway, and show why it was chosen, or what's wrong with what was typed."""
+        item = self.gateway_table.item(row, GATEWAY_EDIT_COLUMN)
+        why = self.gateway_table.item(row, GATEWAY_WHY_COLUMN)
+        error = self.gateway_errors.get(id(fix))
+        if error:
+            item.setForeground(QColor(COLORS["error"]))
+            why.setText(error)
+            why.setForeground(QColor(COLORS["error"]))
+        elif not fix.gateway:
+            item.setForeground(QColor(COLORS["muted"]))
+            why.setText("Left out: the subnet is imported without a gateway.")
+            why.setForeground(QColor(COLORS["muted"]))
+        else:
+            item.setForeground(QColor(COLORS["success"]))
+            why.setText(fix.reason if fix.gateway == fix.suggested else "Typed in.")
+            why.setForeground(QColor(COLORS["text"]))
+        item.setToolTip("Double-click to type another gateway; clear it to leave the gateway out.")
+        why.setToolTip(why.text())
+
+    def on_gateway_edited(self, item):
+        if item.column() != GATEWAY_EDIT_COLUMN:
+            return
+        sheet = self.current_sheet()
+        fix = sheet.gateway_fixes[item.row()]
+        error = fix.set_gateway(item.text())
+        if error:
+            self.gateway_errors[id(fix)] = error
+        else:
+            self.gateway_errors.pop(id(fix), None)
+        self.gateway_table.blockSignals(True)
+        self.mark_gateway(item.row(), fix)
+        self.gateway_table.blockSignals(False)
+        self.gateway_table.resizeRowToContents(item.row())
+        self.update_state()
+
+    def set_choice(self, difference, choice):
+        difference.choice = choice
+        self.update_state()
+
+    def choose_all(self, preference):
+        sheet = self.current_sheet()
+        if sheet is None:
+            return
+        for difference in sheet.differences:
+            if preference is None:
+                difference.choice = None
+            elif difference.summary and difference.detail:
+                difference.choice = preference
+            else:  # Only one side lists it: keep it if it's the preferred side's
+                difference.choice = preference if (difference.detail if preference == DETAIL else
+                                                   difference.summary) else SKIP
+        self.show_page()
+        self.update_state()
+
+    def chosen_pages(self):
+        """[(sheet, network name)] for the ticked pages."""
+        return [(sheet, self.page_table.item(row, 1).text().strip()) for row, sheet in enumerate(self.sheets)
+                if self.page_table.item(row, 0).checkState() == Qt.Checked]
+
+    def update_state(self):
+        self.page_table.blockSignals(True)
+        chosen = self.chosen_pages()
+        names = [name.casefold() for _, name in chosen]
+        blockers = []
+        for row, sheet in enumerate(self.sheets):
+            ticked = self.page_table.item(row, 0).checkState() == Qt.Checked
+            name = self.page_table.item(row, 1).text().strip()
+            undecided = len(sheet.undecided())
+            bad_gateways = sum(id(fix) in self.gateway_errors for fix in sheet.gateway_fixes)
+            gateways_item = self.page_table.item(row, GATEWAYS_COLUMN)
+            if bad_gateways:
+                gateways_item.setText(f"{bad_gateways} not usable")
+                gateways_item.setForeground(QColor(COLORS["error"]))
+            elif sheet.gateway_fixes:
+                gateways_item.setText(f"{len(sheet.gateway_fixes)} fixed")
+                gateways_item.setForeground(QColor(COLORS["warning"]))
+            else:
+                gateways_item.setText("None")
+                gateways_item.setForeground(QColor(COLORS["muted"]))
+            gateways_item.setToolTip("Gateways the sheet gives that can't be right; see the Gateways tab for the "
+                                     "one NOMAD will use instead." if sheet.gateway_fixes else "")
+            self.page_table.item(row, UNDECIDED_COLUMN).setText(
+                f"{undecided} of {len(sheet.differences)}" if undecided else "Done")
+            self.page_table.item(row, UNDECIDED_COLUMN).setForeground(
+                QColor(COLORS["warning" if undecided else "muted"]))
+            result, kind = "", "muted"
+            if not ticked:
+                result = "Not imported"
+            elif not name:
+                result, kind = "Needs a network name", "error"
+            elif names.count(name.casefold()) > 1:
+                result, kind = "Two pages have this name", "error"
+            elif self.store.network_named(name) is not None:
+                result, kind = "Replaces the existing network", "warning"
+            else:
+                result = "New network"
+            self.page_table.item(row, RESULT_COLUMN).setText(result)
+            self.page_table.item(row, RESULT_COLUMN).setForeground(QColor(COLORS[kind]))
+            if ticked and (kind == "error" or undecided or bad_gateways):
+                blockers.append(sheet.title)
+        self.page_table.blockSignals(False)
+        self.import_button.setEnabled(bool(chosen) and not blockers)
+        if not chosen:
+            set_hint(self.status_label, "Tick at least one page to import.", "info")
+        elif blockers:
+            set_hint(self.status_label, "Still to sort out before importing: " + ", ".join(blockers) +
+                     " (choices under Differences, gateways under Gateways, or the network name).", "warning")
+        else:
+            set_hint(self.status_label, f"Ready to import {len(chosen)} page{'' if len(chosen) == 1 else 's'}.",
+                     "success")
+
+    def run_import(self):
+        chosen = self.chosen_pages()
+        replacing = [name for _, name in chosen if self.store.network_named(name) is not None]
+        if replacing and QMessageBox.question(
+                self, "Replace Networks",
+                "These networks already exist, and importing replaces everything recorded in them:\n\n" +
+                "\n".join(replacing) + "\n\nReplace them?") != QMessageBox.Yes:
+            return
+        try:
+            with self.store.transaction():
+                for sheet, name in chosen:
+                    self.imported.append(import_page(self.store, sheet, name, replace=name in replacing))
+                    log.info("Imported page %r as network %r: %d subnets, %d addresses, %d problems", sheet.title,
+                             name, len(sheet.subnets_to_import()), len(sheet.addresses), len(sheet.problems))
+        except (IpamError, SpreadsheetError) as error:
+            log.warning("Import failed (nothing imported): %s", error)
+            self.imported = []
+            set_hint(self.status_label, f"Nothing was imported: {error}", "error")
+            return
+        self.accept()

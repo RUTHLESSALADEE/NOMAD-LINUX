@@ -117,6 +117,10 @@ class UtilitiesTab(QWidget):
         if address:
             self.subnet_input.setText(address)
 
+    def calculate_subnet(self, text):
+        """Show a subnet in the calculator (from the IPAM page)."""
+        self.subnet_input.setText(text)
+
     def calculate(self):
         self.split_table.setRowCount(0)
         self.split_status.clear()

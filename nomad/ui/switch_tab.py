@@ -5,7 +5,8 @@ from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import QApplication, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QProgressBar, QPushButton, \
     QSpinBox, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
 
-from ..lldp import discover, find_pktmon
+from ..lldp import discover
+from ..pktmon import PktmonBusy, find_pktmon
 from ..system import CommandError
 from .common import StoppableThread, set_hint
 from .theme import accent_button
@@ -28,7 +29,7 @@ class DiscoveryThread(StoppableThread):
         try:
             neighbors = discover(self.seconds, should_stop=lambda: self.stopping, found=self.found.emit,
                                  progress=self.progress.emit)
-        except (CommandError, OSError) as error:
+        except (CommandError, OSError, PktmonBusy) as error:
             self.finished_discovery.emit(f"Couldn't listen for switches: {error}", "error")
             return
         if neighbors:

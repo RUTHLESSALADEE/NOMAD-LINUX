@@ -1,1 +1,5 @@
 PyQt5>=5.15
+paramiko>=4.0
+pyte>=0.8
+pyserial>=3.5
+openpyxl>=3.1

@@ -38,6 +38,18 @@ QTabBar::tab {{ background: {background}; color: {muted}; border: 1px solid {bor
 QTabBar::tab:selected {{ background: {panel}; color: {accent}; border-top: 2px solid {accent}; }}
 QTabBar::tab:hover:!selected {{ color: {text}; }}
 
+QListWidget#navigation {{ background: {background}; border: none; border-right: 1px solid {border}; outline: 0;
+    padding: 2px 0; }}
+QListWidget#navigation::item {{ padding: 4px 18px 4px 22px; color: {text}; border-left: 3px solid transparent; }}
+QListWidget#navigation::item:hover {{ background: {panel}; }}
+QListWidget#navigation::item:selected {{ background: {panel}; color: {accent}; border-left: 3px solid {accent}; }}
+QStackedWidget#pages {{ background: {panel}; border: 1px solid {border}; border-left: none; }}
+QWidget#navigationPanel, QWidget#navigationRail {{ background: {background}; }}
+QWidget#navigationRail {{ border-right: 1px solid {border}; }}
+QToolButton#navigationButton {{ background: transparent; border: none; color: {muted}; padding: 3px 8px; }}
+QToolButton#navigationButton:hover {{ color: {accent}; background: {panel}; }}
+QToolButton#navigationButton::menu-indicator {{ image: none; }}
+
 QGroupBox {{ border: 1px solid {border}; margin-top: 12px; }}
 QGroupBox::title {{ subcontrol-origin: margin; left: 8px; padding: 0 4px; color: {accent}; font-weight: bold; }}
 

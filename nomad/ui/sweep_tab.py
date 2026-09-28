@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QFileDia
 from ..oui import vendor
 from ..sweep import LARGE_SWEEP_HOSTS, SWEEP_PASSES, add_to_user_path, find_putty, local_networks, lookup_host, \
     make_probe, putty_locations, run_sweep, sweep_hosts
+from ..terminal.sessions import SSH, TELNET
 from .common import SortableTableItem, StoppableThread, set_hint, set_invalid
 from .theme import accent_button
 
@@ -172,7 +173,8 @@ class SweepTab(QWidget):
         layout.addWidget(self.table, 1)
 
         host_buttons = QHBoxLayout()
-        self.ssh_button = QPushButton("SSH (PuTTY)")
+        self.ssh_button = QPushButton("SSH")
+        self.ssh_button.setToolTip("Open an SSH session on the Terminal page.")
         self.web_button = QPushButton("Open in Browser")
         self.web_button.setToolTip("Open https://<host> in the default browser.")
         self.ping_button = QPushButton("Ping")
@@ -196,7 +198,7 @@ class SweepTab(QWidget):
         self.export_button.clicked.connect(self.export_csv)
         self.table.itemSelectionChanged.connect(self.update_buttons)
         self.table.customContextMenuRequested.connect(self.show_context_menu)
-        self.ssh_button.clicked.connect(lambda: self.open_ssh(self.selected_host()))
+        self.ssh_button.clicked.connect(lambda: self.open_terminal(self.selected_host(), SSH))
         self.web_button.clicked.connect(lambda: self.open_web(self.selected_host()))
         self.ping_button.clicked.connect(lambda: self.ping(self.selected_host()))
         self.trace_button.clicked.connect(lambda: self.trace(self.selected_host()))
@@ -412,6 +414,8 @@ class SweepTab(QWidget):
 
         menu = QMenu(self)
         actions = {
+            menu.addAction("Open SSH Session"): lambda: self.open_terminal(host, SSH),
+            menu.addAction("Open Telnet Session"): lambda: self.open_terminal(host, TELNET),
             menu.addAction("SSH with PuTTY"): lambda: self.open_ssh(host),
             menu.addAction(f"Open https://{host}"): lambda: self.open_web(host),
             menu.addAction(f"Open http://{host}"): lambda: self.open_web(host, "http"),
@@ -419,6 +423,8 @@ class SweepTab(QWidget):
             menu.addAction("Traceroute"): lambda: self.trace(host),
             menu.addAction("Monitor Latency"): lambda: self.monitor_latency(host),
             menu.addAction("Scan Ports"): lambda: self.scan_ports(host),
+            menu.addAction("SNMP Details"): lambda: self.snmp(host),
+            menu.addAction("Capture Traffic..."): lambda: self.capture(host),
         }
         menu.addSeparator()
         actions[menu.addAction("Copy Address")] = lambda: QApplication.clipboard().setText(host)
@@ -430,6 +436,11 @@ class SweepTab(QWidget):
         chosen = menu.exec_(self.table.viewport().mapToGlobal(position))
         if chosen in actions:
             actions[chosen]()
+
+    def open_terminal(self, host, protocol):
+        """Open a session to host on the Terminal page."""
+        if host:
+            self.window.terminal_tab.open_address(host, protocol)
 
     def open_ssh(self, host):
         if not host:
@@ -455,23 +466,34 @@ class SweepTab(QWidget):
 
     def ping(self, host):
         if host:
-            self.window.tabs.setCurrentWidget(self.window.ping_tab)
+            self.window.navigator.setCurrentWidget(self.window.ping_tab)
             self.window.ping_tab.ping_host(host)
 
     def trace(self, host):
         if host:
-            self.window.tabs.setCurrentWidget(self.window.traceroute_tab)
+            self.window.navigator.setCurrentWidget(self.window.traceroute_tab)
             self.window.traceroute_tab.trace_host(host)
 
     def monitor_latency(self, host):
         if host:
-            self.window.tabs.setCurrentWidget(self.window.latency_tab)
+            self.window.navigator.setCurrentWidget(self.window.latency_tab)
             self.window.latency_tab.add_target(host, host)
 
     def scan_ports(self, host):
         if host:
-            self.window.tabs.setCurrentWidget(self.window.ports_tab)
+            self.window.navigator.setCurrentWidget(self.window.ports_tab)
             self.window.ports_tab.scan_host(host)
+
+    def snmp(self, host):
+        if host:
+            self.window.navigator.setCurrentWidget(self.window.snmp_tab)
+            self.window.snmp_tab.query_host(host)
+
+    def capture(self, host):
+        """Fill in the host on the Packet Capture page; capturing needs a deliberate Start (and admin rights)."""
+        if host:
+            self.window.navigator.setCurrentWidget(self.window.capture_tab)
+            self.window.capture_tab.capture_host(host)
 
     # ----------------------------------------------------------------- Menu actions
 

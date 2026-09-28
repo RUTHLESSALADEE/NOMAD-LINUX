@@ -92,7 +92,7 @@ def main(args):
         set_version(new_version)
         release_changelog(new_version)
         print(f"{__version__} -> {new_version}\n"
-              f"Next:\n  git commit -am \"Release {new_version}\"\n  git tag v{new_version}\n  .\\build.ps1")
+              f"Next:\n  git add -A\n  git commit -m \"Release {new_version}\"\n  git tag v{new_version}\n  .\\build.ps1")
     elif args[0] == "exe-name" and len(args) == 1:
         print(exe_name())
     elif args[0] == "resource" and len(args) == 2:
