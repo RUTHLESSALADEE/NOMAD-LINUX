@@ -134,7 +134,7 @@ class SubnetDialog(_EditDialog):
 
 
 class AddressDialog(_EditDialog):
-    def __init__(self, parent, store, network_id, ip, address=None, note=""):
+    def __init__(self, parent, store, network_id, ip, address=None, note="", name="", mac=""):
         super().__init__(parent, f"Address {ip}")
         self.store, self.network_id, self.ip = store, network_id, ip
         self.status_combo = QComboBox()
@@ -144,9 +144,9 @@ class AddressDialog(_EditDialog):
                                      "of the spreadsheet).")
         if address is not None:
             self.status_combo.setCurrentIndex(self.status_combo.findData(address.status))
-        self.name_input = QLineEdit(address.name if address else "")
+        self.name_input = QLineEdit(address.name if address else name)
         self.name_input.setPlaceholderText("Host name or what it's for")
-        self.mac_input = QLineEdit(address.mac if address else "")
+        self.mac_input = QLineEdit(mac or (address.mac if address else ""))
         self.description_input = QLineEdit(address.description if address else "")
         address_label = QLabel(ip)
         address_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -552,3 +552,117 @@ class ImportDialog(QDialog):
             set_hint(self.status_label, f"Nothing was imported: {error}", "error")
             return
         self.accept()
+
+
+REFUSED_COLUMNS = ["Network", "Address", "Your change", "Made (UTC)", "Why it wasn't made"]
+
+
+class RefusedDialog(QDialog):
+    """Changes made offline that the IPAM server refused (someone else changed the address first): record the
+    same thing at the next free address instead, or discard it."""
+
+    def __init__(self, parent, team):
+        super().__init__(parent)
+        self.team = team
+        self.setWindowTitle("Refused Changes")
+        self.resize(1000, 420)
+        layout = QVBoxLayout(self)
+        intro = QLabel("These changes were made while the IPAM server couldn't be reached. When they were sent, "
+                       "someone else had already changed those addresses, so the server kept theirs. For each, "
+                       "record the same thing at the next free address in its subnet, or discard it.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        self.table = QTableWidget(0, len(REFUSED_COLUMNS))
+        self.table.setHorizontalHeaderLabels(REFUSED_COLUMNS)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setWordWrap(True)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.table, 1)
+        self.message_label = QLabel()
+        self.message_label.setWordWrap(True)
+        layout.addWidget(self.message_label)
+        buttons = QHBoxLayout()
+        self.next_free_button = QPushButton("Use Next Free Address...")
+        self.next_free_button.setProperty("accent", True)
+        self.discard_button = QPushButton("Discard")
+        close_button = QPushButton("Close")
+        for button in (self.next_free_button, self.discard_button):
+            buttons.addWidget(button)
+        buttons.addStretch()
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+        self.next_free_button.clicked.connect(self.use_next_free)
+        self.discard_button.clicked.connect(self.discard)
+        close_button.clicked.connect(self.accept)
+        self.table.itemSelectionChanged.connect(self.update_buttons)
+        self.fill()
+
+    def fill(self):
+        self.entries = self.team.refused()
+        networks = {network.id: network.name for network in self.team.networks()}
+        self.table.setRowCount(len(self.entries))
+        for row, entry in enumerate(self.entries):
+            if entry["action"] == "set_address":
+                data = entry["data"]
+                change = f"{STATUSES.get(data.get('status'), 'Used')}: {data.get('name') or '(no name)'}"
+            else:
+                change = "Mark free"
+            values = [networks.get(entry["network_id"], "(deleted network)"), entry["ip"], change,
+                      entry["made"][:16].replace("T", " "), entry["error"]]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                self.table.setItem(row, column, item)
+        for column in range(4):  # The reason takes the rest of the width, wrapping onto more lines
+            self.table.resizeColumnToContents(column)
+        self.table.resizeRowsToContents()
+        if self.entries:
+            self.table.selectRow(0)
+        self.update_buttons()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.table.resizeRowsToContents()  # Now the reason column has its final width
+
+    def selected(self):
+        rows = self.table.selectionModel().selectedRows()
+        return self.entries[rows[0].row()] if rows else None
+
+    def update_buttons(self):
+        entry = self.selected()
+        self.discard_button.setEnabled(entry is not None)
+        self.next_free_button.setEnabled(entry is not None and entry["action"] == "set_address")
+
+    def use_next_free(self):
+        entry = self.selected()
+        subnet = self.team.subnet_for(entry["network_id"], entry["ip"])
+        if subnet is None:
+            set_hint(self.message_label, f"{entry['ip']} isn't in any subnet now, so there's no subnet to take "
+                                         "another address from.", "error")
+            return
+        address = self.team.next_free(subnet)
+        if address is None:
+            set_hint(self.message_label, f"{subnet.cidr} has no free addresses left.", "error")
+            return
+        name = entry["data"].get("name") or "(no name)"
+        if QMessageBox.question(self, "Use Next Free Address",
+                                f"Record {name} at {address} in {subnet.cidr} instead of {entry['ip']}?") != \
+                QMessageBox.Yes:
+            return
+        try:
+            self.team.set_address(entry["network_id"], str(address), **entry["data"])
+        except IpamError as error:
+            set_hint(self.message_label, f"Couldn't record it: {error}", "error")
+            return
+        self.team.discard(entry["seq"])
+        set_hint(self.message_label, f"Recorded {name} at {address}.", "success")
+        self.fill()
+
+    def discard(self):
+        entry = self.selected()
+        self.team.discard(entry["seq"])
+        set_hint(self.message_label, f"Discarded the change to {entry['ip']}.", "info")
+        self.fill()

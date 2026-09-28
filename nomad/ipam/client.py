@@ -4,8 +4,15 @@ a local copy of the tribe's data, and TeamStore, which the IPAM page uses like a
 Reads come from the local copy, so they work offline. Edits go straight to the server, which checks them against
 what the client last saw (raising ConflictError if someone else got there first) and replies with the changed rows,
 which are applied to the copy at once; other changes arrive with the next sync.
+
+While the server can't be reached, changes to addresses (not subnets or networks) are still made: they're applied to
+the copy at once and queued as pending, several changes to one address becoming one. When the server is back they're
+sent in the order they were made (send_pending on a worker thread, then apply_sent); any the server refuses, because
+someone else changed that address first, are kept as refused for the user to resolve (use the next free address, or
+discard), and the copy goes back to the server's version.
 """
 import contextlib
+import datetime
 import http.client
 import json
 import logging
@@ -18,7 +25,7 @@ from pathlib import Path
 from ..system import app_data_dir, log_dir
 from .server import ADMIN, KEY_FILE_FORMAT, TEAM, ConflictError, fingerprint, fingerprint_of_file, load_config, \
     server_dir
-from .store import IpamError, IpamStore, current_user, parse_address
+from .store import IpamError, IpamStore, current_user, ip_key, parse_address
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +33,14 @@ SETTINGS_FILE = "ipam-team.json"
 COPY_FILE = "ipam-team.db"
 CONNECT_SECONDS = 4
 READ_SECONDS = 60  # A first sync or an import can take a while to send
+PENDING, REFUSED = "pending", "refused"
+PENDING_SCHEMA = """
+CREATE TABLE IF NOT EXISTS pending (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT, network_id TEXT NOT NULL, ip TEXT NOT NULL, sort_key TEXT NOT NULL,
+    action TEXT NOT NULL, data TEXT NOT NULL DEFAULT '{}', expected_version INTEGER, original TEXT,
+    made TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', error TEXT NOT NULL DEFAULT '');
+"""
+SET, FREE = "set_address", "free_address"
 
 
 class ServerUnreachable(IpamError):
@@ -225,6 +240,7 @@ class TeamStore:
         self.online = False
         self.last_error = ""
         self.key_rejected = False  # The server refused the tribe key (a new key file is needed)
+        self.copy.db.executescript(PENDING_SCHEMA)
         if self.copy.get_meta("server_id") not in ("", key.server_id):
             self.reset_copy()
 
@@ -242,7 +258,7 @@ class TeamStore:
     def reset_copy(self):
         """Empty the copy (for a different server), so the next sync fetches everything."""
         with self.copy.transaction():
-            for table in ("networks", "subnets", "addresses", "changes"):
+            for table in ("networks", "subnets", "addresses", "changes", "pending"):
                 self.copy.db.execute(f"DELETE FROM {table}")
             self.copy.set_meta("revision", 0)
             self.copy.set_meta("server_id", self.key.server_id)
@@ -259,6 +275,7 @@ class TeamStore:
     def apply_sync(self, items, revision, status=None):
         """Apply what fetch_all_changes brought (on the UI thread)."""
         self.copy.apply_rows(items)
+        self._keep_pending_on_top(items)
         with self.copy.transaction():
             self.copy.set_meta("revision", revision)
             self.copy.set_meta("server_id", self.key.server_id)
@@ -288,11 +305,136 @@ class TeamStore:
             reply = self.client.edit(action, **arguments)
         except ServerUnreachable as error:
             self.online, self.last_error = False, str(error)
-            raise ServerUnreachable("The IPAM server can't be reached, so tribe networks can't be changed right now "
-                                    "(changing them offline comes in a later version).") from None
+            raise ServerUnreachable("The IPAM server can't be reached, so subnets and networks can't be changed "
+                                    "right now (addresses can: they're sent when it's back).") from None
         self.online = True
         self.copy.apply_rows(reply["items"])
         return reply
+
+    # ----------------------------------------------------------------- Changes made offline
+
+    def pending_count(self):
+        return self.copy.db.execute("SELECT COUNT(*) FROM pending WHERE state = ?", (PENDING,)).fetchone()[0]
+
+    def pending_ips(self, network_id):
+        """Addresses in a network with a change waiting to be sent."""
+        rows = self.copy.db.execute("SELECT ip FROM pending WHERE network_id = ? AND state = ?", (network_id, PENDING))
+        return {row[0] for row in rows}
+
+    def refused(self):
+        """Changes made offline that the server refused: [dict] with network_id, ip, action, data, error, made."""
+        rows = self.copy.db.execute("SELECT * FROM pending WHERE state = ? ORDER BY seq", (REFUSED,)).fetchall()
+        return [dict(row, data=json.loads(row["data"])) for row in rows]
+
+    def discard(self, seq):
+        with self.copy.transaction():
+            self.copy.db.execute("DELETE FROM pending WHERE seq = ?", (seq,))
+
+    def _queue(self, network_id, ip, action, data):
+        """Make an address change in the copy now and remember it for the server (merged with any earlier one)."""
+        ip = str(parse_address(ip))
+        key = ip_key(parse_address(ip))
+        with self.copy.transaction():
+            entry = self.copy.db.execute("SELECT * FROM pending WHERE network_id = ? AND sort_key = ? AND state = ?",
+                                         (network_id, key, PENDING)).fetchone()
+            if entry is None:
+                current = self.copy.address(network_id, ip)
+                if current is None and action == FREE:
+                    return  # Already free
+                original = self.copy.row_of("addresses", current.id)["row"] if current else None
+                self.copy.db.execute("INSERT INTO pending (network_id, ip, sort_key, action, data, expected_version, "
+                                     "original, made) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                     (network_id, ip, key, action, json.dumps(data),
+                                      current.version if current else None,
+                                      json.dumps(original) if original else None, now_text()))
+            elif action == FREE and entry["original"] is None:
+                # Recorded offline and freed again before the server heard about it: nothing to send
+                self.copy.db.execute("DELETE FROM pending WHERE seq = ?", (entry["seq"],))
+            else:
+                self.copy.db.execute("UPDATE pending SET action = ?, data = ?, made = ? WHERE seq = ?",
+                                     (action, json.dumps(data), now_text(), entry["seq"]))
+            if action == SET:
+                self.copy.set_address(network_id, ip, **data)
+            else:
+                self.copy.free_address(network_id, ip)
+
+    def outgoing(self):
+        """The pending changes to send, oldest first (plain data, for a worker thread)."""
+        rows = self.copy.db.execute("SELECT * FROM pending WHERE state = ? ORDER BY seq", (PENDING,)).fetchall()
+        return [dict(row, data=json.loads(row["data"])) for row in rows]
+
+    def send_pending(self, entries):
+        """Send pending changes in order (safe on a worker thread: it only talks to the server). Stops at the first
+        one that can't reach the server. Returns [(seq, "sent", reply) or (seq, "refused", message)]."""
+        results = []
+        for entry in entries:
+            arguments = dict(network_id=entry["network_id"], ip=entry["ip"],
+                             expected_version=entry["expected_version"])
+            if entry["action"] == SET:
+                arguments.update(entry["data"])
+            try:
+                reply = self.client.edit(entry["action"], **arguments)
+            except ServerUnreachable:
+                break
+            except TeamKeyError:
+                raise
+            except IpamError as error:  # Someone else changed it first, or the server couldn't make it
+                results.append((entry["seq"], REFUSED, str(error)))
+                continue
+            results.append((entry["seq"], "sent", reply))
+        return results
+
+    def apply_sent(self, results):
+        """Record what send_pending did (on the UI thread). Returns (sent, refused) counts."""
+        sent = refused = 0
+        for seq, outcome, detail in results:
+            entry = self.copy.db.execute("SELECT * FROM pending WHERE seq = ?", (seq,)).fetchone()
+            if entry is None:
+                continue
+            if outcome == "sent":
+                self.copy.apply_rows(detail["items"])
+                with self.copy.transaction():
+                    self.copy.db.execute("DELETE FROM pending WHERE seq = ?", (seq,))
+                sent += 1
+                continue
+            with self.copy.transaction():
+                self.copy.db.execute("UPDATE pending SET state = ?, error = ? WHERE seq = ?", (REFUSED, detail, seq))
+                self._restore(entry)
+            refused += 1
+        if results:
+            self.online = True
+        return sent, refused
+
+    def _keep_pending_on_top(self, items):
+        """The server's rows just replaced some addresses that have changes waiting. Remember the server's row as
+        what to go back to if the change is refused, and show the waiting change on top of it again."""
+        arrived = {(item["row"]["network_id"], item["row"]["sort_key"]): item["row"] for item in items
+                   if item["entity"] == "addresses"}
+        if not arrived:
+            return
+        entries = self.copy.db.execute("SELECT * FROM pending WHERE state = ?", (PENDING,)).fetchall()
+        for entry in entries:
+            row = arrived.get((entry["network_id"], entry["sort_key"]))
+            if row is None:
+                continue
+            with self.copy.transaction():
+                self.copy.db.execute("UPDATE pending SET original = ? WHERE seq = ?",
+                                     (None if row["deleted"] else json.dumps(row), entry["seq"]))
+                if entry["action"] == SET:
+                    self.copy.set_address(entry["network_id"], entry["ip"], **json.loads(entry["data"]))
+                else:
+                    self.copy.free_address(entry["network_id"], entry["ip"])
+
+    def _restore(self, entry):
+        """Put the copy's address back to the server's latest version (as of the last sync) after a refusal."""
+        self.copy.db.execute("UPDATE addresses SET deleted = 1 WHERE network_id = ? AND sort_key = ? AND deleted = 0",
+                             (entry["network_id"], entry["sort_key"]))
+        if entry["original"]:
+            self.copy.apply_rows([{"entity": "addresses", "row": json.loads(entry["original"])}])
+
+    def flush(self):
+        """Send every pending change now (blocking). Returns (sent, refused)."""
+        return self.apply_sent(self.send_pending(self.outgoing()))
 
     # ----------------------------------------------------------------- Reading, from the copy
 
@@ -309,17 +451,31 @@ class TeamStore:
     # ----------------------------------------------------------------- Changing, through the server
 
     def set_address(self, network_id, ip, status="used", name="", mac="", description="", fields=None):
-        current = self.copy.address(network_id, ip)
-        self._send("set_address", network_id=network_id, ip=str(parse_address(ip)), status=status, name=name,
-                   mac=mac, description=description, fields=fields or {},
-                   expected_version=current.version if current else None)
+        """Record an address: straight to the server when it can be reached (and nothing is waiting to be sent
+        before it), otherwise queued as pending."""
+        data = dict(status=status, name=name.strip(), mac=mac.strip(), description=description, fields=fields or {})
+        if self.online and not self.pending_count():
+            current = self.copy.address(network_id, ip)
+            try:
+                self._send(SET, network_id=network_id, ip=str(parse_address(ip)),
+                           expected_version=current.version if current else None, **data)
+                return self.copy.address(network_id, ip)
+            except ServerUnreachable:
+                pass  # Lost the server just now: keep the change for later
+        self._queue(network_id, ip, SET, data)
         return self.copy.address(network_id, ip)
 
     def free_address(self, network_id, ip):
         current = self.copy.address(network_id, ip)
-        if current is not None:
-            self._send("free_address", network_id=network_id, ip=str(parse_address(ip)),
-                       expected_version=current.version)
+        if current is None:
+            return
+        if self.online and not self.pending_count():
+            try:
+                self._send(FREE, network_id=network_id, ip=str(parse_address(ip)), expected_version=current.version)
+                return
+            except ServerUnreachable:
+                pass
+        self._queue(network_id, ip, FREE, {})
 
     def add_subnet(self, network_id, cidr, name="", gateway="", description="", fields=None):
         reply = self._send("add_subnet", network_id=network_id, cidr=cidr, name=name, gateway=gateway,
@@ -357,3 +513,7 @@ class TeamStore:
             raise
         self.copy.apply_rows(reply["items"])
         return [self.copy.network(network_id) for network_id in reply["networks"]]
+
+
+def now_text():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")

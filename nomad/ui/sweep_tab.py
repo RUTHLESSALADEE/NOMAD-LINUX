@@ -1,5 +1,5 @@
 """Sweep tab: find the hosts on a subnet, with their names, MAC addresses and vendors, then SSH, browse, ping,
-trace or port scan them."""
+trace or port scan them, and compare them with IPAM (what's recorded, what's missing, what didn't answer)."""
 import csv
 import ipaddress
 import logging
@@ -17,15 +17,17 @@ from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QFileDia
 from ..oui import vendor
 from ..sweep import LARGE_SWEEP_HOSTS, SWEEP_PASSES, add_to_user_path, find_putty, local_networks, lookup_host, \
     make_probe, putty_locations, run_sweep, sweep_hosts
+from ..ipam.store import parse_subnet
 from ..terminal.sessions import SSH, TELNET
 from .common import SortableTableItem, StoppableThread, set_hint, set_invalid
+from .ipam_compare import IpamComparison, finding_color
 from .theme import accent_button
 
 log = logging.getLogger(__name__)
 
 DEFAULTS = {"workers": 100, "timeout": 1000}
-COLUMNS = ["IP Address", "Response Time", "Host Name", "MAC Address", "Vendor"]
-COL_ADDRESS, COL_RTT, COL_NAME, COL_MAC, COL_VENDOR = range(len(COLUMNS))
+COLUMNS = ["IP Address", "Response Time", "Host Name", "MAC Address", "Vendor", "IPAM"]
+COL_ADDRESS, COL_RTT, COL_NAME, COL_MAC, COL_VENDOR, COL_IPAM = range(len(COLUMNS))
 PROGRESS_INTERVAL_SECONDS = 0.05  # Limit progress updates so big sweeps don't flood the UI
 NAME_LOOKUP_WORKERS = 16
 ARP_ONLY_SORT_KEY = 10 ** 9  # Hosts that only answered ARP sort after every response time
@@ -158,6 +160,10 @@ class SweepTab(QWidget):
         layout.addWidget(self.progress_bar)
         self.status_label = QLabel()
         layout.addWidget(self.status_label)
+        self.ipam_bar = IpamComparison(self.window)
+        self.ipam_bar.updated.connect(self.show_ipam_column)
+        layout.addWidget(self.ipam_bar)
+        self.swept = []  # The subnet swept, for the IPAM addresses that didn't answer
 
         self.table = QTableWidget(0, len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
@@ -262,6 +268,7 @@ class SweepTab(QWidget):
                 return
 
         self.clear_results()
+        self.swept = [parse_subnet(str(network))]
         self.progress_bar.setRange(0, len(hosts) * SWEEP_PASSES)
         arp_networks = [local for local in local_networks(self.window.snapshot) if local.overlaps(network)]
         via_arp = " with ARP" if arp_networks and self.arp_check.isChecked() else ""
@@ -278,6 +285,18 @@ class SweepTab(QWidget):
         self.worker.start()
         self.window.set_busy("sweep", f"Sweeping {network}")
         self.update_buttons()
+
+    def sweep_subnet(self, cidr, source=None, network_id=None):
+        """Sweep a subnet from the IP Addresses page, comparing the hosts with that IPAM network."""
+        self.window.navigator.setCurrentWidget(self)
+        if self.worker is not None:
+            set_hint(self.status_label, "A sweep is already running: stop it first to sweep another subnet.",
+                     "warning")
+            return
+        self.subnet_input.setText(cidr)
+        if network_id is not None:
+            self.ipam_bar.compare_with(source, network_id)
+        self.start_sweep()
 
     def stop_sweep(self):
         if self.worker is not None:
@@ -302,6 +321,18 @@ class SweepTab(QWidget):
             self.progress_bar.setValue(self.progress_bar.maximum())
         set_hint(self.status_label, message, "success")
         log.info(message)
+        # Addresses IPAM expects that didn't answer only mean something once every address has been tried
+        complete = not self.worker.stopping
+        self.ipam_bar.set_devices(self.devices(), self.swept, complete=complete, soon=False)
+        selection = self.ipam_bar.selection()
+        if selection is not None:  # Show what answered on the IP Addresses page too
+            source, _, network_id = selection
+            hosts = {}
+            for row in range(self.table.rowCount()):
+                rtt = self.table.item(row, COL_RTT).sort_key
+                hosts[self.table.item(row, COL_ADDRESS).text()] = (None if rtt == ARP_ONLY_SORT_KEY else rtt,
+                                                                   self.table.item(row, COL_MAC).text())
+            self.window.ipam_tab.record_sweep(source, network_id, self.swept, hosts, complete)
 
     def on_thread_finished(self):
         self.worker.deleteLater()
@@ -327,8 +358,10 @@ class SweepTab(QWidget):
         local = self.local_addresses().get(address)
         self.table.setItem(row, COL_NAME, SortableTableItem("(this computer)" if local else ""))
         self.set_mac(row, hit.mac or (local.mac if local else ""))
+        self.table.setItem(row, COL_IPAM, SortableTableItem(""))
         self.table.setSortingEnabled(True)
         self.update_buttons()
+        self.ipam_bar.set_devices(self.devices(), self.swept)
 
     def set_mac(self, row, mac):
         self.table.setItem(row, COL_MAC, SortableTableItem(mac))
@@ -350,8 +383,28 @@ class SweepTab(QWidget):
             self.set_mac(row, mac)
             self.table.item(row, COL_MAC).setToolTip("Reported by the host over NetBIOS.")
         self.table.setSortingEnabled(True)
+        self.ipam_bar.set_devices(self.devices(), self.swept)
+
+    def devices(self):
+        """{ip: (mac, host name)} of the hosts found, for comparing with IPAM."""
+        return {self.table.item(row, COL_ADDRESS).text():
+                (self.table.item(row, COL_MAC).text(),
+                 self.table.item(row, COL_NAME).text().replace(" (this computer)", "").replace("(this computer)", ""))
+                for row in range(self.table.rowCount())}
+
+    def show_ipam_column(self):
+        """What IPAM says about each host, from the comparison."""
+        self.table.setSortingEnabled(False)
+        for row in range(self.table.rowCount()):
+            finding = self.ipam_bar.findings.get(self.table.item(row, COL_ADDRESS).text())
+            item = SortableTableItem(finding.text if finding else "", finding.state if finding else "")
+            if finding is not None:
+                item.setForeground(finding_color(finding))
+            self.table.setItem(row, COL_IPAM, item)
+        self.table.setSortingEnabled(True)
 
     def clear_results(self):
+        self.ipam_bar.set_devices({}, soon=False)
         self.table.setRowCount(0)
         self.progress_bar.reset()
         self.status_label.clear()
@@ -375,13 +428,13 @@ class SweepTab(QWidget):
         try:
             with open(path, "w", newline="", encoding="utf-8") as file:
                 writer = csv.writer(file)
-                writer.writerow(["IP Address", "Response Time (ms)", "Host Name", "MAC Address", "Vendor"])
+                writer.writerow(["IP Address", "Response Time (ms)", "Host Name", "MAC Address", "Vendor", "IPAM"])
                 for address in self.addresses():
                     row = by_address[address]
                     rtt = self.table.item(row, COL_RTT).sort_key
                     writer.writerow([address, "" if rtt == ARP_ONLY_SORT_KEY else rtt] +
                                     [self.table.item(row, column).text()
-                                     for column in (COL_NAME, COL_MAC, COL_VENDOR)])
+                                     for column in (COL_NAME, COL_MAC, COL_VENDOR, COL_IPAM)])
         except OSError as error:
             QMessageBox.critical(self, "Export Failed", f"Couldn't save {path}:\n\n{error}")
             return
@@ -433,6 +486,11 @@ class SweepTab(QWidget):
             actions[menu.addAction("Copy MAC Address")] = lambda: QApplication.clipboard().setText(mac)
             name = self.table.item(item.row(), COL_NAME).text().replace(" (this computer)", "")
             actions[menu.addAction("Wake-on-LAN...")] = lambda: self.window.wake_device(mac, name)
+        ipam_actions = self.ipam_bar.menu_actions(host, mac, self.devices().get(host, ("", ""))[1])
+        if ipam_actions:
+            menu.addSeparator()
+            for label, action in ipam_actions:
+                actions[menu.addAction(label)] = action
         chosen = menu.exec_(self.table.viewport().mapToGlobal(position))
         if chosen in actions:
             actions[chosen]()
