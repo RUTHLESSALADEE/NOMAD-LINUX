@@ -1,0 +1,249 @@
+import datetime
+import json
+import threading
+
+import pytest
+
+from nomad.ipam.client import ServerUnreachable, TeamClient, TeamKey, TeamKeyError, TeamStore, admin_key, \
+    load_saved_key, read_key_file, save_key
+from nomad.ipam.server import ADMIN, TEAM, ConflictError, IpamServer, RequestError, change_team_secret, load_config, \
+    team_key, write_team_key
+from nomad.ipam.store import IpamError, RESERVED, USED
+
+
+@pytest.fixture
+def server(tmp_path):
+    server = IpamServer(tmp_path / "server", host="127.0.0.1", port=0)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    yield server
+    server.stop()
+    thread.join(10)
+
+
+def key_for(server, role=TEAM):
+    if role == ADMIN:
+        key = admin_key(server.directory)
+        key.port = server.port
+        return key
+    config = load_config(server.directory)
+    data = dict(team_key(config, server.directory), hosts=["127.0.0.1"], port=server.port)
+    return TeamKey.from_dict(data)
+
+
+def team_store(server, tmp_path, user, role=TEAM):
+    key = key_for(server, role)
+    store = TeamStore(key, tmp_path / f"{user}.db", TeamClient(key, user=user, computer="PC"))
+    store.sync()
+    return store
+
+
+def plan(name="11AB SIPR"):
+    return {"name": name, "replace": False, "fields": {"Unit": "11AB"},
+            "subnets": [{"cidr": "10.0.0.0/24", "name": "LAN", "gateway": "10.0.0.1", "description": "",
+                         "fields": {}}],
+            "addresses": [{"ip": "10.0.0.5", "status": USED, "name": "sw1"}]}
+
+
+def test_import_on_server_then_laptops_sync(server, tmp_path):
+    admin = team_store(server, tmp_path, "admin", ADMIN)
+    [network] = admin.import_networks([plan()])
+    assert network.fields["Unit"] == "11AB"
+
+    laptop = team_store(server, tmp_path, "alice")
+    assert [network.name for network in laptop.networks()] == ["11AB SIPR"]
+    [subnet] = laptop.subnets(network.id)
+    assert (subnet.cidr, subnet.gateway) == ("10.0.0.0/24", "10.0.0.1")
+    assert laptop.address(network.id, "10.0.0.5").name == "sw1"
+    assert laptop.online and laptop.last_sync > 0 and laptop.revision > 0
+
+    # Only the server imports and adds or deletes networks
+    with pytest.raises(IpamError, match="only be imported on the server"):
+        laptop.import_networks([plan("Other")])
+    with pytest.raises(IpamError, match="Only the server"):
+        laptop.add_network("Other")
+    with pytest.raises(IpamError, match="Only the server"):
+        laptop.delete_network(network.id)
+
+
+def test_laptop_edits_reach_everyone_and_record_who(server, tmp_path):
+    admin = team_store(server, tmp_path, "admin", ADMIN)
+    [network] = admin.import_networks([plan()])
+    alice = team_store(server, tmp_path, "alice")
+    bob = team_store(server, tmp_path, "bob")
+
+    address = alice.set_address(network.id, "10.0.0.9", RESERVED, "printer")
+    assert address.modified_by == "alice (PC)"
+    subnet = alice.subnets(network.id)[0]
+    alice.update_subnet(subnet.id, name="LAN renamed")
+    added = alice.add_subnet(network.id, "10.0.1.0/24", "New")
+    assert alice.subnet(added.id).name == "New"
+
+    bob.sync()
+    assert bob.address(network.id, "10.0.0.9").name == "printer"
+    assert {subnet.name for subnet in bob.subnets(network.id)} == {"LAN renamed", "New"}
+
+    alice.delete_subnet(added.id)
+    alice.free_address(network.id, "10.0.0.9")
+    bob.sync()
+    assert [subnet.name for subnet in bob.subnets(network.id)] == ["LAN renamed"]
+    assert bob.address(network.id, "10.0.0.9") is None
+
+
+def test_conflicts_between_laptops(server, tmp_path):
+    admin = team_store(server, tmp_path, "admin", ADMIN)
+    [network] = admin.import_networks([plan()])
+    alice = team_store(server, tmp_path, "alice")
+    bob = team_store(server, tmp_path, "bob")
+
+    # Both see 10.0.0.20 free; Alice takes it first
+    alice.set_address(network.id, "10.0.0.20", USED, "alice-pc")
+    with pytest.raises(ConflictError, match=r"10\.0\.0\.20 was just recorded as in use for alice-pc by alice \(PC\)"):
+        bob.set_address(network.id, "10.0.0.20", USED, "bob-pc")
+    assert bob.address(network.id, "10.0.0.20") is None  # Bob's copy is unchanged until he syncs
+
+    # Bob edits sw1 from an out-of-date copy
+    alice.set_address(network.id, "10.0.0.5", USED, "sw1-renamed")
+    with pytest.raises(ConflictError, match="was changed by alice"):
+        bob.set_address(network.id, "10.0.0.5", USED, "sw1-bob")
+    bob.sync()
+    bob.set_address(network.id, "10.0.0.5", USED, "sw1-bob")  # Fine once he's seen Alice's change
+
+    alice.free_address(network.id, "10.0.0.20")
+    with pytest.raises(ConflictError, match="was marked free by alice"):
+        bob.set_address(network.id, "10.0.0.20", RESERVED, "stale edit")
+
+    subnet = alice.subnets(network.id)[0]
+    alice.sync()
+    alice.update_subnet(subnet.id, description="changed")
+    with pytest.raises(ConflictError, match="That subnet was changed by alice"):
+        bob.update_subnet(subnet.id, description="mine")
+
+
+def test_keys_and_certificate_are_checked(server, tmp_path):
+    key = key_for(server)
+    wrong_fingerprint = TeamKey(key.server_id, key.hosts, key.port, "0" * 64, key.secret)
+    with pytest.raises(IpamError, match="isn't the one in the tribe key file"):
+        TeamClient(wrong_fingerprint).status()
+    wrong_secret = TeamKey(key.server_id, key.hosts, key.port, key.fingerprint, "not-the-secret")
+    with pytest.raises(TeamKeyError, match="tribe key"):
+        TeamClient(wrong_secret).status()
+    rebuilt = TeamKey("another-server", key.hosts, key.port, key.fingerprint, key.secret)
+    with pytest.raises(TeamKeyError, match="set up again"):
+        TeamClient(rebuilt).fetch_all_changes(0)
+
+    # A new tribe secret locks out the old key file
+    server.config = change_team_secret(server.directory)
+    with pytest.raises(TeamKeyError):
+        TeamClient(key).status()
+    assert TeamClient(key_for(server)).status()["role"] == TEAM
+
+    # The admin key only works from the server itself
+    with pytest.raises(RequestError, match="only works on the server"):
+        server.role_for(f"Bearer {server.config['admin_secret']}", "10.0.0.50")
+    assert server.role_for(f"Bearer {server.config['admin_secret']}", "127.0.0.1") == ADMIN
+
+
+def test_offline_laptop_keeps_its_copy(server, tmp_path):
+    admin = team_store(server, tmp_path, "admin", ADMIN)
+    [network] = admin.import_networks([plan()])
+    laptop = team_store(server, tmp_path, "alice")
+    key = key_for(server)
+    unreachable = TeamKey(key.server_id, ["127.0.0.1"], 1, key.fingerprint, key.secret)  # Nothing listens on port 1
+    offline = TeamStore(unreachable, tmp_path / "alice.db", TeamClient(unreachable, user="alice"))
+    assert offline.address(network.id, "10.0.0.5").name == "sw1"  # Still readable
+    with pytest.raises(ServerUnreachable, match="can't be changed right now"):
+        offline.set_address(network.id, "10.0.0.30", USED, "x")
+    assert not offline.online
+    laptop.close()
+
+
+def test_copy_from_another_server_is_emptied(server, tmp_path):
+    admin = team_store(server, tmp_path, "admin", ADMIN)
+    admin.import_networks([plan()])
+    laptop = team_store(server, tmp_path, "alice")
+    assert laptop.networks()
+    laptop.close()
+    key = key_for(server)
+    other = TeamKey("different-server", key.hosts, key.port, key.fingerprint, key.secret)
+    assert TeamStore(other, tmp_path / "alice.db").networks() == []
+
+
+def test_key_files(server, tmp_path):
+    path = tmp_path / "tribe.nomadkey"
+    write_team_key(path, server.config, server.directory)
+    key = read_key_file(path)
+    assert key.secret == server.config["team_secret"] and len(key.fingerprint) == 64 and key.hosts
+    with pytest.raises(TeamKeyError, match="isn't a NOMAD tribe key file"):
+        path.write_text(json.dumps({"format": 1, "hosts": []}))
+        read_key_file(path)
+
+    saved = tmp_path / "ipam-team.json"
+    save_key(key, saved)
+    assert key.secret not in saved.read_text()  # Encrypted for this Windows account
+    assert load_saved_key(saved) == key
+    assert load_saved_key(tmp_path / "missing.json") is None
+
+
+def test_backups(server, tmp_path):
+    folder = tmp_path / "server" / "backups"
+    folder.mkdir(parents=True, exist_ok=True)
+    old = folder / f"ipam-{(datetime.date.today() - datetime.timedelta(days=30)).isoformat()}.db"
+    old.write_bytes(b"")
+    target = server.backup_now()
+    assert target.exists() and target.stat().st_size > 0
+    assert not old.exists()  # Past the 14 days kept
+
+
+def test_secure_folder_leaves_files_readable(tmp_path):
+    """The server's folder is locked down, but its files (old and new) must stay readable by those granted it."""
+    import getpass
+    import subprocess
+    from nomad.ipam.service import secure_folder
+    folder = tmp_path / "server"
+    folder.mkdir()
+    (folder / "config.json").write_text("{}")
+    (folder / "backups").mkdir()
+    (folder / "backups" / "old.db").write_bytes(b"x")
+    me = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True).stdout
+    sid = me.strip().split(",")[-1].strip('"')
+    secure_folder(folder, [f"*{sid}:(OI)(CI)M", "*S-1-5-18:(OI)(CI)F"])
+    assert (folder / "config.json").read_text() == "{}"
+    assert (folder / "backups" / "old.db").read_bytes() == b"x"
+    (folder / "new.db").write_bytes(b"y")  # Files created later inherit the folder's permissions
+    assert (folder / "new.db").read_bytes() == b"y"
+    assert getpass.getuser()
+
+
+def test_waiting_laptops_hear_about_changes_at_once(server, tmp_path):
+    import time
+    admin = team_store(server, tmp_path, "admin", ADMIN)
+    [network] = admin.import_networks([plan()])
+    laptop = team_store(server, tmp_path, "alice")
+    watcher = TeamClient(key_for(server), user="bob")
+    since = watcher.status()["revision"]
+
+    started = time.monotonic()
+    assert watcher.wait(since, timeout=1) == since  # Nothing changed: answers after the timeout
+    assert 0.8 < time.monotonic() - started < 5
+
+    result = {}
+    thread = threading.Thread(target=lambda: result.update(revision=watcher.wait(since, timeout=20)))
+    started = time.monotonic()
+    thread.start()
+    time.sleep(0.3)
+    laptop.set_address(network.id, "10.0.0.40", USED, "new")
+    thread.join(10)
+    assert result["revision"] > since and time.monotonic() - started < 3  # Woken by the change, not the timeout
+    assert laptop.server_name and laptop.server_address.endswith(f":{server.port}")
+
+
+def test_older_server_is_recognised_not_offline(server, monkeypatch):
+    from nomad.ipam.client import OldServerError
+    monkeypatch.setattr(IpamServer, "wait", lambda self, since, timeout: (_ for _ in ()).throw(
+        RequestError(404, "No such request.")))  # A server from before instant sync
+    client = TeamClient(key_for(server))
+    with pytest.raises(OldServerError, match="older version"):
+        client.wait(0, 1)
+    assert not issubclass(OldServerError, ServerUnreachable)  # So the laptop doesn't show it as offline
+    assert client.status()["api"] >= 2  # This server reports what it supports

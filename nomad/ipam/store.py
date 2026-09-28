@@ -6,7 +6,9 @@ is 172.28.0.0/16). Subnets may nest (a /20 block holding /24s), and an address b
 containing it. Only addresses in use or reserved are stored; the rest of a subnet is free.
 
 Rows are never removed: deleting marks them deleted (a tombstone) and every change bumps the row's version and is
-written to the change log, so a later sync can send local changes to the server and apply everyone else's.
+written to the change log. On the NOMAD server, the change log's sequence numbers are the revisions clients sync by
+(changes_since); a client's copy of the team's data is an IpamStore filled by apply_rows, without a change log of
+its own.
 """
 import contextlib
 import datetime
@@ -15,6 +17,7 @@ import ipaddress
 import json
 import logging
 import sqlite3
+import threading
 import uuid
 from dataclasses import dataclass, field
 
@@ -27,6 +30,7 @@ SCHEMA_VERSION = 1
 USED, RESERVED = "used", "reserved"
 STATUSES = {USED: "Used", RESERVED: "Reserved"}
 MAX_NEXT_FREE_SCAN = 1 << 20  # Stop looking for a free address after this many (a /12's worth)
+TABLES = ("networks", "subnets", "addresses")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -222,12 +226,15 @@ def default_path():
 
 
 class IpamStore:
-    """The local IPAM database. Use one per thread (SQLite connections aren't shared between threads)."""
+    """An IPAM database. Use one per thread (SQLite connections aren't shared between threads), unless `shared`:
+    then callers take `lock` around each use (the server does, handling requests on several threads)."""
 
-    def __init__(self, path=None, user=None):
+    def __init__(self, path=None, user=None, shared=False):
         self.path = path or default_path()
         self.user = user or current_user()
-        self.db = sqlite3.connect(self.path, isolation_level=None)  # Transactions are begun and ended explicitly
+        self.lock = threading.RLock()
+        # Transactions are begun and ended explicitly
+        self.db = sqlite3.connect(self.path, isolation_level=None, check_same_thread=not shared)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self._depth = 0
@@ -309,6 +316,74 @@ class IpamStore:
     def pending_changes(self):
         """Changes made here that haven't been sent to a server yet."""
         return self.db.execute("SELECT COUNT(*) FROM changes WHERE pushed = 0").fetchone()[0]
+
+    # ----------------------------------------------------------------- Sync
+
+    def get_meta(self, key, default=""):
+        row = self.db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return default if row is None else row[0]
+
+    def set_meta(self, key, value):
+        self.db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (key, str(value)))
+
+    def revision(self):
+        """The latest change's number (0 before any change): what a fully synced copy has seen."""
+        return self.db.execute("SELECT COALESCE(MAX(seq), 0) FROM changes").fetchone()[0]
+
+    def changes_since(self, revision, limit=5000):
+        """Everything changed after `revision`, as each row's current state (deleted rows included, so copies
+        remove them). Returns ([{"entity": table, "row": {column: value}}], the revision they bring a copy up to,
+        whether there's more after that)."""
+        changed = self.db.execute("SELECT entity, entity_id, MAX(seq) AS seq FROM changes WHERE seq > ? "
+                                  "GROUP BY entity, entity_id ORDER BY seq LIMIT ?", (revision, limit + 1)).fetchall()
+        more = len(changed) > limit
+        changed = changed[:limit]
+        items = []
+        for change in changed:
+            row = self.db.execute(f"SELECT * FROM {change['entity']} WHERE id = ?", (change["entity_id"],)).fetchone()
+            if row is not None and change["entity"] in TABLES:
+                items.append({"entity": change["entity"], "row": dict(row)})
+        return items, (changed[-1]["seq"] if changed else revision), more
+
+    def apply_rows(self, items):
+        """Bring a copy of the server's data up to date with rows from changes_since (in the order given)."""
+        with self.transaction():
+            for item in items:
+                table, row = item["entity"], item["row"]
+                if table not in TABLES:
+                    continue
+                if table != "networks" and not row.get("deleted"):
+                    # An older row here may still hold the same address or subnet: the server's word wins
+                    self.db.execute(f"UPDATE {table} SET deleted = 1 WHERE network_id = ? AND sort_key = ? AND "
+                                    "deleted = 0 AND id != ?", (row["network_id"], row["sort_key"], row["id"]))
+                names = ", ".join(row)
+                self.db.execute(f"INSERT OR REPLACE INTO {table} ({names}) VALUES ({', '.join('?' * len(row))})",
+                                list(row.values()))
+
+    def row_of(self, table, item_id):
+        """A row as changes_since sends it, for replying to an edit."""
+        row = self.db.execute(f"SELECT * FROM {table} WHERE id = ?", (item_id,)).fetchone()
+        return None if row is None else {"entity": table, "row": dict(row)}
+
+    def import_networks(self, plans):
+        """Import prepared networks (spreadsheet.import_plan) all at once. Returns the networks."""
+        imported = []
+        with self.transaction():
+            for plan in plans:
+                fields = dict(plan["fields"])
+                existing = self.network_named(plan["name"])
+                if existing is not None and plan.get("replace"):
+                    self.clear_network(existing.id)
+                    network = self.update_network(existing.id, fields=fields)
+                else:
+                    network = self.add_network(plan["name"], fields=fields)
+                for subnet in plan["subnets"]:
+                    self.add_subnet(network.id, subnet["cidr"], subnet["name"], subnet["gateway"],
+                                    subnet["description"], subnet["fields"])
+                for address in plan["addresses"]:
+                    self.set_address(network.id, address["ip"], address["status"], address["name"])
+                imported.append(network)
+        return imported
 
     # ----------------------------------------------------------------- Networks
 

@@ -581,22 +581,26 @@ def _agree(summary, detail):
                if value and detail.fields.get(name))
 
 
+def import_plan(sheet, network_name, replace=False):
+    """What importing a page creates, as plain data (so it can be sent to the NOMAD server): the network's name,
+    details, subnets and addresses. Every difference must have a choice first."""
+    if sheet.undecided():
+        raise SpreadsheetError(f"{sheet.title}: {len(sheet.undecided())} differences still need a choice.")
+    return {
+        "name": network_name.strip(),
+        "replace": replace,
+        "fields": dict(sheet.fields, **{"Imported from": sheet.title}),
+        "subnets": [{"cidr": subnet.cidr, "name": subnet.name, "gateway": subnet.gateway,
+                     "description": subnet.description, "fields": subnet.fields}
+                    for subnet in sheet.subnets_to_import()],
+        "addresses": [{"ip": address.ip, "status": address.status, "name": address.name}
+                      for address in sheet.addresses],
+    }
+
+
 def import_page(store, sheet, network_name, replace=False):
     """Create the network (or, with replace, empty the existing one of that name) and fill it from the page.
 
     Returns the network. Every difference must have a choice first.
     """
-    if sheet.undecided():
-        raise SpreadsheetError(f"{sheet.title}: {len(sheet.undecided())} differences still need a choice.")
-    with store.transaction():
-        existing = store.network_named(network_name)
-        if existing is not None and replace:
-            store.clear_network(existing.id)
-            network = store.update_network(existing.id, fields=dict(sheet.fields, **{"Imported from": sheet.title}))
-        else:
-            network = store.add_network(network_name, fields=dict(sheet.fields, **{"Imported from": sheet.title}))
-        for subnet in sheet.subnets_to_import():
-            store.add_subnet(network.id, subnet.cidr, subnet.name, subnet.gateway, subnet.description, subnet.fields)
-        for address in sheet.addresses:
-            store.set_address(network.id, address.ip, address.status, address.name)
-    return network
+    return store.import_networks([import_plan(sheet, network_name, replace)])[0]

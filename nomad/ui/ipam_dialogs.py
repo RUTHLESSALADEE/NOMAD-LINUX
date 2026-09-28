@@ -7,7 +7,7 @@ from PyQt5.QtWidgets import QAbstractItemView, QComboBox, QDialog, QDialogButton
     QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QSplitter, QTableWidget, QTableWidgetItem, \
     QShortcut, QTabWidget, QVBoxLayout, QWidget
 
-from ..ipam.spreadsheet import DETAIL, SKIP, SUMMARY, SpreadsheetError, import_page
+from ..ipam.spreadsheet import DETAIL, SKIP, SUMMARY, SpreadsheetError, import_plan
 from ..ipam.store import STATUSES, IpamError
 from .common import set_hint
 from .theme import COLORS
@@ -197,7 +197,7 @@ class ImportDialog(QDialog):
     the detailed info disagree, the gateway to use where the sheet's isn't in its subnet, and the rows that can't
     be used. It can be maximized or shown full screen (F11) for room."""
 
-    def __init__(self, parent, store, file_name, sheets, skipped=()):
+    def __init__(self, parent, store, file_name, sheets, skipped=(), to_server=False, team_connected=False):
         super().__init__(parent)
         self.store, self.sheets = store, sheets
         self.imported = []
@@ -209,6 +209,22 @@ class ImportDialog(QDialog):
         intro = QLabel("Tick the pages to import. Where the summary at the top of a page and its Detailed Info "
                        "disagree, choose which to keep. SNMP strings are never imported.")
         intro.setWordWrap(True)
+        # Where the networks go, impossible to miss: only the IPAM server itself imports tribe networks
+        destination = QLabel()
+        destination.setWordWrap(True)
+        if to_server:
+            destination.setText("<b>Importing to the tribe's IPAM server.</b> Every connected laptop gets these "
+                                "networks as soon as the import finishes.")
+            colors = (COLORS["success_background"], COLORS["success"])
+        else:
+            team = ("You're connected to the tribe, but this import is NOT sent to the IPAM server and the tribe won't "
+                    "see it." if team_connected else "It isn't shared with anyone.")
+            destination.setText(f"<b>Importing to this computer only (Local networks).</b> {team} Tribe networks can "
+                                "only be imported on the IPAM server itself (NOMAD running as administrator there).")
+            colors = (COLORS["warning_background"], COLORS["warning"])
+        destination.setStyleSheet(f"background: {colors[0]}; border: 1px solid {colors[1]}; color: {COLORS['text']}; "
+                                  "padding: 8px;")
+        layout.addWidget(destination)
         layout.addWidget(intro)
         if skipped:
             skipped_label = QLabel(f"Skipped {len(skipped)} page{'' if len(skipped) == 1 else 's'} without a Subnet "
@@ -293,7 +309,8 @@ class ImportDialog(QDialog):
         self.full_screen_button = buttons.addButton("Full Screen (F11)", QDialogButtonBox.ActionRole)
         self.full_screen_button.clicked.connect(self.toggle_full_screen)
         QShortcut(QKeySequence("F11"), self, self.toggle_full_screen)
-        self.import_button = buttons.addButton("Import", QDialogButtonBox.AcceptRole)
+        self.import_button = buttons.addButton("Import to the Tribe Server" if to_server else
+                                               "Import to This Computer Only", QDialogButtonBox.AcceptRole)
         self.import_button.setProperty("accent", True)
         buttons.accepted.connect(self.run_import)
         buttons.rejected.connect(self.reject)
@@ -523,11 +540,12 @@ class ImportDialog(QDialog):
                 "\n".join(replacing) + "\n\nReplace them?") != QMessageBox.Yes:
             return
         try:
-            with self.store.transaction():
-                for sheet, name in chosen:
-                    self.imported.append(import_page(self.store, sheet, name, replace=name in replacing))
-                    log.info("Imported page %r as network %r: %d subnets, %d addresses, %d problems", sheet.title,
-                             name, len(sheet.subnets_to_import()), len(sheet.addresses), len(sheet.problems))
+            # All pages at once (in one request, when importing to the server), so it's all or nothing
+            self.imported = self.store.import_networks([import_plan(sheet, name, replace=name in replacing)
+                                                        for sheet, name in chosen])
+            for sheet, name in chosen:
+                log.info("Imported page %r as network %r: %d subnets, %d addresses, %d problems", sheet.title,
+                         name, len(sheet.subnets_to_import()), len(sheet.addresses), len(sheet.problems))
         except (IpamError, SpreadsheetError) as error:
             log.warning("Import failed (nothing imported): %s", error)
             self.imported = []
