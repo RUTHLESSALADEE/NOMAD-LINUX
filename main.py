@@ -44,6 +44,14 @@ def migrate_settings():
 
 def main():
     """Main entry point for the application."""
+    if "--ipam-service" in sys.argv:  # Started by Windows as the NOMAD IPAM Server service
+        from nomad.ipam.service import run_service_dispatcher
+        run_service_dispatcher()
+        return
+    if "--ipam-server" in sys.argv:  # The IPAM server in this console, for trying it out or troubleshooting
+        from nomad.ipam.server import run_in_foreground
+        run_in_foreground()
+        return
     memory_log_handler = setup_logging()
     install_exception_hook()
     log.info("Starting %s %s", APP_NAME, __version__)

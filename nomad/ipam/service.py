@@ -1,0 +1,238 @@
+"""Running the IPAM server as the "NOMAD IPAM Server" Windows service, and installing, starting and removing it.
+
+Installing (from NOMAD running as administrator on the server) sets up %ProgramData%\\NOMAD\\server (readable only
+by Administrators, SYSTEM and the service), copies NOMAD's exe to %ProgramFiles%\\NOMAD so the service doesn't
+depend on where NOMAD was started from, registers the service to start with Windows (restarting it if it fails),
+opens the port in Windows Firewall and starts it. The packaged exe runs as Network Service; when running from
+source, the service runs Python as Local System instead (Network Service can't read a user's profile folder).
+Installing again updates the exe and settings in place and keeps the data and the tribe key.
+"""
+import logging
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+from .server import IpamServer, load_config, log_to_file, server_dir, set_up
+
+log = logging.getLogger(__name__)
+
+SERVICE_NAME = "NOMADIpamServer"
+DISPLAY_NAME = "NOMAD IPAM Server"
+DESCRIPTION = "Shares the tribe's IP address management (IPAM) data with NOMAD on every laptop."
+FIREWALL_RULE = "NOMAD IPAM Server"
+SERVICE_ARGUMENT = "--ipam-service"
+NETWORK_SERVICE = r"NT AUTHORITY\NetworkService"
+START_WAIT_SECONDS = 20
+NOT_INSTALLED, STOPPED, STARTING, RUNNING, STOPPING = "Not installed", "Stopped", "Starting", "Running", "Stopping"
+# icacls grants by SID, so they work in any Windows language: SYSTEM, Administrators, Network Service
+FOLDER_GRANTS = ["*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "*S-1-5-20:(OI)(CI)M"]
+
+
+class ServiceError(Exception):
+    pass
+
+
+def install_dir():
+    return Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "NOMAD"
+
+
+def _hidden():
+    return subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+
+def _run(arguments):
+    result = subprocess.run(arguments, capture_output=True, text=True, creationflags=_hidden())
+    if result.returncode != 0:
+        raise ServiceError(f"{arguments[0]} failed: {(result.stdout + result.stderr).strip()}")
+    return result.stdout
+
+
+# --------------------------------------------------------------------- The service itself
+
+def _service_class():
+    import servicemanager
+    import win32event
+    import win32service
+    import win32serviceutil
+
+    class IpamService(win32serviceutil.ServiceFramework):
+        _svc_name_ = SERVICE_NAME
+        _svc_display_name_ = DISPLAY_NAME
+        _svc_description_ = DESCRIPTION
+
+        def __init__(self, arguments):
+            super().__init__(arguments)
+            self.stopped = win32event.CreateEvent(None, 0, 0, None)
+            self.server = None
+
+        def SvcStop(self):
+            self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+            if self.server is not None:
+                self.server.stop()
+            win32event.SetEvent(self.stopped)
+
+        def SvcDoRun(self):
+            log_to_file()
+            try:
+                self.server = IpamServer()
+            except Exception as error:  # Port in use, unreadable folder...: say why in the log and Event Viewer
+                log.exception("The IPAM server couldn't start")
+                servicemanager.LogErrorMsg(f"{DISPLAY_NAME} couldn't start: {error}")
+                return
+            thread = threading.Thread(target=self.server.serve, name="IPAM server", daemon=True)
+            thread.start()
+            win32event.WaitForSingleObject(self.stopped, win32event.INFINITE)
+            thread.join(15)
+
+    return IpamService
+
+
+def run_service_dispatcher():
+    """Hand this process to Windows' service manager (NOMAD.exe --ipam-service, started by Windows)."""
+    import servicemanager
+    servicemanager.Initialize()
+    servicemanager.PrepareToHostSingle(_service_class())
+    servicemanager.StartServiceCtrlDispatcher()
+
+
+# --------------------------------------------------------------------- Managing it (needs administrator rights)
+
+def status():
+    """NOT_INSTALLED, STOPPED, STARTING, RUNNING or STOPPING."""
+    import pywintypes
+    import win32service
+    import win32serviceutil
+    try:
+        state = win32serviceutil.QueryServiceStatus(SERVICE_NAME)[1]
+    except pywintypes.error:
+        return NOT_INSTALLED
+    return {win32service.SERVICE_STOPPED: STOPPED, win32service.SERVICE_START_PENDING: STARTING,
+            win32service.SERVICE_RUNNING: RUNNING, win32service.SERVICE_STOP_PENDING: STOPPING}.get(state, STOPPED)
+
+
+def _command():
+    """(command line, account) for the service: the packaged exe copied to Program Files, or Python and Main.py."""
+    if getattr(sys, "frozen", False):
+        target = install_dir() / "NOMAD.exe"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if Path(sys.executable).resolve() != target.resolve():
+            shutil.copy2(sys.executable, target)
+        return f'"{target}" {SERVICE_ARGUMENT}', NETWORK_SERVICE
+    python = Path(sys.executable).with_name("python.exe")
+    main = Path(__file__).resolve().parents[2] / "Main.py"
+    return f'"{python}" "{main}" {SERVICE_ARGUMENT}', None  # None: Local System
+
+
+def secure_folder(directory, grants=FOLDER_GRANTS):
+    """Only Administrators, SYSTEM and the service may read the server's folder (it holds the secrets).
+
+    The permissions are set on the folder alone, then everything in it is reset to inherit them (so files the
+    server creates later get them too). Setting them on the files directly doesn't work: icacls gives a file no
+    permissions at all when handed the folder-only (OI)(CI) flags.
+    """
+    _run(["icacls", str(directory), "/inheritance:r", "/grant:r", *grants, "/C", "/Q"])
+    if any(Path(directory).iterdir()):
+        _run(["icacls", str(Path(directory) / "*"), "/reset", "/T", "/C", "/Q"])
+
+
+def open_firewall(port):
+    subprocess.run(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={FIREWALL_RULE}"],
+                   capture_output=True, creationflags=_hidden())
+    _run(["netsh", "advfirewall", "firewall", "add", "rule", f"name={FIREWALL_RULE}", "dir=in", "action=allow",
+          "protocol=TCP", f"localport={port}", "profile=any"])
+
+
+def install(port=None):
+    """Install (or update) and start the service. Returns the server's config."""
+    import win32service
+    import win32serviceutil
+    directory = server_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    secure_folder(directory)  # First, so it also repairs a folder whose files can't be read
+    config = set_up(directory, port or 8443)
+    if port and config["port"] != port:
+        from .server import save_config
+        config["port"] = port
+        save_config(config, directory)
+    if status() in (RUNNING, STARTING):
+        stop()  # So the exe can be replaced
+    command, account = _command()
+    manager = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_ALL_ACCESS)
+    try:
+        try:
+            service = win32service.OpenService(manager, SERVICE_NAME, win32service.SERVICE_ALL_ACCESS)
+            win32service.ChangeServiceConfig(service, win32service.SERVICE_WIN32_OWN_PROCESS,
+                                             win32service.SERVICE_AUTO_START, win32service.SERVICE_ERROR_NORMAL,
+                                             command, None, 0, None, account or "LocalSystem", "", DISPLAY_NAME)
+        except win32service.error:
+            service = win32service.CreateService(manager, SERVICE_NAME, DISPLAY_NAME,
+                                                 win32service.SERVICE_ALL_ACCESS,
+                                                 win32service.SERVICE_WIN32_OWN_PROCESS,
+                                                 win32service.SERVICE_AUTO_START,
+                                                 win32service.SERVICE_ERROR_NORMAL, command, None, 0, None,
+                                                 account, None)
+        try:
+            win32service.ChangeServiceConfig2(service, win32service.SERVICE_CONFIG_DESCRIPTION, DESCRIPTION)
+            win32service.ChangeServiceConfig2(service, win32service.SERVICE_CONFIG_FAILURE_ACTIONS, {
+                "ResetPeriod": 86400, "RebootMsg": None, "Command": None,
+                "Actions": [(win32service.SC_ACTION_RESTART, 60000)] * 3})
+        finally:
+            win32service.CloseServiceHandle(service)
+    finally:
+        win32service.CloseServiceHandle(manager)
+    open_firewall(config["port"])
+    log.info("Installed the %s service: %s", DISPLAY_NAME, command)
+    start()
+    return config
+
+
+def start():
+    import win32serviceutil
+    win32serviceutil.StartService(SERVICE_NAME)
+    deadline = time.monotonic() + START_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        state = status()
+        if state == RUNNING:
+            return
+        if state == STOPPED:
+            break
+        time.sleep(0.5)
+    raise ServiceError(f"The service didn't start. {last_log_error()}")
+
+
+def stop():
+    import win32serviceutil
+    try:
+        win32serviceutil.StopServiceWithDeps(SERVICE_NAME, waitSecs=START_WAIT_SECONDS)
+    except Exception as error:  # Already stopped, or it doesn't exist
+        log.info("Stopping the service: %s", error)
+
+
+def uninstall():
+    """Stop and remove the service and its firewall rule. The data in %ProgramData%\\NOMAD\\server is kept."""
+    import win32serviceutil
+    stop()
+    win32serviceutil.RemoveService(SERVICE_NAME)
+    subprocess.run(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={FIREWALL_RULE}"],
+                   capture_output=True, creationflags=_hidden())
+
+
+def last_log_error():
+    """The last error in the server's log, to explain a failed start."""
+    try:
+        lines = (server_dir() / "server.log").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return "Details may be in Event Viewer (Windows Logs > Application)."
+    errors = [line for line in lines if " ERROR " in line or " CRITICAL " in line]
+    return errors[-1].split(": ", 1)[-1] if errors else "See the server's log for details."
+
+
+def configured_port():
+    try:
+        return load_config()["port"]
+    except (OSError, KeyError, ValueError):
+        return None

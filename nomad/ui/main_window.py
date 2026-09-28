@@ -248,6 +248,7 @@ class MainWindow(QMainWindow):
         tools_menu.addSeparator()
         tools_menu.addAction("&Flush DNS Cache", self.flush_dns)
         tools_menu.addAction("Saved Password &Protection...", lambda: self.terminal_tab.show_protection())
+        tools_menu.addAction("&IPAM Server...", self.show_ipam_server)
         tools_menu.addSeparator()
         tools_menu.addAction("Add &PuTTY to PATH", self.sweep_tab.add_putty_to_path)
         tools_menu.addAction("Default &Browser Settings...", self.open_default_apps)
@@ -437,6 +438,10 @@ class MainWindow(QMainWindow):
         if reply == QMessageBox.Yes:
             self.restart_as_admin()
         return False
+
+    def show_ipam_server(self):
+        from .ipam_server_dialog import IpamServerDialog  # Loads pywin32 only when it's needed
+        IpamServerDialog(self).exec_()
 
     def restart_as_admin(self):
         self.save_settings()
