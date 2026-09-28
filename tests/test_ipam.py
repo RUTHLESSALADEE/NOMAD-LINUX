@@ -320,3 +320,32 @@ def test_gateway_suggestions():
     assert "broadcast address, which can't be a gateway" in fix.set_gateway("10.0.0.255")
     assert fix.subnet.gateway == "10.0.0.1"  # Unchanged by the rejected entries
     assert fix.set_gateway("") is None and fix.subnet.gateway == ""  # Leave it out
+
+
+def test_comparing_the_network_with_ipam(store):
+    from nomad.ipam.reconcile import MAC_DIFFERS, NOT_RECORDED, RECORDED, RESERVED_IN_USE, candidate_networks, \
+        compare, silent
+    from nomad.ipam.store import parse_subnet
+    lab = store.add_network("Lab")
+    other = store.add_network("Other site")  # Same range in a separate network
+    store.add_subnet(lab.id, "10.0.0.0/24", "LAN")
+    store.add_subnet(other.id, "10.0.0.0/25", "LAN")
+    store.set_address(lab.id, "10.0.0.5", USED, "sw1", mac="aa:bb:cc:00:00:05")
+    store.set_address(lab.id, "10.0.0.6", USED, "printer", mac="AA-BB-CC-00-00-06")
+    store.set_address(lab.id, "10.0.0.7", RESERVED)
+    store.set_address(lab.id, "10.0.0.8", USED, "gone")
+    store.set_address(lab.id, "10.0.0.9", RESERVED, "future")
+
+    found = {"10.0.0.5": ("AA-BB-CC-00-00-05", "sw1"), "10.0.0.6": ("AA-BB-CC-00-00-99", ""),
+             "10.0.0.7": ("", ""), "10.0.0.200": ("AA-BB-CC-00-00-C8", "new-host"),
+             "169.254.1.1": ("AA-BB-CC-00-01-01", "")}  # Outside every subnet: not judged
+    assert [(source, network.name, held) for source, network, held in
+            candidate_networks([("local", store)], found)] == [("local", "Lab", 4), ("local", "Other site", 3)]
+    assert "169.254.1.1" not in compare(found, store, lab.id)
+    findings = compare(found, store, lab.id)
+    assert {ip: finding.state for ip, finding in findings.items()} == {
+        "10.0.0.5": RECORDED, "10.0.0.6": MAC_DIFFERS, "10.0.0.7": RESERVED_IN_USE, "10.0.0.200": NOT_RECORDED}
+    assert findings["10.0.0.5"].text == "In IPAM: sw1"
+    assert "IPAM has AA-BB-CC-00-00-06 for printer" in findings["10.0.0.6"].text
+    quiet = silent(store, lab.id, found, [parse_subnet("10.0.0.0/24")])
+    assert [record.ip for record in quiet] == ["10.0.0.8"]  # Reserved addresses needn't answer

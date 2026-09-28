@@ -10,12 +10,13 @@ from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QComboBo
 from ..neighbors import PERMANENT, UNRESOLVED_STATES, MacHistory, clear_neighbor_cache, delete_neighbor, \
     load_neighbors, shared_macs
 from .common import SortableTableItem, run_in_background, set_hint
+from .ipam_compare import IpamComparison, finding_color
 from .theme import COLORS
 
 log = logging.getLogger(__name__)
 
-COLUMNS = ["IP Address", "MAC Address", "Vendor", "State", "Interface", "Warning"]
-COL_ADDRESS, COL_MAC, COL_VENDOR, COL_STATE, COL_INTERFACE, COL_WARNING = range(len(COLUMNS))
+COLUMNS = ["IP Address", "MAC Address", "Vendor", "State", "Interface", "Warning", "IPAM"]
+COL_ADDRESS, COL_MAC, COL_VENDOR, COL_STATE, COL_INTERFACE, COL_WARNING, COL_IPAM = range(len(COLUMNS))
 AUTO_REFRESH_AFTER_SECONDS = 3
 WARNING_BACKGROUND = COLORS["warning_background"]
 
@@ -57,6 +58,10 @@ class NeighborsTab(QWidget):
         self.warning_label.setStyleSheet(f"background: {WARNING_BACKGROUND}; border: 1px solid "
                                          f"{COLORS['warning']}; padding: 6px;")
         layout.addWidget(self.warning_label)
+        # The ARP table only lists devices this computer has talked to, so there's no "didn't answer" list here
+        self.ipam_bar = IpamComparison(self.window, allow_silent=False)
+        self.ipam_bar.updated.connect(self.show_ipam_column)
+        layout.addWidget(self.ipam_bar)
 
         self.table = QTableWidget(0, len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
@@ -236,10 +241,23 @@ class NeighborsTab(QWidget):
             if (neighbor.interface, neighbor.address) == selected_key:
                 table.selectRow(row)
                 break
+        self.ipam_bar.set_devices({neighbor.address.partition("%")[0]: (neighbor.mac, "") for neighbor in neighbors
+                                   if neighbor.family == 4 and neighbor.mac and not neighbor.is_multicast}, soon=False)
         shown = len(neighbors)
         total = sum(1 for neighbor in self.table_data.neighbors if neighbor.family == self.family_combo.currentData())
         set_hint(self.status_label, f"Showing {shown} of {total} entries.", "info")
         self.update_buttons()
+
+    def show_ipam_column(self):
+        self.table.setSortingEnabled(False)
+        for row in range(self.table.rowCount()):
+            neighbor = self.table.item(row, COL_ADDRESS).data_object
+            finding = self.ipam_bar.findings.get(neighbor.address.partition("%")[0])
+            item = SortableTableItem(finding.text if finding else "", finding.state if finding else "", neighbor)
+            if finding is not None:
+                item.setForeground(finding_color(finding))
+            self.table.setItem(row, COL_IPAM, item)
+        self.table.setSortingEnabled(True)
 
     def selected_neighbor(self):
         rows = self.table.selectionModel().selectedRows()
@@ -265,6 +283,11 @@ class NeighborsTab(QWidget):
         if neighbor.mac:
             actions[menu.addAction("Copy MAC Address")] = lambda: QApplication.clipboard().setText(neighbor.mac)
             actions[menu.addAction("Wake-on-LAN...")] = lambda: self.window.wake_device(neighbor.mac)
+        ipam_actions = self.ipam_bar.menu_actions(address, neighbor.mac, "") if neighbor.family == 4 else []
+        if ipam_actions:
+            menu.addSeparator()
+            for label, action in ipam_actions:
+                actions[menu.addAction(label)] = action
         menu.addSeparator()
         actions[menu.addAction("Delete Entry")] = lambda: self.delete_entry(neighbor)
         chosen = menu.exec_(self.table.viewport().mapToGlobal(position))

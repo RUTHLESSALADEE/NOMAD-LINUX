@@ -25,6 +25,7 @@ from ..ipam.client import OldServerError, ServerUnreachable, TeamKeyError, TeamS
 from ..ipam.server import ConflictError, server_dir
 from ..ipam.spreadsheet import SpreadsheetError, parse_page, read_pages
 from ..ipam.store import RESERVED, STATUSES, IpamError, IpamStore
+from ..oui import normalize_mac
 from ..system import log_dir
 from .common import SortableTableItem, run_in_background, set_hint
 from .ipam_dialogs import AddressDialog, ImportDialog, NetworkDialog, SubnetDialog
@@ -32,7 +33,8 @@ from .theme import COLORS, accent_button
 
 log = logging.getLogger(__name__)
 
-ADDRESS_COLUMNS = ["Address", "Status", "Name", "MAC Address", "Description", "Last Changed"]
+ADDRESS_COLUMNS = ["Address", "Status", "Last Sweep", "Name", "MAC Address", "Description", "Last Changed"]
+COL_SWEEP = 2
 RESULT_COLUMNS = ["Network", "Subnet", "Subnet Name", "Address", "Status", "Name", "Description"]
 LIST_EVERY_ADDRESS_UP_TO = 65536  # Larger subnets list only the addresses in use (a /16 is still listed in full)
 UNSUBNETTED = "unsubnetted"
@@ -44,8 +46,8 @@ RETRY_SECONDS = 15  # After losing the server, how soon to try again
 POLL_SECONDS = 30  # How often to check an older server (without instant sync) for changes
 STATUS_REFRESH_MS = 30 * 1000
 ADMIN_COPY_FILE = "ipam-server-admin.db"
-OFFLINE_NOTE = "The IPAM server can't be reached, so tribe networks are read-only for now (changing them offline " \
-               "comes in a later version)."
+OFFLINE_NOTE = "The IPAM server can't be reached. You can still assign, edit and free addresses: they're kept as " \
+               "pending and sent when it's back. Subnets and networks can only be changed online."
 
 
 class ServerWatcher(QObject):
@@ -140,10 +142,14 @@ class AddressModel(QAbstractTableModel):
         self.nested = []  # [(Block, name)] subnets inside this one
         self.rows = None  # [address] when not listing every address
         self.first = 0
+        self.pending = set()  # Addresses (as text) with a change waiting to be sent to the IPAM server
+        self.sweep = None  # SweepResults for this network, when it has been swept this session
 
-    def load(self, network, recorded, special, nested, every_address):
+    def load(self, network, recorded, special, nested, every_address, pending=(), sweep=None):
         self.beginResetModel()
         self.network, self.recorded, self.special, self.nested = network, recorded, special, nested
+        self.pending = set(pending)
+        self.sweep = sweep
         self.first = int(network.network_address) if network is not None else 0
         if network is not None and every_address:
             self.rows = None
@@ -179,6 +185,9 @@ class AddressModel(QAbstractTableModel):
     def status_text(self, address):
         record = self.recorded.get(address)
         special = self.special.get(address)
+        if str(address) in self.pending:
+            status = STATUSES.get(record.status, record.status) if record is not None else "Free"
+            return f"{status} · pending"
         if record is not None:
             status = STATUSES.get(record.status, record.status)
             return f"{special} · {status}" if special else status
@@ -189,26 +198,60 @@ class AddressModel(QAbstractTableModel):
             return f"In {nested[0]}"
         return FREE
 
+    def sweep_result(self, address):
+        """(what the last sweep saw, colour name, explanation) for the Last Sweep column, or None."""
+        if self.sweep is None:
+            return None
+        record = self.recorded.get(address)
+        answer = self.sweep.hosts.get(address)
+        when = time.strftime("%H:%M", time.localtime(answer[2] if answer else self.sweep.swept_at(address) or 0))
+        if answer is not None:
+            rtt, mac, _ = answer
+            speed = "no ping reply (ARP)" if rtt is None else "<1 ms" if rtt < 1 else f"{rtt} ms"
+            text = f"Answered · {speed} · {when}"
+            if record is None and address not in self.special:
+                return text, "warning", f"A device answered at {when} but IPAM has no record of this address."
+            if record is not None and mac and record.mac and normalize_mac(mac) != normalize_mac(record.mac):
+                return text, "error", f"Answered at {when} from {mac}, but IPAM records {record.mac}."
+            return text, "success", f"Answered the sweep at {when}" + (f" from {mac}." if mac else ".")
+        if not self.sweep.swept_at(address) or self.special.get(address) in ("Network", "Broadcast",
+                                                                                "Subnet router anycast"):
+            return None  # Not swept, or an address no device uses
+        text = f"No answer · {when}"
+        if record is not None and record.status != RESERVED:
+            return text, "error", (f"Recorded as used but didn't answer the sweep at {when}: it may be switched "
+                                   "off, block ping and ARP, or be gone.")
+        return text, "muted", f"Nothing answered here in the sweep at {when}."
+
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid():
             return None
         address = self.address_at(index.row())
         record = self.recorded.get(address)
         column = index.column()
+        if column == COL_SWEEP and role in (Qt.DisplayRole, Qt.ForegroundRole, Qt.ToolTipRole):
+            result = self.sweep_result(address)
+            if result is None:
+                return None
+            text, color, explanation = result
+            return {Qt.DisplayRole: text, Qt.ForegroundRole: QColor(COLORS[color]),
+                    Qt.ToolTipRole: explanation}[role]
         if role == Qt.DisplayRole:
             if column == 0:
                 return str(address)
             if column == 1:
                 return self.status_text(address)
             if record is None:
-                if column == 2 and address not in self.special:
+                if column == 3 and address not in self.special:
                     nested = self.nested_name(address)
                     return nested[1] if nested else ""
                 return ""
-            if column == 5:
+            if column == 6:
                 return f"{record.modified[:10]} {record.modified_by}" if record.modified else ""
-            return (record.name, record.mac, record.description)[column - 2]
+            return (record.name, record.mac, record.description)[column - 3]
         if role == Qt.ForegroundRole:
+            if str(address) in self.pending and column == 1:
+                return QColor(COLORS["link"])
             if record is None:
                 return QColor(COLORS["muted"])
             if record.status == RESERVED and column == 1:
@@ -217,9 +260,35 @@ class AddressModel(QAbstractTableModel):
             font = QFont()
             font.setItalic(True)
             return font
+        if role == Qt.ToolTipRole and str(address) in self.pending:
+            return "Changed while the IPAM server couldn't be reached: waiting to be sent to it."
         if role == Qt.UserRole:
             return address
         return None
+
+
+class SweepResults:
+    """What sweeps this session found in one IPAM network: the hosts that answered, and the ranges swept in full
+    (so an address in them that isn't among the hosts didn't answer). A later sweep of a range replaces what an
+    earlier one said about it."""
+
+    def __init__(self):
+        self.hosts = {}  # {address: (response ms or None for ARP only, MAC, when)}
+        self.ranges = []  # [(Block, when)]
+
+    def add(self, ranges, hosts, complete):
+        now = time.time()
+        if complete:
+            for block in ranges:
+                self.hosts = {address: hit for address, hit in self.hosts.items() if address not in block}
+                self.ranges = [(old, when) for old, when in self.ranges if not old.subnet_of(block)] + [(block, now)]
+        for ip, (rtt, mac) in hosts.items():
+            self.hosts[ipaddress.ip_address(ip)] = (rtt, mac, now)
+
+    def swept_at(self, address):
+        """When the latest full sweep covering this address ran, or None."""
+        times = [when for block, when in self.ranges if address in block]
+        return max(times) if times else None
 
 
 class IpamTab(QWidget):
@@ -236,6 +305,7 @@ class IpamTab(QWidget):
         self.sync_again = False  # A change arrived during a sync: sync once more when it ends
         self.watcher = None
         self.server_outdated = False  # The server lacks instant sync (an older NOMAD)
+        self.sweeps = {}  # {"source:network id": SweepResults} from sweeps this session
         self.init_ui()
         self.sync_timer = QTimer(self)
         self.sync_timer.timeout.connect(self.sync_now)
@@ -251,8 +321,13 @@ class IpamTab(QWidget):
         return self.team if self.source == TEAM and self.team is not None else self.local_store
 
     def can_edit(self):
-        """Whether the selected network can be changed now (tribe networks need the server)."""
+        """Whether the selected network's subnets and details can be changed now (tribe networks need the
+        server for those)."""
         return self.source == LOCAL or (self.team is not None and self.team.online)
+
+    def can_edit_addresses(self):
+        """Addresses can always be changed: offline, tribe changes wait as pending until the server is back."""
+        return self.source == LOCAL or self.team is not None
 
     # ----------------------------------------------------------------- Layout
 
@@ -287,6 +362,12 @@ class IpamTab(QWidget):
         self.server_label = QLabel()
         self.server_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         top.addWidget(self.server_label)
+        self.refused_button = QPushButton()
+        self.refused_button.setToolTip("Changes made offline that the IPAM server couldn't make, because someone "
+                                       "else changed those addresses first.")
+        self.refused_button.clicked.connect(self.review_refused)
+        self.refused_button.setVisible(False)
+        top.addWidget(self.refused_button)
         top.addStretch()
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Find an address, name or subnet in every network")
@@ -340,10 +421,14 @@ class IpamTab(QWidget):
         self.next_free_button.setProperty("normal_tip", "Record the lowest free address in this subnet (not the "
                                                         "network, broadcast or gateway address).")
         self.next_free_button.setToolTip(self.next_free_button.property("normal_tip"))
+        self.sweep_button = QPushButton("Sweep Subnet")
+        self.sweep_button.setToolTip("Ping every address in this subnet on the Sweep page and compare what answers "
+                                     "with IPAM: devices not recorded, MAC addresses that differ, and recorded "
+                                     "addresses that don't answer.")
         self.edit_address_button = QPushButton("Edit...")
         self.free_button = QPushButton("Mark Free")
         self.hide_free_check = QCheckBox("Hide free addresses")
-        for widget in (self.next_free_button, self.edit_address_button, self.free_button):
+        for widget in (self.next_free_button, self.edit_address_button, self.free_button, self.sweep_button):
             address_buttons.addWidget(widget)
         address_buttons.addStretch()
         address_buttons.addWidget(self.hide_free_check)
@@ -397,6 +482,7 @@ class IpamTab(QWidget):
         self.edit_subnet_button.clicked.connect(self.edit_subnet)
         self.delete_subnet_button.clicked.connect(self.delete_subnet)
         self.next_free_button.clicked.connect(self.use_next_free)
+        self.sweep_button.clicked.connect(self.sweep_subnet)
         self.edit_address_button.clicked.connect(self.edit_address)
         self.free_button.clicked.connect(self.free_addresses)
         self.hide_free_check.toggled.connect(lambda: self.show_subnet())
@@ -532,10 +618,13 @@ class IpamTab(QWidget):
                                     "IPAM.", "success")
 
     def disconnect_team(self):
+        unsent = (self.team.pending_count() + len(self.team.refused())) if self.team is not None else 0
+        warning = f"\n\n{unsent} change{'s' if unsent != 1 else ''} made offline haven't reached the server and " \
+                  "will be lost." if unsent else ""
         if QMessageBox.question(self, "Disconnect from the Tribe",
                                 "Stop using the tribe's IPAM server on this computer? The saved tribe key and the "
-                                "copy of the tribe's networks are removed; your local networks are kept.") != \
-                QMessageBox.Yes:
+                                "copy of the tribe's networks are removed; your local networks are kept." +
+                                warning) != QMessageBox.Yes:
             return
         forget_key()
         if self.team is not None:
@@ -550,15 +639,17 @@ class IpamTab(QWidget):
         if self.team is None or self.syncing:
             return
         self.syncing = True
-        client, revision = self.team.client, self.team.revision
+        team, client, revision, outgoing = self.team, self.team.client, self.team.revision, self.team.outgoing()
         if announce:
             set_hint(self.team_label, "Tribe: syncing...", "info")
 
         def fetch():
+            sent = []
             try:
-                return client.fetch_all_changes(revision)
+                sent = team.send_pending(outgoing) if outgoing else []  # Only talks to the server: thread-safe
+                return sent, client.fetch_all_changes(revision)
             except IpamError as error:  # Offline or refused: expected, so not logged as a failure
-                return error
+                return sent, error
 
         run_in_background(fetch, lambda result: self.sync_done(result, announce), self.sync_failed)
 
@@ -569,6 +660,18 @@ class IpamTab(QWidget):
         if self.sync_again:
             self.sync_again = False
             QTimer.singleShot(0, self.sync_now)
+        sent_results, result = result
+        if sent_results:
+            sent, refused = self.team.apply_sent(sent_results)
+            log.info("Sent %d offline changes to the IPAM server; %d refused", sent, refused)
+            if refused:
+                set_hint(self.status_label, f"{refused} change{'s' if refused != 1 else ''} made offline couldn't "
+                                            "be made: someone else changed those addresses first. Use Review "
+                                            "Refused Changes to choose what to do.", "warning")
+            elif sent:
+                set_hint(self.status_label, f"Sent {sent} change{'s' if sent != 1 else ''} made offline to the IPAM "
+                                            "server.", "success")
+            self.refresh_everything()
         if isinstance(result, Exception):
             self.sync_failed(result)
             if announce:
@@ -587,6 +690,8 @@ class IpamTab(QWidget):
 
     def sync_failed(self, error):
         self.syncing = False
+        if isinstance(error, tuple):  # (sent, error) from a sync that sent some changes first
+            error = error[1]
         self.sync_again = False
         if self.team is None:
             return
@@ -619,9 +724,16 @@ class IpamTab(QWidget):
             set_hint(self.team_label, "Tribe: not connected. To share networks with the tribe, use Tribe > Connect "
                                       "with Tribe Key File." + hint, "info")
             set_hint(self.server_label, "No IPAM server", "info")
+            self.refused_button.setVisible(False)
             self.server_label.setToolTip("Not connected to the tribe's IPAM server.")
             return
         synced = f"synced {ago(time.time() - team.last_sync)}" if team.last_sync else "not synced yet"
+        waiting = team.pending_count()
+        if waiting:
+            synced += f"; {waiting} change{'s' if waiting != 1 else ''} waiting to be sent"
+        refused = len(team.refused())
+        self.refused_button.setText(f"Review Refused Changes ({refused})")
+        self.refused_button.setVisible(bool(refused))
         who = "Server admin: this is the server's IPAM; imports and new networks go to it" if admin else "Tribe"
         server = "This computer (IPAM server)" if admin else team.server_name
         if team.key_rejected:
@@ -649,6 +761,56 @@ class IpamTab(QWidget):
         if team.last_error:
             details.append(f"Last problem: {team.last_error}")
         self.server_label.setToolTip("\n".join(details))
+
+    # ----------------------------------------------------------------- For other pages (Sweep, ARP)
+
+    def ipam_stores(self):
+        """[(source, store)] with networks to compare against: the tribe's first, then this computer's."""
+        if not self.open_store():
+            return []
+        return ([(TEAM, self.team)] if self.team is not None else []) + [(LOCAL, self.local_store)]
+
+    def store_for(self, source):
+        return self.team if source == TEAM else self.local_store
+
+    def can_change_addresses(self, source):
+        return source == LOCAL or self.team is not None
+
+    def show_address(self, source, network_id, ip):
+        """Go to an address on this page."""
+        self.window.navigator.setCurrentWidget(self)
+        self.subnet_filter.clear()
+        self.search_input.clear()
+        self.right_stack.setCurrentIndex(0)
+        self.fill_networks(f"{source}:{network_id}")
+        store = self.store_for(source)
+        subnet = store.subnet_for(network_id, ip) if store is not None else None
+        self.fill_tree(select=subnet if subnet is not None else UNSUBNETTED)
+        self.select_address(ipaddress.ip_address(ip))
+
+    def record_sweep(self, source, network_id, ranges, hosts, complete):
+        """A sweep compared with this IPAM network finished: show what it found in the Last Sweep column."""
+        self.sweeps.setdefault(f"{source}:{network_id}", SweepResults()).add(ranges, hosts, complete)
+        if self.local_store is not None and (source, network_id) == (self.source, self.network_id):
+            self.refresh_current()
+
+    def refresh_after_external_change(self):
+        """Another page changed IPAM: show it here, and send tribe changes on."""
+        if self.local_store is None:
+            return
+        self.refresh_everything()
+        self.show_team_status()
+        if self.team is not None:
+            self.sync_now()
+
+    def review_refused(self):
+        from .ipam_dialogs import RefusedDialog
+        if self.team is None:
+            return
+        RefusedDialog(self, self.team).exec_()
+        self.refresh_everything()
+        self.show_team_status()
+        self.sync_now()
 
     def report(self, error, action="That change"):
         """Explain a change the server refused, and sync so the page shows the latest."""
@@ -717,9 +879,8 @@ class IpamTab(QWidget):
                                            "page) into this computer's IPAM (Local). The tribe's networks are "
                                            "imported on the server.")
         tip = "" if editable or not has_network else OFFLINE_NOTE
-        for widget in (self.add_subnet_button, self.edit_subnet_button, self.delete_subnet_button,
-                       self.next_free_button, self.edit_address_button, self.free_button):
-            widget.setToolTip(tip or widget.property("normal_tip") or "")
+        for widget in (self.add_subnet_button, self.edit_subnet_button, self.delete_subnet_button):
+            widget.setToolTip(tip)
 
     def network(self):
         return self.store.network(self.network_id) if self.network_id else None
@@ -893,7 +1054,13 @@ class IpamTab(QWidget):
             menu.addSeparator()
             menu.addAction("Copy Subnet", lambda: QApplication.clipboard().setText(subnet.cidr))
             menu.addAction("Open in Subnet Calculator", lambda: self.open_calculator(subnet.cidr))
+            menu.addAction("Sweep Subnet", self.sweep_subnet).setEnabled(subnet.network.version == 4)
         menu.exec_(self.tree.viewport().mapToGlobal(position))
+
+    def sweep_subnet(self):
+        subnet = self.selected_subnet()
+        if subnet is not None:
+            self.window.sweep_tab.sweep_subnet(subnet.cidr, self.source, self.network_id)
 
     def open_calculator(self, cidr):
         self.window.navigator.setCurrentWidget(self.window.utilities_tab)
@@ -919,7 +1086,9 @@ class IpamTab(QWidget):
             nested = [(other.network, other.name) for other in self.subnets if other.id != subnet.id and
                       other.network.version == network.version and other.network.subnet_of(network)]
             every = not self.hide_free_check.isChecked() and network.num_addresses <= LIST_EVERY_ADDRESS_UP_TO
-            self.model.load(network, recorded, subnet.special_addresses(), nested, every)
+            pending = self.team.pending_ips(self.network_id) if self.source == TEAM and self.team else ()
+            sweep = self.sweeps.get(f"{self.source}:{self.network_id}")
+            self.model.load(network, recorded, subnet.special_addresses(), nested, every, pending, sweep)
             parts = [f"<b>{subnet.cidr}</b>"]
             if subnet.name:
                 parts.append(subnet.name)
@@ -928,6 +1097,13 @@ class IpamTab(QWidget):
             parts.append(f"netmask {network.netmask}" if network.version == 4 else f"{network.num_addresses:,} "
                                                                                       "addresses")
             parts.append(f"{len(recorded)} of {usable_count(network):,} recorded")
+            swept = sweep.swept_at(network.network_address) if sweep is not None else None
+            if swept:
+                answered = sum(1 for address in sweep.hosts if address in network)
+                silent = sum(1 for address, record in recorded.items() if record.status != RESERVED and
+                             address not in sweep.hosts)
+                parts.append(f"swept {time.strftime('%H:%M', time.localtime(swept))}: {answered} answered, "
+                             f"{silent} recorded but silent")
             parts += [f"{name}: {value}" for name, value in subnet.fields.items()]
             if subnet.description:
                 parts.append(subnet.description)
@@ -936,7 +1112,8 @@ class IpamTab(QWidget):
             self.subnet_label.setText("   ·   ".join(parts))
         self.table.resizeColumnToContents(0)
         metrics = self.table.fontMetrics()
-        for column, sample in ((1, "Gateway · Reserved"), (2, "M" * 16), (3, "00-00-00-00-00-00")):
+        for column, sample in ((1, "Gateway · Reserved"), (COL_SWEEP, "Answered · <1 ms · 00:00"), (3, "M" * 16),
+                               (4, "00-00-00-00-00-00")):
             self.table.setColumnWidth(column, metrics.horizontalAdvance(sample) + 24)
         self.update_buttons()
 
@@ -948,10 +1125,14 @@ class IpamTab(QWidget):
         has_subnet = self.selected_subnet() is not None
         self.edit_subnet_button.setEnabled(has_subnet and editable)
         self.delete_subnet_button.setEnabled(has_subnet and editable)
-        self.next_free_button.setEnabled(has_subnet and editable)
+        subnet = self.selected_subnet()
+        self.sweep_button.setEnabled(subnet is not None and subnet.network.version == 4)  # Sweep is IPv4 only
+        addresses_editable = self.can_edit_addresses()
+        self.next_free_button.setEnabled(has_subnet and addresses_editable)
         selected = self.selected_addresses()
-        self.edit_address_button.setEnabled(len(selected) == 1 and editable)
-        self.free_button.setEnabled(editable and any(address in self.model.recorded for address in selected))
+        self.edit_address_button.setEnabled(len(selected) == 1 and addresses_editable)
+        self.free_button.setEnabled(addresses_editable and any(address in self.model.recorded
+                                                               for address in selected))
         self.update_permissions()
 
     def edit_address(self, address=None):
@@ -964,7 +1145,7 @@ class IpamTab(QWidget):
         special = self.model.special.get(address)
         if special and address not in self.model.recorded:
             note = f"This is the subnet's {special.lower()} address."
-        if not self.can_edit():
+        if not self.can_edit_addresses():
             return
         record = self.store.address(self.network_id, address)
         dialog = AddressDialog(self, self.store, self.network_id, str(address), record, note)
@@ -1030,12 +1211,12 @@ class IpamTab(QWidget):
         menu = QMenu(self)
         host = str(selected[0])
         if len(selected) == 1:
-            menu.addAction("Edit...", self.edit_address).setEnabled(self.can_edit())
+            menu.addAction("Edit...", self.edit_address).setEnabled(self.can_edit_addresses())
         if any(address in self.model.recorded for address in selected):
-            menu.addAction("Mark Free", self.free_addresses).setEnabled(self.can_edit())
+            menu.addAction("Mark Free", self.free_addresses).setEnabled(self.can_edit_addresses())
         menu.addAction("Copy", lambda: QApplication.clipboard().setText(
             "\n".join(self.model.data(self.model.index(index.row(), 0)) + "\t" +
-                      self.model.data(self.model.index(index.row(), 2)) for index in
+                      self.model.data(self.model.index(index.row(), 3)) for index in
                       self.table.selectionModel().selectedRows())))
         if len(selected) == 1:
             menu.addSeparator()

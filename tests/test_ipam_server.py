@@ -144,18 +144,74 @@ def test_keys_and_certificate_are_checked(server, tmp_path):
     assert server.role_for(f"Bearer {server.config['admin_secret']}", "127.0.0.1") == ADMIN
 
 
-def test_offline_laptop_keeps_its_copy(server, tmp_path):
+def offline_store(server, tmp_path, user="alice"):
+    """A laptop whose copy is `user`.db but which can't reach the server (nothing listens on port 1)."""
+    key = key_for(server)
+    unreachable = TeamKey(key.server_id, ["127.0.0.1"], 1, key.fingerprint, key.secret)
+    return TeamStore(unreachable, tmp_path / f"{user}.db", TeamClient(unreachable, user=user, computer="PC"))
+
+
+def online_again(server, tmp_path, user="alice"):
+    key = key_for(server)
+    return TeamStore(key, tmp_path / f"{user}.db", TeamClient(key, user=user, computer="PC"))
+
+
+def test_offline_changes_wait_then_reach_the_server(server, tmp_path):
     admin = team_store(server, tmp_path, "admin", ADMIN)
     [network] = admin.import_networks([plan()])
-    laptop = team_store(server, tmp_path, "alice")
-    key = key_for(server)
-    unreachable = TeamKey(key.server_id, ["127.0.0.1"], 1, key.fingerprint, key.secret)  # Nothing listens on port 1
-    offline = TeamStore(unreachable, tmp_path / "alice.db", TeamClient(unreachable, user="alice"))
-    assert offline.address(network.id, "10.0.0.5").name == "sw1"  # Still readable
-    with pytest.raises(ServerUnreachable, match="can't be changed right now"):
-        offline.set_address(network.id, "10.0.0.30", USED, "x")
-    assert not offline.online
+    team_store(server, tmp_path, "alice").close()  # Alice's copy is up to date, then she goes offline
+
+    laptop = offline_store(server, tmp_path)
+    assert laptop.address(network.id, "10.0.0.5").name == "sw1"  # Still readable
+    laptop.set_address(network.id, "10.0.0.30", USED, "field-laptop")  # Assigned offline
+    laptop.set_address(network.id, "10.0.0.5", USED, "sw1-renamed")
+    laptop.set_address(network.id, "10.0.0.5", RESERVED, "sw1-final")  # Merged with the change before
+    laptop.free_address(network.id, "10.0.0.31")  # Free already: nothing to do
+    laptop.set_address(network.id, "10.0.0.32", USED, "temporary")
+    laptop.free_address(network.id, "10.0.0.32")  # Recorded and freed offline: nothing to send
+    assert laptop.address(network.id, "10.0.0.30").name == "field-laptop"  # Usable straight away
+    assert laptop.pending_count() == 2 and laptop.pending_ips(network.id) == {"10.0.0.30", "10.0.0.5"}
+    with pytest.raises(ServerUnreachable, match="subnets and networks can't be changed"):
+        laptop.add_subnet(network.id, "10.0.9.0/24")  # Only addresses change offline
     laptop.close()
+
+    laptop = online_again(server, tmp_path)  # Pending changes survive a restart
+    assert laptop.pending_count() == 2
+    assert laptop.flush() == (2, 0)
+    assert laptop.pending_count() == 0
+    bob = team_store(server, tmp_path, "bob")
+    assert bob.address(network.id, "10.0.0.30").name == "field-laptop"
+    assert (bob.address(network.id, "10.0.0.5").status, bob.address(network.id, "10.0.0.5").name) ==            (RESERVED, "sw1-final")
+    assert bob.address(network.id, "10.0.0.30").modified_by == "alice (PC)"
+
+
+def test_offline_changes_someone_beat_are_refused(server, tmp_path):
+    admin = team_store(server, tmp_path, "admin", ADMIN)
+    [network] = admin.import_networks([plan()])
+    team_store(server, tmp_path, "alice").close()
+    laptop = offline_store(server, tmp_path)
+    laptop.set_address(network.id, "10.0.0.40", USED, "alice-offline")
+    laptop.set_address(network.id, "10.0.0.5", USED, "alice-edit")
+    laptop.set_address(network.id, "10.0.0.41", USED, "no-conflict")
+    laptop.close()
+
+    bob = team_store(server, tmp_path, "bob")  # Meanwhile, online
+    bob.set_address(network.id, "10.0.0.40", USED, "bob-online")
+    bob.set_address(network.id, "10.0.0.5", USED, "bob-edit")
+
+    laptop = online_again(server, tmp_path)
+    assert laptop.flush() == (1, 2)
+    refused = {entry["ip"]: entry for entry in laptop.refused()}
+    assert set(refused) == {"10.0.0.40", "10.0.0.5"}
+    assert "was just recorded as in use for bob-online by bob" in refused["10.0.0.40"]["error"]
+    assert "was changed by bob" in refused["10.0.0.5"]["error"]
+    assert refused["10.0.0.40"]["data"]["name"] == "alice-offline"  # Kept, to use another address instead
+    assert laptop.address(network.id, "10.0.0.40") is None  # Back to what the server had when she went offline
+    assert laptop.address(network.id, "10.0.0.5").name == "sw1"
+    laptop.sync()
+    assert laptop.address(network.id, "10.0.0.40").name == "bob-online"
+    laptop.discard(refused["10.0.0.5"]["seq"])
+    assert [entry["ip"] for entry in laptop.refused()] == ["10.0.0.40"]
 
 
 def test_copy_from_another_server_is_emptied(server, tmp_path):
@@ -247,3 +303,22 @@ def test_older_server_is_recognised_not_offline(server, monkeypatch):
         client.wait(0, 1)
     assert not issubclass(OldServerError, ServerUnreachable)  # So the laptop doesn't show it as offline
     assert client.status()["api"] >= 2  # This server reports what it supports
+
+
+def test_refusal_keeps_the_newer_server_version(server, tmp_path):
+    """A sync brings someone else's change to an address while this laptop's own change to it is still waiting:
+    when that waiting change is refused, the copy must show the other person's change, not the old state."""
+    admin = team_store(server, tmp_path, "admin", ADMIN)
+    [network] = admin.import_networks([plan()])
+    team_store(server, tmp_path, "alice").close()
+    laptop = offline_store(server, tmp_path)
+    laptop.set_address(network.id, "10.0.0.50", USED, "alice-offline")
+    laptop.close()
+    team_store(server, tmp_path, "bob").set_address(network.id, "10.0.0.50", USED, "bob-online")
+
+    laptop = online_again(server, tmp_path)
+    laptop.sync()  # Brings Bob's row while Alice's change is still waiting...
+    assert laptop.address(network.id, "10.0.0.50").name == "alice-offline"  # ...which still shows, as pending
+    assert laptop.pending_ips(network.id) == {"10.0.0.50"}
+    assert laptop.flush() == (0, 1)
+    assert laptop.address(network.id, "10.0.0.50").name == "bob-online"
