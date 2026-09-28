@@ -366,7 +366,10 @@ class PortsTab(QWidget):
             elif result.port == 3389:
                 actions[menu.addAction("Remote Desktop")] = lambda: self.open_port(result)
             elif result.port == 22:
-                actions[menu.addAction("SSH with PuTTY")] = lambda: self.open_port(result)
+                actions[menu.addAction("Open SSH Session")] = lambda: self.open_port(result)
+                actions[menu.addAction("SSH with PuTTY")] = lambda: self.window.sweep_tab.open_ssh(self.scanned_host)
+            elif result.port == 23:
+                actions[menu.addAction("Open Telnet Session")] = lambda: self.open_port(result)
             if actions:
                 menu.addSeparator()
         actions[menu.addAction(f"Copy {target}")] = lambda: QApplication.clipboard().setText(target)
@@ -375,8 +378,8 @@ class PortsTab(QWidget):
             actions[chosen]()
 
     def check_web(self, url):
-        self.window.tabs.setCurrentWidget(self.window.services_tab)
-        self.window.services_tab.check_url(url)
+        self.window.navigator.setCurrentWidget(self.window.web_check_tab)
+        self.window.web_check_tab.check_url(url)
 
     def open_port(self, result):
         """Open a web page, Remote Desktop or SSH session on an open port."""
@@ -394,4 +397,6 @@ class PortsTab(QWidget):
             except OSError as error:
                 QMessageBox.critical(self, "Remote Desktop", f"Couldn't start Remote Desktop:\n\n{error}")
         elif result.port == 22:
-            self.window.sweep_tab.open_ssh(host)
+            self.window.terminal_tab.open_address(host, "SSH")
+        elif result.port == 23:
+            self.window.terminal_tab.open_address(host, "Telnet")

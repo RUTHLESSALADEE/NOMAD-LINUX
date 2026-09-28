@@ -14,7 +14,8 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 
-from .system import CommandError, run_command
+from . import pktmon
+from .system import CommandError
 
 log = logging.getLogger(__name__)
 
@@ -285,20 +286,12 @@ def neighbors_from_pcapng(data):
 
 # ----------------------------------------------------------------- Capture with pktmon
 
-def find_pktmon():
-    return shutil.which("pktmon.exe")
-
-
-def _pktmon(*arguments):
-    return run_command(["pktmon", *arguments], timeout=60)
-
-
 def _add_filters():
     try:
-        _pktmon("filter", "add", f"{FILTER_PREFIX}-LLDP", "-d", f"0x{LLDP_ETHERTYPE:04X}")
+        pktmon.add_filter(f"{FILTER_PREFIX}-LLDP", "-d", f"0x{LLDP_ETHERTYPE:04X}")
     except CommandError:  # Some versions only take decimal protocol numbers
-        _pktmon("filter", "add", f"{FILTER_PREFIX}-LLDP", "-d", str(LLDP_ETHERTYPE))
-    _pktmon("filter", "add", f"{FILTER_PREFIX}-CDP", "-m", CDP_MAC)
+        pktmon.add_filter(f"{FILTER_PREFIX}-LLDP", "-d", str(LLDP_ETHERTYPE))
+    pktmon.add_filter(f"{FILTER_PREFIX}-CDP", "-m", CDP_MAC)
 
 
 def discover(duration, should_stop=lambda: False, found=lambda neighbor: None,
@@ -306,35 +299,32 @@ def discover(duration, should_stop=lambda: False, found=lambda neighbor: None,
     """Listen for switch announcements on every wired adapter for up to `duration` seconds.
 
     Stops early once a segment has heard at least one switch. found(neighbor) is called for each new one.
-    Raises CommandError (for example, without administrator rights) or OSError.
+    Raises CommandError (for example, without administrator rights), pktmon.PktmonBusy or OSError.
     Note: this replaces any packet filters set in pktmon, and removes them when done.
     """
-    if not find_pktmon():
+    if not pktmon.find_pktmon():
         raise OSError("pktmon isn't available. It comes with Windows 10 version 1809 and later.")
+    pktmon.acquire("finding the switch port")
     folder = tempfile.mkdtemp(prefix="nomad-lldp-")
     etl, pcap = os.path.join(folder, "capture.etl"), os.path.join(folder, "capture.pcapng")
     seen = {}
     started = time.monotonic()
     try:
-        for arguments in (("stop",), ("filter", "remove")):  # A capture left running would make start fail
-            try:
-                _pktmon(*arguments)
-            except CommandError:
-                pass
+        pktmon.reset()  # A capture left running would make start fail
         _add_filters()
         while not should_stop():
             elapsed = time.monotonic() - started
             if elapsed >= duration:
                 break
-            _pktmon("start", "--capture", "--comp", "nics", "--pkt-size", "0", "--file-name", etl)
+            pktmon.start(etl)
             try:
                 segment_end = time.monotonic() + min(segment, duration - elapsed)
                 while time.monotonic() < segment_end and not should_stop():
                     progress(time.monotonic() - started, duration)
                     time.sleep(0.25)
             finally:
-                _pktmon("stop")
-            _pktmon("etl2pcap", etl, "--out", pcap)
+                pktmon.stop()
+            pktmon.to_pcapng(etl, pcap)
             with open(pcap, "rb") as file:
                 for neighbor in neighbors_from_pcapng(file.read()):
                     if neighbor.key not in seen:
@@ -345,9 +335,6 @@ def discover(duration, should_stop=lambda: False, found=lambda neighbor: None,
         progress(duration, duration)
         return list(seen.values())
     finally:
-        for arguments in (("stop",), ("filter", "remove")):
-            try:
-                _pktmon(*arguments)
-            except CommandError:
-                pass
+        pktmon.reset()
+        pktmon.lock.release()
         shutil.rmtree(folder, ignore_errors=True)

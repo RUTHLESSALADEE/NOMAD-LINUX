@@ -1,0 +1,886 @@
+"""The terminal widget (drawing, keyboard, mouse) and a session view that connects it to a live connection."""
+import logging
+import os
+import threading
+import time
+
+from PyQt5.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPen
+from PyQt5.QtWidgets import QApplication, QCheckBox, QDialog, QDialogButtonBox, QHBoxLayout, QInputDialog, QLabel, \
+    QLineEdit, QMessageBox, QPushButton, QScrollBar, QVBoxLayout, QWidget
+
+from ..terminal.model import LogCleaner, Position, TerminalModel, encode_key, encode_paste
+from ..terminal.sessions import SERIAL
+from ..terminal.transports import ConnectionFailed, Prompter, make_transport
+from .common import StoppableThread
+from .theme import COLORS
+from .vault_dialog import ensure_unlocked, protect_secret
+
+log = logging.getLogger(__name__)
+
+BACKGROUND = QColor("#0b0f14")
+FOREGROUND = QColor(COLORS["text"])
+CURSOR = QColor(COLORS["accent"])
+SELECTION = QColor(COLORS["accent_dim"])
+FIND_HIGHLIGHT = QColor(COLORS["warning"])
+ANSI = {"black": "#1e2227", "red": "#e06c75", "green": "#98c379", "brown": "#e5c07b", "yellow": "#e5c07b",
+        "blue": "#61afef", "magenta": "#c678dd", "cyan": "#56b6c2", "white": "#dcdfe4",
+        "brightblack": "#5c6370", "brightred": "#ff7a85", "brightgreen": "#b5e890", "brightbrown": "#ffd68a",
+        "brightyellow": "#ffd68a", "brightblue": "#7cc4ff", "brightmagenta": "#de9df0", "brightcyan": "#6fd3df",
+        "brightwhite": "#ffffff"}
+BASE_COLORS = {"black", "red", "green", "brown", "yellow", "blue", "magenta", "cyan", "white"}
+QT_KEYS = {
+    Qt.Key_Up: "Up", Qt.Key_Down: "Down", Qt.Key_Left: "Left", Qt.Key_Right: "Right", Qt.Key_Home: "Home",
+    Qt.Key_End: "End", Qt.Key_PageUp: "PageUp", Qt.Key_PageDown: "PageDown", Qt.Key_Insert: "Insert",
+    Qt.Key_Delete: "Delete", Qt.Key_Return: "Enter", Qt.Key_Enter: "Enter", Qt.Key_Tab: "Tab",
+    Qt.Key_Backtab: "Backtab", Qt.Key_Escape: "Escape", Qt.Key_Backspace: "Backspace",
+    **{getattr(Qt, f"Key_F{number}"): f"F{number}" for number in range(1, 13)},
+}
+CTRL_CHARACTERS = {Qt.Key_Space: " ", Qt.Key_At: "@", Qt.Key_2: "2", Qt.Key_BracketLeft: "[", Qt.Key_Backslash: "\\",
+                   Qt.Key_BracketRight: "]", Qt.Key_AsciiCircum: "^", Qt.Key_6: "6", Qt.Key_Underscore: "_",
+                   Qt.Key_Minus: "-", Qt.Key_Slash: "/", Qt.Key_Question: "?"}
+APP_SHORTCUTS = {(Qt.Key_Tab, Qt.ControlModifier), (Qt.Key_Backtab, Qt.ControlModifier | Qt.ShiftModifier),
+                 (Qt.Key_Tab, Qt.ControlModifier | Qt.ShiftModifier),
+                 (Qt.Key_F11, Qt.NoModifier)}  # Left to the window: switching tabs/pages, and focus mode
+REPAINT_MILLISECONDS = 15
+WHEEL_LINES = 3
+
+
+def is_simple(text):
+    """Characters that can be drawn together in one run without drifting off the grid."""
+    return len(text) == 1 and ord(text) < 0x2500
+
+
+class TerminalView(QWidget):
+    """Draws a TerminalModel and turns keys and mouse actions into input. Knows nothing about connections."""
+    key_input = pyqtSignal(str)  # Text to send
+    paste_requested = pyqtSignal()
+    grid_changed = pyqtSignal(int, int)  # Columns, rows
+    scrolled = pyqtSignal()
+    find_requested = pyqtSignal()
+
+    def __init__(self, model, parent=None):
+        super().__init__(parent)
+        self.model = model
+        self.offset = 0  # Lines scrolled back from the bottom
+        self.zoom = 0  # Points added to the text size (Ctrl+wheel)
+        self.selection = None  # (anchor, end) Positions
+        self.selecting = False
+        self.highlight = None  # (Position, length) of a find match
+        self.application_keys = False
+        self.backspace_delete = True
+        self.enter = "\r"
+        self.colors = {}
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setAttribute(Qt.WA_OpaquePaintEvent)
+        self.setAttribute(Qt.WA_InputMethodEnabled)
+        self.setCursor(Qt.IBeamCursor)
+        self.repaint_timer = QTimer(self)
+        self.repaint_timer.setSingleShot(True)
+        self.repaint_timer.timeout.connect(self.update)
+        self.update_font()
+
+    # ----------------------------------------------------------------- Fonts and the grid
+
+    def update_font(self):
+        size = QApplication.font().pointSizeF() * 1.05 + self.zoom
+        self.fonts = {}
+        for bold in (False, True):
+            for italic in (False, True):
+                font = QFont("Consolas")
+                font.setStyleHint(QFont.Monospace)
+                font.setPointSizeF(max(5.0, size))
+                font.setBold(bold)
+                font.setItalic(italic)
+                self.fonts[(bold, italic)] = font
+        metrics = QFontMetricsF(self.fonts[(False, False)])
+        self.cell_width = max(1.0, metrics.horizontalAdvance("M"))
+        self.cell_height = max(1.0, float(metrics.height()))
+        self.ascent = metrics.ascent()
+        self.update_grid()
+        self.update()
+
+    def update_grid(self):
+        # Before the widget is shown it has no real size yet; sizing the terminal to that would wrap everything
+        if not self.isVisible() or self.width() < self.cell_width * 10 or self.height() < self.cell_height * 2:
+            return
+        columns = int(self.width() // self.cell_width)
+        rows = int(self.height() // self.cell_height)
+        if (columns, rows) != (self.model.columns, self.model.rows):
+            self.grid_changed.emit(columns, rows)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update_grid()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.update_grid()
+
+    def changeEvent(self, event):
+        if event.type() in (QEvent.FontChange, QEvent.ApplicationFontChange):
+            self.update_font()
+        super().changeEvent(event)
+
+    def set_zoom(self, zoom):
+        self.zoom = max(-6, min(24, zoom))
+        self.update_font()
+
+    def schedule_repaint(self):
+        if not self.repaint_timer.isActive():
+            self.repaint_timer.start(REPAINT_MILLISECONDS)
+
+    # ----------------------------------------------------------------- Scrolling
+
+    def top_line(self):
+        return max(0, self.model.line_count - self.model.rows - self.offset)
+
+    def set_offset(self, offset):
+        offset = max(0, min(self.model.history_length, offset))
+        if offset != self.offset:
+            self.offset = offset
+            self.update()
+            self.scrolled.emit()
+
+    def scroll_to_line(self, index):
+        """Scroll so a line (from Position.line) is in view."""
+        top = self.top_line()
+        if top <= index < top + self.model.rows:
+            return
+        self.set_offset(self.model.line_count - self.model.rows - max(0, index - self.model.rows // 2))
+
+    # ----------------------------------------------------------------- Drawing
+
+    def color(self, name, default):
+        if name == "default":
+            return default
+        color = self.colors.get(name)
+        if color is None:
+            value = ANSI.get(name)
+            if value is None and len(name) == 6:
+                try:
+                    int(name, 16)
+                    value = "#" + name
+                except ValueError:
+                    value = None
+            color = QColor(value) if value else default
+            self.colors[name] = color
+        return color
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), BACKGROUND)
+        model = self.model
+        rows, columns = model.rows, model.columns
+        top = self.top_line()
+        selection = self.normalized_selection()
+        cursor = model.cursor_position()
+        show_cursor = self.offset == 0 or top <= cursor.line < top + rows
+        show_cursor = show_cursor and model.cursor_visible
+        cursor_column = min(cursor.column, columns - 1)
+        width, height = self.cell_width, self.cell_height
+
+        for row in range(rows):
+            index = top + row
+            if index >= model.line_count:
+                break
+            line = model.line(index)
+            y = row * height
+            column = 0
+            while column < columns:
+                char = line[column]
+                selected = selection is not None and selection[0] <= Position(index, column) <= selection[1]
+                key = (char.fg, char.bg, char.bold, char.italics, char.underscore, char.strikethrough, char.reverse,
+                       selected)
+                texts = [char.data or " "]
+                start = column
+                column += 1
+                if is_simple(texts[0]):
+                    while column < columns:
+                        following = line[column]
+                        data = following.data or " "
+                        following_selected = selection is not None and \
+                            selection[0] <= Position(index, column) <= selection[1]
+                        if not is_simple(data) or (following.fg, following.bg, following.bold, following.italics,
+                                                   following.underscore, following.strikethrough, following.reverse,
+                                                   following_selected) != key:
+                            break
+                        texts.append(data)
+                        column += 1
+                self.draw_run(painter, "".join(texts), start, y, char, selected)
+
+            if self.highlight is not None and self.highlight[0].line == index:
+                position, length = self.highlight
+                painter.setPen(QPen(FIND_HIGHLIGHT, 1.5))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRect(QRectF(position.column * width, y, length * width, height).adjusted(0.5, 0.5, -1, -1))
+
+        if show_cursor and top <= cursor.line < top + rows:
+            rect = QRectF(cursor_column * width, (cursor.line - top) * height, width, height)
+            if self.hasFocus():
+                painter.fillRect(rect, CURSOR)
+                char = model.line(cursor.line)[cursor_column]
+                painter.setPen(BACKGROUND)
+                painter.setFont(self.fonts[(char.bold, char.italics)])
+                painter.drawText(QPointF(rect.x(), rect.y() + self.ascent), char.data or " ")
+            else:
+                painter.setPen(QPen(CURSOR, 1))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRect(rect.adjusted(0.5, 0.5, -1, -1))
+
+    def draw_run(self, painter, text, column, y, char, selected):
+        foreground_name = char.fg
+        if char.bold and foreground_name in BASE_COLORS:
+            foreground_name = "bright" + foreground_name  # Bold shows as the bright colour, as most terminals do
+        foreground = self.color(foreground_name, FOREGROUND)
+        background = self.color(char.bg, BACKGROUND)
+        if char.reverse:
+            foreground, background = background, foreground
+        if selected:
+            background = SELECTION
+        rect = QRectF(column * self.cell_width, y, len(text) * self.cell_width, self.cell_height)
+        if background is not BACKGROUND:
+            painter.fillRect(rect, background)
+        if not text.strip():
+            return
+        font = self.fonts[(char.bold, char.italics)]
+        if char.underscore or char.strikethrough:
+            font = QFont(font)
+            font.setUnderline(char.underscore)
+            font.setStrikeOut(char.strikethrough)
+        painter.setFont(font)
+        painter.setPen(foreground)
+        painter.drawText(QPointF(rect.x(), y + self.ascent), text)
+
+    # ----------------------------------------------------------------- Selection and clipboard
+
+    def normalized_selection(self):
+        if self.selection is None:
+            return None
+        start, end = self.selection
+        return (start, end) if start <= end else (end, start)
+
+    def selected_text(self):
+        selection = self.normalized_selection()
+        return self.model.text_between(*selection) if selection else ""
+
+    def position_at(self, point):
+        column = max(0, min(self.model.columns - 1, int(point.x() // self.cell_width)))
+        row = max(0, min(self.model.rows - 1, int(point.y() // self.cell_height)))
+        return Position(min(self.top_line() + row, self.model.line_count - 1), column)
+
+    def copy_selection(self):
+        text = self.selected_text()
+        if text:
+            QApplication.clipboard().setText(text)
+        return bool(text)
+
+    def clear_selection(self):
+        if self.selection is not None:
+            self.selection = None
+            self.update()
+
+    def mousePressEvent(self, event):
+        self.setFocus()
+        if event.button() == Qt.LeftButton:
+            position = self.position_at(event.pos())
+            self.selection = (position, position)
+            self.selecting = True
+            self.update()
+        elif event.button() in (Qt.RightButton, Qt.MiddleButton):
+            self.paste_requested.emit()  # Right-click pastes, as in MobaXterm and PuTTY
+
+    def mouseMoveEvent(self, event):
+        if self.selecting and self.selection is not None:
+            self.selection = (self.selection[0], self.position_at(event.pos()))
+            if event.pos().y() < 0:
+                self.set_offset(self.offset + 1)
+            elif event.pos().y() > self.height():
+                self.set_offset(self.offset - 1)
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.selecting:
+            self.selecting = False
+            start, end = self.selection
+            if start == end:
+                self.selection = None
+            else:
+                self.copy_selection()  # Selecting copies, as in MobaXterm and PuTTY
+            self.update()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.selection = self.model.word_at(self.position_at(event.pos()))
+            self.selecting = False
+            self.copy_selection()
+            self.update()
+
+    def wheelEvent(self, event):
+        steps = event.angleDelta().y() / 120
+        if event.modifiers() & Qt.ControlModifier:
+            self.set_zoom(self.zoom + (1 if steps > 0 else -1))
+        else:
+            self.set_offset(self.offset + int(round(steps * WHEEL_LINES)))
+
+    # ----------------------------------------------------------------- Keyboard
+
+    def event(self, event):
+        if event.type() == QEvent.ShortcutOverride:
+            # Keys belong to the remote side (Ctrl+B for tmux, Ctrl+R for shell history, F5...), not NOMAD's
+            # shortcuts, except the few that switch tabs and pages
+            if (event.key(), int(event.modifiers()) & int(Qt.ControlModifier | Qt.ShiftModifier)) not in \
+                    {(key, int(modifiers)) for key, modifiers in APP_SHORTCUTS}:
+                event.accept()
+                return True
+        if event.type() == QEvent.KeyPress and event.key() in (Qt.Key_Tab, Qt.Key_Backtab) and \
+                not event.modifiers() & Qt.ControlModifier:
+            self.keyPressEvent(event)  # Tab goes to the terminal, not to the next widget
+            return True
+        return super().event(event)
+
+    def keyPressEvent(self, event):
+        key, modifiers = event.key(), event.modifiers()
+        ctrl, alt, shift = bool(modifiers & Qt.ControlModifier), bool(modifiers & Qt.AltModifier), \
+            bool(modifiers & Qt.ShiftModifier)
+
+        # Terminal commands
+        if ctrl and shift and key == Qt.Key_C or ctrl and not shift and key == Qt.Key_Insert:
+            self.copy_selection()
+            return
+        if ctrl and shift and key == Qt.Key_V or shift and not ctrl and key == Qt.Key_Insert:
+            self.paste_requested.emit()
+            return
+        if ctrl and shift and key == Qt.Key_F:
+            self.find_requested.emit()
+            return
+        if shift and not ctrl and key in (Qt.Key_PageUp, Qt.Key_PageDown):
+            self.set_offset(self.offset + (1 if key == Qt.Key_PageUp else -1) * max(1, self.model.rows - 1))
+            return
+        if shift and ctrl and key in (Qt.Key_Home, Qt.Key_End):
+            self.set_offset(self.model.history_length if key == Qt.Key_Home else 0)
+            return
+
+        name = QT_KEYS.get(key, "")
+        text = ""
+        if not name:
+            if ctrl and not alt and Qt.Key_A <= key <= Qt.Key_Z:
+                text = chr(key).lower()
+            elif ctrl and not alt and key in CTRL_CHARACTERS:
+                text = CTRL_CHARACTERS[key]
+            else:
+                text = event.text()
+                if text and not text.isprintable():
+                    text = ""
+        if ctrl and alt and text and text.isprintable():
+            ctrl = alt = False  # AltGr (Ctrl+Alt on Windows) typing characters like @ or \ on many keyboards
+        data = encode_key(name, text, ctrl=ctrl, alt=alt, shift=shift,
+                          application_cursor=self.model.application_cursor, backspace_delete=self.backspace_delete,
+                          enter=self.enter)
+        if data:
+            self.clear_selection()
+            self.set_offset(0)
+            self.key_input.emit(data)
+
+    def inputMethodEvent(self, event):
+        text = event.commitString()
+        if text:
+            self.set_offset(0)
+            self.key_input.emit(text)
+        event.accept()
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self.update()
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        self.update()
+
+
+# ----------------------------------------------------------------- Asking the user from the connection thread
+
+class _Request:
+    def __init__(self, kind, arguments):
+        self.kind, self.arguments = kind, arguments
+        self.result = None
+        self.done = threading.Event()
+
+
+class SecretDialog(QDialog):
+    def __init__(self, parent, title, prompt, can_save):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        layout = QVBoxLayout(self)
+        label = QLabel(prompt)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        self.field = QLineEdit()
+        self.field.setEchoMode(QLineEdit.Password)
+        layout.addWidget(self.field)
+        self.save_check = QCheckBox("Save it (encrypted for your Windows account)")
+        self.save_check.setVisible(can_save)
+        layout.addWidget(self.save_check)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.setMinimumWidth(380)
+
+
+class UiPrompter(Prompter):
+    """Answers a connection's questions with dialogs. Called on the connection's thread; waits for the UI thread."""
+
+    def __init__(self, view):
+        self.view = view
+        self.pending = []
+
+    def ask(self, kind, *arguments):
+        request = _Request(kind, arguments)
+        self.pending.append(request)
+        self.view.question.emit(request)
+        request.done.wait()
+        self.pending.remove(request)
+        return request.result
+
+    def cancel_all(self):
+        for request in list(self.pending):
+            request.result = None
+            request.done.set()
+
+    def host_key(self, host, port, key_type, fingerprint, changed, old_fingerprint):
+        return self.ask("host_key", host, port, key_type, fingerprint, changed, old_fingerprint) or "cancel"
+
+    def secret(self, title, prompt, can_save):
+        return self.ask("secret", title, prompt, can_save)
+
+    def text(self, title, prompt):
+        return self.ask("text", title, prompt)
+
+    def unlock_vault(self):
+        return bool(self.ask("unlock"))
+
+    def save_secret(self, kind, value):
+        self.ask("save", kind, value)
+
+
+# ----------------------------------------------------------------- A connected session
+
+class ConnectionThread(StoppableThread):
+    connected = pyqtSignal(str, str)  # (description, notice)
+    data = pyqtSignal(bytes)
+    closed = pyqtSignal(str)  # Reason
+    failed = pyqtSignal(str)  # Couldn't connect
+
+    def __init__(self, transport, parent=None):
+        super().__init__(parent)
+        self.transport = transport
+
+    def run(self):
+        try:
+            self.transport.connect()
+        except ConnectionFailed as error:
+            self.failed.emit(str(error))
+            return
+        except Exception as error:  # Anything unexpected still has to end the "Connecting..." state
+            log.exception("Unexpected error connecting")
+            self.failed.emit(f"Couldn't connect: {error}")
+            return
+        self.connected.emit(self.transport.description, self.transport.notice)
+        while True:
+            chunk = self.transport.read()
+            if not chunk:
+                break
+            self.data.emit(chunk)
+        if not self.stopping:
+            self.closed.emit(self.transport.close_reason or "Disconnected.")
+
+
+CONNECTING, CONNECTED, DISCONNECTED = "connecting", "connected", "disconnected"
+NOTE_COLOR = "\x1b[38;2;139;152;165m"  # Muted, for NOMAD's own messages in the terminal
+ERROR_COLOR = "\x1b[38;2;255;107;107m"
+WARNING_COLOR = "\x1b[38;2;240;180;41m"
+RESET = "\x1b[0m"
+
+
+class SessionView(QWidget):
+    """One open session: the terminal, its scrollbar, a status line and a find bar, plus the live connection."""
+    state_changed = pyqtSignal(object)  # This view
+    question = pyqtSignal(object)  # A _Request from the connection thread
+
+    def __init__(self, session, store=None, parent=None):
+        super().__init__(parent)
+        self.session = session
+        self.store = store  # For saving passwords the user asks to keep, if the session is saved
+        self.state = DISCONNECTED
+        self.transport = None
+        self.thread = None
+        self.prompter = UiPrompter(self)
+        self.log_file = None
+        self.log_cleaner = LogCleaner()
+        self.last_history = 0
+        self.model = TerminalModel(80, 24, session.scrollback, session.encoding, respond=self.respond)
+        self.question.connect(self.answer, Qt.QueuedConnection)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        body = QHBoxLayout()
+        body.setSpacing(0)
+        self.view = TerminalView(self.model, self)
+        self.view.backspace_delete = session.backspace_sends_delete
+        self.scrollbar = QScrollBar(Qt.Vertical, self)
+        body.addWidget(self.view, 1)
+        body.addWidget(self.scrollbar)
+        layout.addLayout(body, 1)
+
+        self.find_bar = QWidget(self)
+        find_layout = QHBoxLayout(self.find_bar)
+        find_layout.setContentsMargins(6, 3, 6, 3)
+        find_layout.addWidget(QLabel("Find:"))
+        self.find_input = QLineEdit()
+        self.find_input.setPlaceholderText("Text to find in the scrollback (Enter finds the one before)")
+        find_layout.addWidget(self.find_input, 1)
+        find_previous = QPushButton("Previous")
+        close_find = QPushButton("Close")
+        find_layout.addWidget(find_previous)
+        find_layout.addWidget(close_find)
+        self.find_bar.setVisible(False)
+        layout.addWidget(self.find_bar)
+        self.find_from = None
+
+        status = QHBoxLayout()
+        status.setContentsMargins(6, 2, 6, 2)
+        self.status_label = QLabel()
+        self.status_label.setStyleSheet(f"color: {COLORS['muted']};")
+        self.log_label = QLabel()
+        self.log_label.setStyleSheet(f"color: {COLORS['accent']};")
+        status.addWidget(self.status_label, 1)
+        status.addWidget(self.log_label)
+        layout.addLayout(status)
+
+        self.view.key_input.connect(self.type_text)
+        self.view.paste_requested.connect(self.paste)
+        self.view.grid_changed.connect(self.resize_grid)
+        self.view.scrolled.connect(self.sync_scrollbar)
+        self.view.find_requested.connect(self.show_find)
+        self.scrollbar.valueChanged.connect(lambda value: self.view.set_offset(self.model.history_length - value))
+        self.find_input.returnPressed.connect(self.find_previous)
+        self.find_input.textChanged.connect(self.restart_find)
+        find_previous.clicked.connect(self.find_previous)
+        close_find.clicked.connect(self.hide_find)
+        self.sync_scrollbar()
+
+    # ----------------------------------------------------------------- Connecting
+
+    @property
+    def title(self):
+        return self.session.name
+
+    def connect_session(self):
+        if self.state != DISCONNECTED:
+            return
+        self.set_state(CONNECTING)
+        target = self.session.target()
+        self.note(f"Connecting to {target} ({self.session.protocol})...", NOTE_COLOR)
+        self.transport = make_transport(self.session, self.prompter, (self.model.columns, self.model.rows),
+                                        self.store.vault if self.store is not None else None)
+        self.view.enter = self.transport.enter
+        self.thread = ConnectionThread(self.transport, self)
+        self.thread.connected.connect(self.on_connected)
+        self.thread.data.connect(self.on_data)
+        self.thread.closed.connect(self.on_closed)
+        self.thread.failed.connect(self.on_failed)
+        self.thread.start()
+
+    def on_connected(self, description, notice):
+        self.set_state(CONNECTED, description)
+        if notice:
+            self.note(notice, WARNING_COLOR)
+        if self.session.log_to_file and self.log_file is None:
+            self.start_logging()
+        log.info("Connected: %s", description)
+        self.view.setFocus()
+
+    def on_failed(self, message):
+        self.note(message, ERROR_COLOR)
+        self.note("Press Enter to try again.", NOTE_COLOR)
+        self.transport = None
+        self.set_state(DISCONNECTED, message)
+
+    def on_closed(self, reason):
+        self.note(reason, NOTE_COLOR)
+        self.note("Press Enter to reconnect.", NOTE_COLOR)
+        self.close_transport()
+        self.set_state(DISCONNECTED, reason)
+
+    def reconnect(self):
+        self.disconnect_session()
+        self.connect_session()
+
+    def disconnect_session(self):
+        if self.state == DISCONNECTED:
+            return
+        self.close_transport()
+        self.note("Disconnected.", NOTE_COLOR)
+        self.set_state(DISCONNECTED, "Disconnected.")
+
+    def close_transport(self):
+        self.prompter.cancel_all()
+        if self.thread is not None:
+            self.thread.stop()
+        if self.transport is not None:
+            self.transport.close()
+        if self.thread is not None:
+            self.thread.wait(3000)
+            self.thread = None
+        self.transport = None
+
+    def shutdown(self):
+        """Close the connection and the log (the view is going away)."""
+        self.close_transport()
+        self.stop_logging()
+        self.state = DISCONNECTED
+
+    def set_state(self, state, detail=""):
+        self.state = state
+        text = {CONNECTING: "Connecting...", CONNECTED: detail, DISCONNECTED: detail or "Not connected."}[state]
+        self.status_label.setText(f"{text}   ·   {self.model.columns}×{self.model.rows}")
+        self.state_changed.emit(self)
+
+    # ----------------------------------------------------------------- Data
+
+    def respond(self, text):
+        """Answers the terminal gives to the device's questions (cursor position and the like)."""
+        if self.transport is not None and self.state == CONNECTED:
+            self.transport.send(text.encode(self.session.encoding, "replace"))
+
+    def on_data(self, data):
+        text = self.model.feed(data)
+        self.after_output(text)
+
+    def after_output(self, text=""):
+        if self.log_file is not None and text:
+            try:
+                self.log_file.write(self.log_cleaner.clean(text))
+            except OSError:
+                self.stop_logging()
+        grown = self.model.history_length - self.last_history
+        self.last_history = self.model.history_length
+        if self.view.offset and grown > 0:
+            self.view.offset += grown  # Keep showing the same text while scrolled back
+        if grown and self.view.selection is not None:
+            self.view.selection = None
+        self.view.schedule_repaint()
+        self.sync_scrollbar()
+
+    def note(self, message, color):
+        """Write one of NOMAD's own messages into the terminal."""
+        prefix = "\r\n" if self.model.screen.cursor.x else ""
+        self.model.feed_text(f"{prefix}{color}[{message}]{RESET}\r\n")
+        self.after_output()
+
+    def type_text(self, text):
+        if self.state == DISCONNECTED:
+            if text in ("\r", "\r\n", "\n", self.view.enter):
+                self.connect_session()
+            return
+        if self.state != CONNECTED or self.transport is None:
+            return
+        data = text.encode(self.session.encoding, "replace")
+        self.transport.send(data)
+        if self.transport.local_echo:
+            self.model.feed(data.replace(b"\r", b"\r\n") if data.endswith(b"\r") else data)
+            self.after_output()
+
+    def paste(self):
+        text = QApplication.clipboard().text()
+        if not text:
+            return
+        if text.count("\n") >= 5 and self.state == CONNECTED:
+            reply = QMessageBox.question(self, "Paste", f"Paste {text.count(chr(10)) + 1} lines into "
+                                         f"{self.session.name}?", QMessageBox.Yes | QMessageBox.No,
+                                         QMessageBox.Yes)
+            if reply != QMessageBox.Yes:
+                return
+        self.view.set_offset(0)
+        self.type_text(encode_paste(text, self.model.bracketed_paste))
+
+    def resize_grid(self, columns, rows):
+        self.model.resize(columns, rows)
+        if self.transport is not None:
+            self.transport.resize(columns, rows)
+        self.set_state(self.state, self.status_label.text().split("   ·   ")[0] if self.state != CONNECTING else "")
+        self.after_output()
+
+    def sync_scrollbar(self):
+        history = self.model.history_length
+        self.scrollbar.blockSignals(True)
+        self.scrollbar.setRange(0, history)
+        self.scrollbar.setPageStep(self.model.rows)
+        self.scrollbar.setValue(history - self.view.offset)
+        self.scrollbar.blockSignals(False)
+
+    def send_break(self):
+        if self.session.protocol == SERIAL and self.transport is not None and self.state == CONNECTED:
+            self.transport.send_break()
+            self.note("Sent a serial break.", NOTE_COLOR)
+
+    def clear_scrollback(self):
+        self.model.clear_scrollback()
+        self.view.set_offset(0)
+        self.last_history = 0
+        self.after_output()
+
+    # ----------------------------------------------------------------- Logging
+
+    def default_log_folder(self):
+        return self.session.log_folder or os.path.join(os.path.expanduser("~"), "Documents", "NOMAD Logs")
+
+    def start_logging(self):
+        folder = self.default_log_folder()
+        safe_name = "".join(character if character.isalnum() or character in " -_.@" else "_"
+                            for character in self.session.name)
+        path = os.path.join(folder, f"{safe_name} {time.strftime('%Y-%m-%d %H%M%S')}.log")
+        try:
+            os.makedirs(folder, exist_ok=True)
+            self.log_file = open(path, "a", encoding="utf-8", buffering=1)
+            self.log_file.write(f"--- {self.session.name} ({self.session.target()}), {time.strftime('%c')} ---\n")
+        except OSError as error:
+            self.note(f"Couldn't start logging to {path}: {error}", ERROR_COLOR)
+            self.log_file = None
+            return
+        self.log_path = path
+        self.log_label.setText("● Logging")
+        self.log_label.setToolTip(path)
+        self.note(f"Logging to {path}", NOTE_COLOR)
+
+    def stop_logging(self):
+        if self.log_file is not None:
+            try:
+                self.log_file.close()
+            except OSError:
+                pass
+            self.log_file = None
+            self.log_label.clear()
+
+    def toggle_logging(self):
+        if self.log_file is None:
+            self.start_logging()
+        else:
+            self.stop_logging()
+            self.note("Stopped logging.", NOTE_COLOR)
+
+    # ----------------------------------------------------------------- Find
+
+    def show_find(self):
+        self.find_bar.setVisible(True)
+        self.find_input.setFocus()
+        self.find_input.selectAll()
+
+    def hide_find(self):
+        self.find_bar.setVisible(False)
+        self.view.highlight = None
+        self.view.update()
+        self.view.setFocus()
+
+    def restart_find(self):
+        self.find_from = None
+        self.find_input.setStyleSheet("")
+
+    def find_previous(self):
+        query = self.find_input.text()
+        found = self.model.find(query, self.find_from)
+        if found is None and self.find_from is not None:
+            found = self.model.find(query)  # Wrap around to the bottom
+        if found is None:
+            self.find_input.setStyleSheet(f"border: 1px solid {COLORS['error']};")
+            self.view.highlight = None
+            self.view.update()
+            return
+        self.find_input.setStyleSheet("")
+        self.find_from = found
+        self.view.highlight = (found, len(query))
+        self.view.scroll_to_line(found.line)
+        self.view.update()
+
+    # ----------------------------------------------------------------- Questions from the connection thread
+
+    def answer(self, request):
+        try:
+            request.result = self.ask_user(request.kind, *request.arguments)
+        finally:
+            request.done.set()
+
+    def ask_user(self, kind, *arguments):
+        if kind == "host_key":
+            return self.ask_host_key(*arguments)
+        if kind == "secret":
+            title, prompt, can_save = arguments
+            saved_session = self.store is not None and self.store.get(self.session.id) is not None
+            dialog = SecretDialog(self, title, prompt, can_save and saved_session)
+            if dialog.exec_() != QDialog.Accepted:
+                return None
+            return dialog.field.text(), dialog.save_check.isChecked()
+        if kind == "text":
+            title, prompt = arguments
+            value, ok = QInputDialog.getText(self, title, prompt)
+            return value if ok else None
+        if kind == "unlock":
+            if self.store is None:
+                return False
+            return ensure_unlocked(self, self.store, f"{self.session.name} has a saved password protected by the "
+                                                     "master password.")
+        if kind == "save":
+            secret_kind, value = arguments
+            self.save_secret(secret_kind, value)
+            return None
+        return None
+
+    def ask_host_key(self, host, port, key_type, fingerprint, changed, old_fingerprint):
+        where = host if int(port) == 22 else f"{host} port {port}"
+        box = QMessageBox(self)
+        if changed:
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("Host Key Changed")
+            box.setText(f"<b>The SSH key of {where} has changed.</b>")
+            box.setInformativeText(
+                "That's expected if the device was replaced, reset or given a new key. Otherwise someone may be "
+                "intercepting the connection (a man-in-the-middle attack).\n\n"
+                f"Key it had before: {old_fingerprint}\nKey it has now: {fingerprint} ({key_type})")
+            trust = box.addButton("Trust the New Key", QMessageBox.AcceptRole)
+        else:
+            box.setIcon(QMessageBox.Question)
+            box.setWindowTitle("New Host Key")
+            box.setText(f"NOMAD hasn't connected to {where} before.")
+            box.setInformativeText(
+                f"Its SSH key fingerprint is:\n{fingerprint} ({key_type})\n\nTo be sure it's the right device, compare "
+                "this with the device's own fingerprint (for example \"show ip ssh\" or \"show crypto key "
+                "mypubkey rsa\" on Cisco).")
+            trust = box.addButton("Trust and Connect", QMessageBox.AcceptRole)
+        once = box.addButton("Connect Once", QMessageBox.ActionRole)
+        cancel = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(cancel if changed else trust)
+        box.exec_()
+        clicked = box.clickedButton()
+        return "trust" if clicked is trust else "once" if clicked is once else "cancel"
+
+    def save_secret(self, kind, value):
+        if self.store is None or self.store.get(self.session.id) is None:
+            return
+        try:
+            encrypted = protect_secret(self, self.store, value)
+        except Exception as error:  # Saving is a convenience; the connection itself worked
+            self.note(f"Couldn't save the {kind}: {error}", WARNING_COLOR)
+            return
+        if encrypted is None:
+            self.note(f"The {kind} wasn't saved (the master password wasn't entered).", WARNING_COLOR)
+            return
+        stored = self.store.get(self.session.id)
+        if kind == "password":
+            stored.saved_password = self.session.saved_password = encrypted
+        else:
+            stored.saved_passphrase = self.session.saved_passphrase = encrypted
+        self.store.put(stored)
+        how = "your master password and Windows account" if self.store.vault.enabled else "your Windows account"
+        self.note(f"Saved the {kind} (encrypted with {how}).", NOTE_COLOR)

@@ -24,6 +24,19 @@ def set_hint(label, text, kind="info"):
     label.setText(text)
 
 
+def format_size(size):
+    """Bytes for display, such as "12.3 MB"."""
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "bytes" else f"{size:.1f} {unit}"
+        size /= 1024
+
+
+def format_ms(value):
+    """Milliseconds for display: "" when missing, "<1 ms" when under a millisecond."""
+    return "" if value is None else "<1 ms" if value < 1 else f"{value:.0f} ms"
+
+
 class SortableTableItem(QTableWidgetItem):
     """Table item that sorts by its sort_key, so IP addresses and numbers sort numerically."""
 

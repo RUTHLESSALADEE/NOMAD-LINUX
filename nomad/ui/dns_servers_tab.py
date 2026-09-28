@@ -1,4 +1,4 @@
-"""Services tab: compare DNS servers, check forward/reverse DNS, and check a web server step by step."""
+"""DNS Servers page: compare how quickly DNS servers answer, and check forward/reverse DNS."""
 import ipaddress
 import json
 import logging
@@ -6,14 +6,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QKeySequence
-from PyQt5.QtWidgets import QAbstractItemView, QApplication, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, \
-    QHeaderView, QLabel, QLineEdit, QPushButton, QShortcut, QSpinBox, QTableWidget, QTabWidget, QTreeWidget, \
-    QTreeWidgetItem, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QAbstractItemView, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, \
+    QLineEdit, QPushButton, QShortcut, QSpinBox, QTableWidget, QVBoxLayout, QWidget
 
 from ..dnsclient import RCODE_MEANINGS, benchmark_server, forward_reverse
-from ..httpcheck import EXPIRY_WARNING_DAYS, check_with_redirects, normalize_url
 from ..lookup import HOSTNAME_PATTERN
-from .common import SortableTableItem, StoppableThread, run_in_background, set_hint, set_invalid
+from .common import SortableTableItem, StoppableThread, format_ms, run_in_background, set_hint, set_invalid
 from .theme import COLORS, accent_button
 
 log = logging.getLogger(__name__)
@@ -26,10 +24,6 @@ COL_SERVER, COL_SOURCE, COL_AVERAGE, COL_MEDIAN, COL_FIRST, COL_ANSWERED, COL_RE
 FR_COLUMNS = ["Address", "PTR Name", "Result"]
 NO_ANSWER_SORT_KEY = 10 ** 9
 PARALLEL_SERVERS = 8
-
-
-def format_ms(value):
-    return "" if value is None else "<1 ms" if value < 1 else f"{value:.0f} ms"
 
 
 class DnsBenchmarkThread(StoppableThread):
@@ -48,26 +42,13 @@ class DnsBenchmarkThread(StoppableThread):
                 self.result.emit(future.result())
 
 
-class WebCheckThread(StoppableThread):
-    finished_check = pyqtSignal(list)
-
-    def __init__(self, url, timeout, parent=None):
-        super().__init__(parent)
-        self.url, self.timeout = url, timeout
-
-    def run(self):
-        self.finished_check.emit(check_with_redirects(self.url, self.timeout, should_stop=lambda: self.stopping))
-
-
-class ServicesTab(QWidget):
+class DnsServersTab(QWidget):
     def __init__(self, window):
         super().__init__(window)
         self.window = window
         self.dns_worker = None
-        self.web_worker = None
         self.custom_servers = []
         self.removed_servers = set()  # Built-in servers taken off the list
-        self.web_results = []
         self.fr_server_chosen = False  # Keep the user's choice of server across refreshes
         self.init_ui()
         window.snapshot_changed.connect(lambda _: self.fill_servers())
@@ -76,17 +57,6 @@ class ServicesTab(QWidget):
 
     def init_ui(self):
         layout = QVBoxLayout(self)
-        self.pages = QTabWidget()
-        self.pages.addTab(self.build_dns_page(), "DNS Servers")
-        self.web_page = self.build_web_page()
-        self.pages.addTab(self.web_page, "Web Check")
-        layout.addWidget(self.pages)
-
-    # ----------------------------------------------------------------- DNS page
-
-    def build_dns_page(self):
-        page = QWidget()
-        layout = QVBoxLayout(page)
         intro = QLabel("Time how quickly each DNS server answers, asking it directly (Windows' DNS cache is "
                        "skipped). Tick the servers to compare. The first lookup of a name is usually slower, "
                        "because the server has to look it up itself.")
@@ -188,52 +158,8 @@ class ServicesTab(QWidget):
         self.fr_server_combo.activated.connect(lambda _: setattr(self, "fr_server_chosen", True))
         self.fr_button.clicked.connect(self.start_forward_reverse)
         self.fr_name_input.returnPressed.connect(self.start_forward_reverse)
-        return page
 
-    # ----------------------------------------------------------------- Web page
-
-    def build_web_page(self):
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        intro = QLabel("Fetch a web page once and see how long each step takes, the server's certificate and its "
-                       "reply. Redirects are followed. Works with devices' own web pages, including ones with "
-                       "self-signed certificates.")
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
-        self.url_input = QLineEdit("https://example.com")
-        self.url_input.setPlaceholderText("https://host, http://host:8080/path, or just a host name")
-        self.web_timeout_input = QSpinBox()
-        self.web_timeout_input.setRange(1, 120)
-        self.web_timeout_input.setValue(10)
-        self.web_timeout_input.setButtonSymbols(QSpinBox.NoButtons)
-        form = QFormLayout()
-        form.addRow("Address:", self.url_input)
-        form.addRow("Timeout (s):", self.web_timeout_input)
-        layout.addLayout(form)
-
-        buttons = QHBoxLayout()
-        self.web_button = accent_button("Check")
-        self.web_copy_button = QPushButton("Copy Results")
-        buttons.addWidget(self.web_button)
-        buttons.addStretch()
-        buttons.addWidget(self.web_copy_button)
-        layout.addLayout(buttons)
-        self.web_status = QLabel()
-        self.web_status.setWordWrap(True)
-        layout.addWidget(self.web_status)
-
-        self.web_tree = QTreeWidget()
-        self.web_tree.setHeaderLabels(["Check", "Result"])
-        self.web_tree.setAlternatingRowColors(True)
-        self.web_tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        layout.addWidget(self.web_tree, 1)
-
-        self.web_button.clicked.connect(self.start_web_check)
-        self.url_input.returnPressed.connect(self.start_web_check)
-        self.web_copy_button.clicked.connect(self.copy_web_results)
-        return page
-
-    # ----------------------------------------------------------------- Tab interface
+    # ----------------------------------------------------------------- Page interface
 
     def save_settings(self, settings):
         settings.setValue("services/names", self.names_input.text())
@@ -242,8 +168,6 @@ class ServicesTab(QWidget):
         settings.setValue("services/custom_servers", json.dumps(self.custom_servers))
         settings.setValue("services/removed_servers", json.dumps(sorted(self.removed_servers)))
         settings.setValue("services/unchecked", json.dumps(self.unchecked_servers()))
-        settings.setValue("services/url", self.url_input.text())
-        settings.setValue("services/web_timeout", self.web_timeout_input.value())
         settings.setValue("services/fr_name", self.fr_name_input.text())
 
     def restore_settings(self, settings):
@@ -258,16 +182,13 @@ class ServicesTab(QWidget):
                                     json.loads(settings.value("services/removed_servers", "[]", str))}
         except (ValueError, TypeError):
             self.custom_servers, self.restored_unchecked, self.removed_servers = [], set(), set()
-        self.url_input.setText(settings.value("services/url", "https://example.com", str))
-        self.web_timeout_input.setValue(settings.value("services/web_timeout", 10, int))
         self.fr_name_input.setText(settings.value("services/fr_name", "", str))
         self.fill_servers()
 
     def shutdown(self):
-        for worker in (self.dns_worker, self.web_worker):
-            if worker is not None:
-                worker.stop()
-                worker.wait(self.dns_timeout_input.value() + 3000)
+        if self.dns_worker is not None:
+            self.dns_worker.stop()
+            self.dns_worker.wait(self.dns_timeout_input.value() + 3000)
 
     # ----------------------------------------------------------------- DNS servers
 
@@ -480,107 +401,6 @@ class ServicesTab(QWidget):
         self.fr_button.setEnabled(True)
         set_hint(self.fr_status, str(error), "error")
 
-    # ----------------------------------------------------------------- Web check
-
-    def check_url(self, url):
-        """Check url now (used from other tabs)."""
-        self.pages.setCurrentWidget(self.web_page)
-        self.url_input.setText(url)
-        self.start_web_check()
-
-    def start_web_check(self):
-        if self.web_worker is not None:
-            return
-        try:
-            url = normalize_url(self.url_input.text())
-        except ValueError as error:
-            set_invalid(self.url_input, True)
-            set_hint(self.web_status, str(error), "error")
-            return
-        set_invalid(self.url_input, False)
-        self.web_tree.clear()
-        self.web_results = []
-        set_hint(self.web_status, f"Checking {url}...", "info")
-        self.web_worker = WebCheckThread(url, self.web_timeout_input.value(), self)
-        self.web_worker.finished_check.connect(self.show_web_results)
-        self.web_worker.finished.connect(self.on_web_finished)
-        self.web_worker.start()
-        self.update_buttons()
-
-    def on_web_finished(self):
-        self.web_worker.deleteLater()
-        self.web_worker = None
-        self.update_buttons()
-
-    def web_rows(self, result):
-        """(label, value, color or None) rows describing one request."""
-        rows = [("Address", result.address, None)]
-        for label, value in (("DNS lookup", result.dns_ms), ("TCP connect", result.connect_ms),
-                             ("TLS handshake", result.tls_ms), ("Time to first byte", result.first_byte_ms),
-                             ("Total", result.total_ms)):
-            if value is not None:
-                rows.append((label, format_ms(value), None))
-        if result.tls_version:
-            rows.append(("TLS version", f"{result.tls_version} ({result.cipher})", None))
-        if result.verified is not None:
-            rows.append(("Certificate check", "Trusted" if result.verified else f"Not trusted: {result.verify_error}",
-                         COLORS["success"] if result.verified else COLORS["warning"]))
-        certificate = result.certificate
-        if certificate is not None:
-            rows.append(("Issued to", certificate.subject, None))
-            rows.append(("Issued by", "Itself (self-signed)" if certificate.self_signed else certificate.issuer, None))
-            if certificate.names:
-                rows.append(("Names it covers", ", ".join(certificate.names), None))
-            if certificate.days_left is not None:
-                days = certificate.days_left
-                text = f"{certificate.not_after} ({'expired ' + str(-days) + ' days ago' if days < 0 else str(days) + ' days left'})"
-                color = COLORS["error"] if days < 0 else COLORS["warning"] if days <= EXPIRY_WARNING_DAYS else None
-                rows.append(("Valid until", text, color))
-        if result.status is not None:
-            color = COLORS["success"] if result.status < 400 else COLORS["error"] if result.status >= 500 \
-                else COLORS["warning"]
-            rows.append(("HTTP status", f"{result.status} {result.reason}", color))
-        if result.server:
-            rows.append(("Server software", result.server, None))
-        if result.location:
-            rows.append(("Redirects to", result.location, None))
-        if result.error:
-            rows.append(("Problem", result.error, COLORS["error"]))
-        return rows
-
-    def show_web_results(self, results):
-        self.web_results = results
-        for index, result in enumerate(results):
-            title = f"{result.status} {result.reason}" if result.status else "Failed"
-            top = QTreeWidgetItem([result.url if len(results) == 1 else f"{index + 1}. {result.url}", title])
-            for label, value, color in self.web_rows(result):
-                child = QTreeWidgetItem([label, value])
-                if color:
-                    child.setForeground(1, QColor(color))
-                child.setToolTip(1, value)
-                top.addChild(child)
-            self.web_tree.addTopLevelItem(top)
-            top.setExpanded(index == len(results) - 1 or bool(result.error))
-        final = results[-1] if results else None
-        if final is None:
-            set_hint(self.web_status, "Stopped.", "warning")
-        elif final.error:
-            set_hint(self.web_status, final.error, "error")
-        else:
-            hops = f" after {len(results) - 1} redirect{'' if len(results) == 2 else 's'}" if len(results) > 1 else ""
-            trusted = "" if final.verified is not False else " The certificate isn't trusted."
-            kind = "warning" if final.verified is False or final.status >= 400 else "success"
-            set_hint(self.web_status, f"{final.status} {final.reason}{hops} in {format_ms(final.total_ms)}."
-                                      f"{trusted}", kind)
-
-    def copy_web_results(self):
-        lines = []
-        for result in self.web_results:
-            lines.append(result.url)
-            lines += [f"    {label}: {value}" for label, value, _ in self.web_rows(result)]
-        QApplication.clipboard().setText("\n".join(lines) + "\n")
-        self.window.show_status("Copied the web check results to the clipboard.", "info")
-
     # ----------------------------------------------------------------- Buttons
 
     def update_buttons(self):
@@ -593,5 +413,3 @@ class ServicesTab(QWidget):
         built_in = {server for server, _ in self.built_in_servers()}
         self.restore_servers_button.setEnabled(not dns_running and bool(self.removed_servers & built_in))
         self.add_server_button.setEnabled(not dns_running)
-        self.web_button.setEnabled(self.web_worker is None)
-        self.web_copy_button.setEnabled(bool(self.web_results) and self.web_worker is None)

@@ -1,11 +1,11 @@
-"""Main window: adapter picker, tabs, menus, status bar, and shared services for the tabs."""
+"""Main window: adapter picker, sidebar of pages, menus, status bar, and shared services for the pages."""
 import logging
 import os
 import time
 
 from PyQt5.QtCore import QSettings, Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import QAction, QActionGroup, QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox, \
-    QProgressBar, QPushButton, QTabWidget, QVBoxLayout, QWidget
+    QProgressBar, QPushButton, QVBoxLayout, QWidget
 
 from .. import __version__
 from ..ipconfig import flush_dns
@@ -13,24 +13,34 @@ from ..profiles import ProfileStore
 from ..snapshot import NetworkSnapshot, load_snapshot
 from ..system import APP_FULL_NAME, APP_NAME, is_admin, relaunch_as_admin
 from .adapter_tab import AdapterTab
+from .capture_tab import CaptureTab
 from .common import run_in_background
 from .connections_tab import ConnectionsTab
+from .dhcp_tab import DhcpTab
 from .dialogs import AboutDialog, LogDialog
+from .dns_servers_tab import DnsServersTab
 from .iperf_tab import IperfTab
+from .ipam_tab import IpamTab
 from .latency_tab import LatencyTab
 from .lookup_tab import LookupTab
 from .mtu_tab import MtuTab
+from .navigation import Navigator
 from .neighbors_tab import NeighborsTab
+from .netreset_tab import NetworkResetTab
 from .ping_tab import PingTab
 from .ports_tab import PortsTab
 from .report_dialog import ReportDialog
 from .routing_tab import RoutingTab
-from .services_tab import ServicesTab
+from .snmp_tab import SnmpTab
 from .sweep_tab import SweepTab
 from .switch_tab import SwitchTab
+from .syslog_tab import SyslogTab
+from .tftp_tab import TftpTab
 from .theme import COLORS, DEFAULT_TEXT_SCALE, TEXT_SCALES, set_text_scale
 from .traceroute_tab import TracerouteTab
+from .terminal_tab import TerminalTab
 from .utilities_tab import UtilitiesTab
+from .web_check_tab import WebCheckTab
 
 log = logging.getLogger(__name__)
 
@@ -62,9 +72,10 @@ class MainWindow(QMainWindow):
         self.busy_reasons = {}
         self.log_dialog = None
         self.text_scale = DEFAULT_TEXT_SCALE
+        self.focus_mode = False  # Everything but the current page hidden (F11)
 
         self.setWindowTitle(f"{APP_NAME} {__version__} - {APP_FULL_NAME}" + (" (Administrator)" if self.admin else ""))
-        self.resize(1100, 760)
+        self.resize(1180, 800)
         self.init_ui()
         self.init_menus()
         self.restore_settings()
@@ -76,6 +87,7 @@ class MainWindow(QMainWindow):
     def init_ui(self):
         central = QWidget(self)
         layout = QVBoxLayout(central)
+        self.central_layout = layout
 
         # Banner explaining read-only mode when not running as administrator
         self.admin_banner = QFrame(central)
@@ -94,46 +106,72 @@ class MainWindow(QMainWindow):
         self.admin_banner.setVisible(not self.admin)
         layout.addWidget(self.admin_banner)
 
-        # App-wide adapter picker used by the Interfaces, MTU, Ping and Sweep tabs
-        picker_layout = QHBoxLayout()
+        # App-wide adapter picker used by the Interfaces, MTU, Ping, Sweep and other pages
+        self.picker_bar = QWidget(central)
+        picker_layout = QHBoxLayout(self.picker_bar)
+        picker_layout.setContentsMargins(0, 0, 0, 0)
         picker_layout.addWidget(QLabel("Adapter:"))
         self.adapter_combo = QComboBox(central)
         self.adapter_combo.setMinimumWidth(420)
-        self.adapter_combo.setToolTip("The network adapter the Interfaces, MTU, Ping and Sweep tabs work with.")
+        self.adapter_combo.setToolTip("The network adapter the Interfaces, MTU, Ping, Sweep, DHCP Servers and "
+                                      "other pages work with.")
         self.adapter_combo.currentIndexChanged.connect(self.on_adapter_selected)
         picker_layout.addWidget(self.adapter_combo, 1)
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.setToolTip("Reload network settings (F5)")
         self.refresh_button.clicked.connect(lambda: self.refresh())
         picker_layout.addWidget(self.refresh_button)
-        layout.addLayout(picker_layout)
+        layout.addWidget(self.picker_bar)
 
-        self.tabs = QTabWidget(central)
+        self.normal_margins = layout.getContentsMargins()
+        self.navigator = Navigator(central)
         self.adapter_tab = AdapterTab(self)
         self.routing_tab = RoutingTab(self)
         self.neighbors_tab = NeighborsTab(self)
         self.connections_tab = ConnectionsTab(self)
-        self.mtu_tab = MtuTab(self)
+        self.netreset_tab = NetworkResetTab(self)
         self.ping_tab = PingTab(self)
         self.latency_tab = LatencyTab(self)
         self.traceroute_tab = TracerouteTab(self)
+        self.mtu_tab = MtuTab(self)
         self.ports_tab = PortsTab(self)
         self.iperf_tab = IperfTab(self)
-        self.lookup_tab = LookupTab(self)
         self.sweep_tab = SweepTab(self)
         self.switch_tab = SwitchTab(self)
-        self.services_tab = ServicesTab(self)
+        self.dhcp_tab = DhcpTab(self)
+        self.snmp_tab = SnmpTab(self)
+        self.lookup_tab = LookupTab(self)
+        self.dns_servers_tab = DnsServersTab(self)
+        self.web_check_tab = WebCheckTab(self)
+        self.capture_tab = CaptureTab(self)
+        self.syslog_tab = SyslogTab(self)
+        self.tftp_tab = TftpTab(self)
         self.utilities_tab = UtilitiesTab(self)
-        tabs = [(self.adapter_tab, "Interfaces"), (self.routing_tab, "Routing Table"), (self.neighbors_tab, "ARP"),
-                (self.connections_tab, "Connections"), (self.switch_tab, "Switch Port"), (self.mtu_tab, "MTU"),
-                (self.ping_tab, "Ping"), (self.latency_tab, "Latency"), (self.traceroute_tab, "Traceroute"),
-                (self.ports_tab, "Ports"), (self.services_tab, "Services"), (self.iperf_tab, "iperf"),
-                (self.lookup_tab, "DNS Lookup"), (self.sweep_tab, "Sweep"), (self.utilities_tab, "Utilities")]
-        self.all_tabs = [tab for tab, _ in tabs]
-        for tab, title in tabs:
-            self.tabs.addTab(tab, title)
-        self.tabs.currentChanged.connect(self.on_tab_changed)
-        layout.addWidget(self.tabs, 1)
+        self.terminal_tab = TerminalTab(self)
+        self.ipam_tab = IpamTab(self)
+        sections = [
+            ("This Computer", [(self.adapter_tab, "Interfaces"), (self.routing_tab, "Routing Table"),
+                               (self.neighbors_tab, "ARP"), (self.connections_tab, "Connections"),
+                               (self.netreset_tab, "Network Reset")]),
+            ("Connect", [(self.terminal_tab, "Terminal")]),
+            ("Manage", [(self.ipam_tab, "IP Addresses")]),
+            ("Test", [(self.ping_tab, "Ping"), (self.latency_tab, "Latency"), (self.traceroute_tab, "Traceroute"),
+                      (self.mtu_tab, "MTU"), (self.ports_tab, "Ports"), (self.iperf_tab, "iperf")]),
+            ("Discover", [(self.sweep_tab, "Sweep"), (self.switch_tab, "Switch Port"),
+                          (self.dhcp_tab, "DHCP Servers"), (self.snmp_tab, "SNMP")]),
+            ("DNS & Web", [(self.lookup_tab, "DNS Lookup"), (self.dns_servers_tab, "DNS Servers"),
+                           (self.web_check_tab, "Web Check")]),
+            ("Tools", [(self.capture_tab, "Packet Capture"), (self.syslog_tab, "Syslog"), (self.tftp_tab, "TFTP"),
+                       (self.utilities_tab, "Utilities")]),
+        ]
+        self.all_tabs = []
+        for section, pages in sections:
+            self.navigator.add_section(section)
+            for page, title in pages:
+                self.navigator.add_page(page, title)
+                self.all_tabs.append(page)
+        self.navigator.currentChanged.connect(self.on_tab_changed)
+        layout.addWidget(self.navigator, 1)
         self.setCentralWidget(central)
 
         # Status bar: messages on the left, busy indicator and log button on the right
@@ -160,6 +198,23 @@ class MainWindow(QMainWindow):
         file_menu.addAction("E&xit", self.close)
 
         view_menu = self.menuBar().addMenu("&View")
+        self.sidebar_action = QAction("Show &Sidebar", self)
+        self.sidebar_action.setCheckable(True)
+        self.sidebar_action.setChecked(True)
+        self.sidebar_action.setShortcut("Ctrl+B")
+        self.sidebar_action.triggered.connect(self.navigator.set_sidebar_visible)
+        self.navigator.sidebarToggled.connect(self.on_sidebar_toggled)
+        view_menu.addAction(self.sidebar_action)
+        self.addAction(self.sidebar_action)  # Ctrl+B works even while the menu is closed
+        self.focus_action = QAction("&Focus Mode", self)
+        self.focus_action.setCheckable(True)
+        self.focus_action.setShortcut("F11")
+        self.focus_action.setToolTip("Hide the sidebar, adapter bar and status bar so the page (such as a terminal "
+                                     "session) gets the whole window")
+        self.focus_action.triggered.connect(self.set_focus_mode)
+        view_menu.addAction(self.focus_action)
+        self.addAction(self.focus_action)
+        view_menu.addSeparator()
         text_menu = view_menu.addMenu("&Text Size")
         self.text_scale_group = QActionGroup(self)
         for scale, label in TEXT_SCALES:
@@ -192,6 +247,7 @@ class MainWindow(QMainWindow):
         tools_menu.addAction(find_action)
         tools_menu.addSeparator()
         tools_menu.addAction("&Flush DNS Cache", self.flush_dns)
+        tools_menu.addAction("Saved Password &Protection...", lambda: self.terminal_tab.show_protection())
         tools_menu.addSeparator()
         tools_menu.addAction("Add &PuTTY to PATH", self.sweep_tab.add_putty_to_path)
         tools_menu.addAction("Default &Browser Settings...", self.open_default_apps)
@@ -210,12 +266,14 @@ class MainWindow(QMainWindow):
             self.restoreGeometry(geometry)
         self.saved_adapter_name = self.settings.value("window/adapter", "", str)
         self.set_text_scale(self.settings.value("view/text_scale", DEFAULT_TEXT_SCALE, float))
-        self.tabs.setCurrentWidget(self.adapter_tab)  # Always start on Interfaces rather than the last tab used
+        self.navigator.set_sidebar_visible(self.settings.value("view/sidebar", True, bool))
+        self.navigator.setCurrentWidget(self.adapter_tab)  # Always start on Interfaces rather than the last tab used
         for tab in self.all_tabs:
             tab.restore_settings(self.settings)
 
     def save_settings(self):
         self.settings.setValue("window/geometry", self.saveGeometry())
+        self.settings.setValue("view/sidebar", self.navigator.sidebar_visible())
         adapter = self.current_adapter()
         if adapter is not None:
             self.settings.setValue("window/adapter", adapter.name)
@@ -224,6 +282,9 @@ class MainWindow(QMainWindow):
         self.settings.sync()
 
     def closeEvent(self, event):
+        if not self.terminal_tab.confirm_close():
+            event.ignore()
+            return
         self.save_settings()
         for tab in self.all_tabs:
             tab.shutdown()
@@ -249,6 +310,31 @@ class MainWindow(QMainWindow):
         else:
             index = scales.index(self.text_scale) + step
             self.set_text_scale(scales[max(0, min(len(scales) - 1, index))])
+
+    def set_focus_mode(self, on):
+        """Give the current page the whole window: no sidebar, adapter bar, banner, status bar or session list."""
+        on = bool(on)
+        self.focus_action.setChecked(on)
+        self.terminal_tab.focus_button.setChecked(on)
+        if on == self.focus_mode:
+            return
+        self.focus_mode = on
+        self.navigator.set_navigation_hidden(on)
+        self.picker_bar.setVisible(not on)
+        self.admin_banner.setVisible(not on and not self.admin)
+        self.statusBar().setVisible(not on)
+        self.central_layout.setContentsMargins(*((0, 0, 0, 0) if on else self.normal_margins))
+        terminal = self.terminal_tab
+        if on:
+            terminal.set_manager_visible(False, remember=False)
+        else:
+            terminal.show_page(terminal.stack.currentIndex())
+        if on:
+            self.show_status("Focus mode: press F11 to bring everything back.", "info")
+
+    def on_sidebar_toggled(self, visible):
+        self.sidebar_action.setChecked(visible)
+        self.settings.setValue("view/sidebar", visible)
 
     # ----------------------------------------------------------------- Snapshot and adapter picker
 
@@ -328,14 +414,14 @@ class MainWindow(QMainWindow):
         return self.snapshot.adapters.get(self.adapter_combo.currentData())
 
     def on_tab_changed(self, index):
-        """Refresh data that may have changed outside the app when switching to a tab that shows it."""
-        widget = self.tabs.widget(index)
+        """Refresh data that may have changed outside the app when switching to a page that shows it."""
+        widget = self.navigator.widget(index)
         if widget in (self.adapter_tab, self.routing_tab):
             if time.monotonic() - self.last_refresh > AUTO_REFRESH_AFTER_SECONDS:
                 self.refresh()
-        elif widget in (self.neighbors_tab, self.connections_tab):
+        elif widget in (self.neighbors_tab, self.connections_tab, self.netreset_tab):
             widget.refresh_if_stale()
-        self.connections_tab.update_timer()  # Auto refresh only while its tab is showing
+        self.connections_tab.update_timer()  # Auto refresh only while its page is showing
 
     # ----------------------------------------------------------------- Changes, admin and status
 
@@ -433,11 +519,11 @@ class MainWindow(QMainWindow):
 
     def wake_device(self, mac, name=""):
         """Open Wake-on-LAN on the Utilities tab with a device filled in (from the Sweep and ARP tabs)."""
-        self.tabs.setCurrentWidget(self.utilities_tab)
+        self.navigator.setCurrentWidget(self.utilities_tab)
         self.utilities_tab.wake_device(mac, name)
 
     def focus_route_filter(self):
-        self.tabs.setCurrentWidget(self.routing_tab)
+        self.navigator.setCurrentWidget(self.routing_tab)
         self.routing_tab.focus_filter()
 
     def show_log(self):
@@ -458,6 +544,9 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Keyboard Shortcuts",
                                 "F5\tRefresh network settings\n"
                                 "Ctrl+R\tRun a diagnostics report on the selected adapter\n"
+                                "Ctrl+Tab / Ctrl+Shift+Tab\tNext / previous page\n"
+                                "Ctrl+B\tHide or show the sidebar\n"
+                                "F11\tFocus mode: give the page (such as a terminal) the whole window\n"
                                 "Ctrl+= / Ctrl+-\tLarger / smaller text (Ctrl+0 for the default size)\n"
                                 "Ctrl+F\tFilter the routing table\n"
                                 "Delete\tDelete the selected route (Routing Table tab)\n"
