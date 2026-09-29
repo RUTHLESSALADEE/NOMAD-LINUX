@@ -57,9 +57,10 @@ class ConflictDialog(QDialog):
 
 
 class PropertiesDialog(QDialog):
-    """Details of remote files, and their permissions (chmod). On OK: mode and recursive are set."""
+    """Details of remote files, their permissions (chmod) and owner (chown). users and groups are the server's
+    names, for the lists. On OK: mode_changed / mode, owner_change, group_change and recursive say what to do."""
 
-    def __init__(self, parent, entries):
+    def __init__(self, parent, entries, users=(), groups=()):
         super().__init__(parent)
         self.entries = entries
         first = entries[0]
@@ -75,7 +76,6 @@ class PropertiesDialog(QDialog):
             form.addRow("Size:", QLabel("Folder" if first.is_dir else f"{format_size(first.size)} "
                                                                           f"({first.size:,} bytes)"))
             form.addRow("Modified:", QLabel(format_time(first.mtime)))
-            form.addRow("Owner:", QLabel(f"{first.owner or '?'} (group {first.group or '?'})"))
         else:
             files = [entry for entry in entries if not entry.is_dir]
             form.addRow("Selected:", QLabel(f"{len(entries) - len(files)} folders, {len(files)} files "
@@ -118,7 +118,27 @@ class PropertiesDialog(QDialog):
         octal_row.addStretch(1)
         grid.addLayout(octal_row, 5, 0, 1, 4)
         layout.addWidget(box)
-        self.recursive = QCheckBox("Also set it on everything inside (folders get Execute wherever Read is set)")
+        owners = QGroupBox("Owner")
+        owner_form = QFormLayout(owners)
+        self.original_owner = first.owner if len({entry.owner for entry in entries}) == 1 else ""
+        self.original_group = first.group if len({entry.group for entry in entries}) == 1 else ""
+        self.owner_combo, self.group_combo = QComboBox(), QComboBox()
+        for combo, names, current in ((self.owner_combo, users, self.original_owner),
+                                      (self.group_combo, groups, self.original_group)):
+            combo.setEditable(True)
+            combo.addItems(list(names))
+            combo.setCurrentText(current)
+            combo.lineEdit().setPlaceholderText("(different)" if not current else "")
+        self.owner_combo.setToolTip("A user name from the server, or a number (uid)")
+        self.group_combo.setToolTip("A group name from the server, or a number (gid)")
+        owner_form.addRow("User:", self.owner_combo)
+        owner_form.addRow("Group:", self.group_combo)
+        owner_note = QLabel("Changing the owner usually needs root: right-click the tab > Work as Root (sudo).")
+        owner_note.setWordWrap(True)
+        set_hint(owner_note, owner_note.text(), "info")
+        owner_form.addRow(owner_note)
+        layout.addWidget(owners)
+        self.recursive = QCheckBox("Also apply to everything inside (folders get Execute wherever Read is set)")
         self.recursive.setVisible(any(entry.is_dir for entry in entries))
         layout.addWidget(self.recursive)
         if len({entry.mode for entry in entries}) > 1:
@@ -143,9 +163,20 @@ class PropertiesDialog(QDialog):
         return sum(bit for bit, check in self.checks.items() if check.isChecked())
 
     @property
-    def changed(self):
+    def mode_changed(self):
         return self.mode != self.original or self.recursive.isChecked() or \
             len({entry.mode & 0o7777 for entry in self.entries}) > 1
+
+    @property
+    def owner_change(self):
+        """The new owner, or None to leave it."""
+        text = self.owner_combo.currentText().strip()
+        return text if text and text != self.original_owner else None
+
+    @property
+    def group_change(self):
+        text = self.group_combo.currentText().strip()
+        return text if text and text != self.original_group else None
 
     def set_mode(self, mode):
         for bit, check in self.checks.items():

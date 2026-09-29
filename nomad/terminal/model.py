@@ -63,7 +63,12 @@ class TerminalScreen(pyte.HistoryScreen):
         if self.alternate:
             pyte.Screen.index(self)  # Full-screen programs' scrolling doesn't belong in the scrollback
         else:
+            top, bottom = self.margins or pyte.screens.Margins(0, self.lines - 1)
+            if self.cursor.y == bottom:  # pyte's own test for adding a line to the scrollback
+                self.scrolled_out += 1
             super().index()
+
+    scrolled_out = 0  # Lines ever added to the scrollback: once it's full, the oldest go as new ones arrive
 
     def prev_page(self):
         pass  # The view scrolls through history itself; pyte's own paging would rewrite the screen
@@ -128,6 +133,11 @@ class TerminalModel:
     @property
     def history_length(self):
         return len(self.screen.history.top)
+
+    @property
+    def scrolled_out(self):
+        """How many lines have ever scrolled into the scrollback (it keeps counting once the scrollback is full)."""
+        return self.screen.scrolled_out
 
     @property
     def line_count(self):

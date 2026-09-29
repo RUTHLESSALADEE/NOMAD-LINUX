@@ -44,6 +44,7 @@ class Session:
     saved_passphrase: str = ""  # For an encrypted key file, also encrypted
     keepalive: int = 30  # Seconds; 0 turns it off
     file_protocol: str = "Auto"  # The SCP page: "Auto" (SFTP if the server has it, else SCP), "SFTP" or "SCP"
+    scp_sudo: bool = False  # The SCP page works as root, through sudo
     # Serial
     serial_port: str = "COM1"
     baud_rate: int = 9600

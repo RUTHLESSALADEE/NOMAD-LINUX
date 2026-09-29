@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import QFileDialog, QHBoxLayout, QInputDialog, QLabel, QMen
     QVBoxLayout, QWidget
 
 from ..terminal.files import CANCELLED, DONE, DOWNLOAD, FAILED, OVERWRITE, PAUSED, QUEUED, RUNNING, UPLOAD, Entry, \
-    FileConnection, RemoteError, Transfer, TransferRunner, chmod_tree, join, parent as remote_parent, remove_tree
+    FileConnection, RemoteError, SCP, Transfer, TransferRunner, chmod_tree, chown_tree, join, parent as remote_parent, remove_tree
 from .common import format_size, set_hint
 from .file_panes import LocalPane, RemotePane
 from .prompts import PromptAnswers, UiPrompter
@@ -45,6 +45,7 @@ class FileSessionView(PromptAnswers, QWidget):
         self.editors = []
         self.external_edits = []
         self.closing_all = False
+        self.sudo = bool(getattr(session, "scp_sudo", False))  # Working as root
         self.prompter = UiPrompter(self)
         self.question.connect(self.answer, Qt.QueuedConnection)
         self.pending_refresh = set()
@@ -91,6 +92,7 @@ class FileSessionView(PromptAnswers, QWidget):
         self.refresh_timer.timeout.connect(self.refresh_after_transfers)
 
         self.remote.set_connected(False)
+        self.update_root_title()
         local_folder = self.settings().value(f"{self.folder_key}/local", "", str)
         self.local.go(local_folder if local_folder and os.path.isdir(local_folder) else self.local.home())
         self.set_status("Not connected.", "info")
@@ -112,6 +114,35 @@ class FileSessionView(PromptAnswers, QWidget):
         hidden.setCheckable(True)
         hidden.setChecked(self.remote.show_hidden)
         actions[hidden] = self.toggle_hidden
+        actions[self.add_sudo_action(menu)] = self.toggle_sudo
+
+    def add_sudo_action(self, menu):
+        action = menu.addAction("Work as Root (sudo)")
+        action.setCheckable(True)
+        action.setChecked(self.sudo)
+        action.setToolTip("Reconnect this tab as root, running SFTP through sudo")
+        return action
+
+    def update_root_title(self):
+        self.remote.set_title("Remote (as root)" if self.sudo else "Remote", warning=self.sudo)
+
+    def toggle_sudo(self):
+        """Switch between working as the login user and as root. Reconnects the tab (if it's connected)."""
+        if not self.sudo and self.connection is not None and self.connection.mode == SCP:
+            self.fail("Work as Root", "Sudo needs SFTP. Set this session's File transfer to Auto or SFTP (Edit "
+                                      "Session), then try again.")
+            return
+        problems = self.problems() if self.state != DISCONNECTED else []
+        if problems:
+            reply = QMessageBox.question(self, "Work as Root", f"Switching reconnects {self.session.name}, which has "
+                                         + " and ".join(problems) + ". Switch anyway?",
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+        self.sudo = not self.sudo
+        self.update_root_title()
+        if self.state != DISCONNECTED:
+            self.reconnect()
 
     def problems(self):
         """What closing this tab would lose, as phrases ("2 transfers still to finish")."""
@@ -174,7 +205,8 @@ class FileSessionView(PromptAnswers, QWidget):
         if self.state != DISCONNECTED:
             return
         self.set_state(CONNECTING)
-        self.connection = FileConnection(self.session, self.prompter, self.store.vault if self.store else None)
+        self.connection = FileConnection(self.session, self.prompter, self.store.vault if self.store else None,
+                                         sudo=self.sudo)
         self.connect_thread = ConnectThread(self.connection, self)
         self.connect_thread.connected.connect(self.on_connected)
         self.connect_thread.failed.connect(self.on_failed)
@@ -295,7 +327,14 @@ class FileSessionView(PromptAnswers, QWidget):
         self.worker.submit(function, done, on_failure)
 
     def fail(self, title, message):
-        QMessageBox.warning(self, title, message)
+        QMessageBox.warning(self, title, self.explain(message))
+
+    def explain(self, message):
+        """Add what to do about an error, where there's something to suggest."""
+        if "permission denied" in message.lower() and not self.sudo:
+            message += ("\n\nChanging files you don't own, and changing owners, usually needs root: right-click the "
+                        "tab > Work as Root (sudo).")
+        return message
 
     # ----------------------------------------------------------------- Commands (keys and menus)
 
@@ -406,15 +445,27 @@ class FileSessionView(PromptAnswers, QWidget):
                     lambda message: (self.remote.refresh(), self.fail("Delete", message)))
 
     def show_properties(self, entries):
-        dialog = PropertiesDialog(self, entries)
-        if not dialog.exec_() or not dialog.changed:
+        """Read the server's user and group names for the lists (quick), then show the dialog."""
+        self.submit(lambda fs: fs.accounts(), lambda accounts: self.open_properties(entries, *accounts),
+                    lambda _message: self.open_properties(entries, {}, {}))
+
+    def open_properties(self, entries, users, groups):
+        dialog = PropertiesDialog(self, entries, sorted(users, key=str.lower), sorted(groups, key=str.lower))
+        if not dialog.exec_():
             return
-        mode, recursive = dialog.mode, dialog.recursive.isChecked()
+        mode = dialog.mode if dialog.mode_changed else None
+        owner, group, recursive = dialog.owner_change, dialog.group_change, dialog.recursive.isChecked()
+        if mode is None and owner is None and group is None:
+            return
 
         def work(fs):
             for entry in entries:
-                chmod_tree(fs, entry, mode, recursive)
-        self.submit(work, lambda _: self.remote.refresh(), lambda message: self.fail("Permissions", message))
+                if owner is not None or group is not None:
+                    chown_tree(fs, entry, owner, group, recursive)
+                if mode is not None:
+                    chmod_tree(fs, entry, mode, recursive)
+        self.submit(work, lambda _: self.remote.refresh(), lambda message: (self.remote.refresh(),
+                                                                             self.fail("Properties", message)))
 
     def local_properties(self, entry):
         try:
@@ -483,6 +534,8 @@ class FileSessionView(PromptAnswers, QWidget):
         hidden = menu.addAction("Show Hidden Files\tCtrl+Alt+H", self.toggle_hidden)
         hidden.setCheckable(True)
         hidden.setChecked(self.remote.show_hidden)
+        if remote:
+            self.add_sudo_action(menu).triggered.connect(self.toggle_sudo)
         menu.addSeparator()
         menu.addAction("Synchronize...", self.show_sync).setEnabled(connected)
         menu.addAction("Open in Terminal", self.open_terminal)

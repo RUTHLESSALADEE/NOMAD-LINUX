@@ -279,6 +279,16 @@ class TerminalView(QWidget):
             self.selection = None
             self.update()
 
+    def shift_selection(self, lines):
+        """Move the selection by some lines (the text under it moved), or drop it if its text has gone."""
+        anchor, end = self.selection
+        anchor, end = Position(anchor.line + lines, anchor.column), Position(end.line + lines, end.column)
+        if min(anchor.line, end.line) < 0:
+            self.selection = None
+            self.selecting = False
+        else:
+            self.selection = (anchor, end)
+
     def mousePressEvent(self, event):
         self.setFocus()
         if event.button() == Qt.LeftButton:
@@ -301,6 +311,9 @@ class TerminalView(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton and self.selecting:
             self.selecting = False
+            if self.selection is None:  # Its text scrolled out of the scrollback while selecting
+                self.update()
+                return
             start, end = self.selection
             if start == end:
                 self.selection = None
@@ -452,6 +465,7 @@ class SessionView(PromptAnswers, QWidget):
         self.log_file = None
         self.log_cleaner = LogCleaner()
         self.last_history = 0
+        self.last_scrolled_out = 0
         self.model = TerminalModel(80, 24, session.scrollback, session.encoding, respond=self.respond)
         self.question.connect(self.answer, Qt.QueuedConnection)
 
@@ -616,12 +630,15 @@ class SessionView(PromptAnswers, QWidget):
                 self.log_file.write(self.log_cleaner.clean(text))
             except OSError:
                 self.stop_logging()
-        grown = self.model.history_length - self.last_history
-        self.last_history = self.model.history_length
-        if self.view.offset and grown > 0:
-            self.view.offset += grown  # Keep showing the same text while scrolled back
-        if grown and self.view.selection is not None:
-            self.view.selection = None
+        history, scrolled_out = self.model.history_length, self.model.scrolled_out
+        scrolled = scrolled_out - self.last_scrolled_out  # Lines that moved up into the scrollback
+        # Lines gone from the top: dropped from a full scrollback, or cleared (Clear Scrollback, a reset)
+        dropped = scrolled - (history - self.last_history)
+        self.last_history, self.last_scrolled_out = history, scrolled_out
+        if self.view.offset and scrolled > 0:
+            self.view.offset = min(self.view.offset + scrolled, history)  # Keep showing the same text when scrolled back
+        if dropped > 0 and self.view.selection is not None:
+            self.view.shift_selection(-dropped)  # Stays on its text (even mid-drag), unless that text has gone
         self.view.schedule_repaint()
         self.sync_scrollbar()
 
@@ -680,8 +697,7 @@ class SessionView(PromptAnswers, QWidget):
     def clear_scrollback(self):
         self.model.clear_scrollback()
         self.view.set_offset(0)
-        self.last_history = 0
-        self.after_output()
+        self.after_output()  # Counts the cleared lines as gone, which drops a selection on them
 
     # ----------------------------------------------------------------- Logging
 
