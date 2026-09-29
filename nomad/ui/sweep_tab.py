@@ -456,6 +456,7 @@ class SweepTab(QWidget):
         menu = QMenu(self)
         actions = {
             menu.addAction("Open SSH Session"): lambda: self.open_terminal(host, SSH),
+            menu.addAction("Open SCP Session"): lambda: self.window.scp_tab.open_address(host),
             menu.addAction("Open Telnet Session"): lambda: self.open_terminal(host, TELNET),
             menu.addAction("SSH with PuTTY"): lambda: self.open_ssh(host),
             menu.addAction(f"Open https://{host}"): lambda: self.open_web(host),

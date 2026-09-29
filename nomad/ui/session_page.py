@@ -86,6 +86,10 @@ class SessionPage(QWidget):
     def make_view(self, session):
         raise NotImplementedError
 
+    def companion_actions(self, session):
+        """[(label, action)] for opening a session on the other page (Terminal ↔ SCP), for right-click menus."""
+        return []
+
     # ----------------------------------------------------------------- Making room
 
     manager_shown = True

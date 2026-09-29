@@ -21,6 +21,9 @@ class ScpTab(SessionPage):
     def make_view(self, session):
         return FileSessionView(session, self.store, self)
 
+    def companion_actions(self, session):
+        return [("Open in Terminal", lambda: self.window.terminal_tab.open_session(session))]
+
     def confirm_close(self):
         """Before the app closes: only transfers still to finish and unsaved edits are worth asking about."""
         problems = [view for view in self.all_views() if view.problems()]

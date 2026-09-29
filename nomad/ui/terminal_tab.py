@@ -1,5 +1,6 @@
 """Terminal page: saved sessions in folders, quick connect, and SSH / Telnet / serial / raw TCP sessions in tabs that
 can be popped out into their own windows."""
+from ..terminal.sessions import SSH
 from .session_page import SessionPage
 from .terminal_view import SessionView
 
@@ -13,3 +14,8 @@ class TerminalTab(SessionPage):
 
     def make_view(self, session):
         return SessionView(session, self.store)
+
+    def companion_actions(self, session):
+        if session.protocol != SSH:
+            return []
+        return [("Open in SCP", lambda: self.window.scp_tab.open_session(session))]

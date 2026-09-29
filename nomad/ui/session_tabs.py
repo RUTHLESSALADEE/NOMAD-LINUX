@@ -95,6 +95,8 @@ class SessionTabs(QTabWidget):
             actions[menu.addAction("Move to Main Window")] = lambda: self.page.move_to_main(view, self)
         menu.addSeparator()
         view.add_tab_actions(menu, actions)
+        for label, action in self.page.companion_actions(view.session):
+            actions[menu.addAction(label)] = action
         if self.page.store.get(view.session.id) is None:
             actions[menu.addAction("Save as Session...")] = lambda: self.page.save_quick_session(view)
         menu.addSeparator()
