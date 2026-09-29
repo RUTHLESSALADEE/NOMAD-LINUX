@@ -367,6 +367,7 @@ class PortsTab(QWidget):
                 actions[menu.addAction("Remote Desktop")] = lambda: self.open_port(result)
             elif result.port == 22:
                 actions[menu.addAction("Open SSH Session")] = lambda: self.open_port(result)
+                actions[menu.addAction("Open SCP Session")] = lambda: self.window.scp_tab.open_address(host)
                 actions[menu.addAction("SSH with PuTTY")] = lambda: self.window.sweep_tab.open_ssh(self.scanned_host)
             elif result.port == 23:
                 actions[menu.addAction("Open Telnet Session")] = lambda: self.open_port(result)

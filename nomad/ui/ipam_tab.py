@@ -1588,6 +1588,7 @@ class IpamTab(QWidget):
             menu.addAction("Traceroute", lambda: self.go_to(self.window.traceroute_tab, "trace_host", host))
             menu.addAction("Scan Ports", lambda: self.go_to(self.window.ports_tab, "scan_host", host))
             menu.addAction("SSH", lambda: self.window.terminal_tab.open_address(host))
+            menu.addAction("SCP", lambda: self.window.scp_tab.open_address(host))
             menu.addSeparator()
             menu.addAction("History...", lambda: self.show_history("address", host)).setEnabled(self.as_of is None)
         menu.exec_(self.table.viewport().mapToGlobal(position))

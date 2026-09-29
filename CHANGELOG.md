@@ -6,6 +6,12 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-09-28
+
+### Added
+
+- SCP wherever SSH is offered in a right-click menu: Open SCP Session on the Sweep and Ports pages (for port 22), SCP on an address on the IP Addresses page, and Open in SCP on SSH sessions in the Terminal page's session list, its Recent list and its tabs. The SCP page offers Open in Terminal the same way.
+
 ## [1.6.0] - 2026-09-28
 
 ### Changed

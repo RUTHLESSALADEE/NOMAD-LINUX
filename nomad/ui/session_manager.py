@@ -458,6 +458,7 @@ class SessionManager(QWidget):
             saved = self.store.get(entry.saved_id)
             actions[menu.addAction("Connect")] = lambda: self.open_recent(entry)
             actions[menu.addAction("Connect in New Window")] = lambda: self.open_recent(entry, window=True)
+            self.add_companion_actions(menu, actions, self.store.recent_session(entry))
             menu.addSeparator()
             if saved is None:
                 actions[menu.addAction("Save as Session...")] = lambda: self.save_recent(entry)
@@ -475,6 +476,7 @@ class SessionManager(QWidget):
         if session is not None:
             actions[menu.addAction("Connect")] = lambda: self.page.open_session(session)
             actions[menu.addAction("Connect in New Window")] = lambda: self.page.open_session(session, window=True)
+            self.add_companion_actions(menu, actions, session)
             menu.addSeparator()
             actions[menu.addAction("Edit...")] = lambda: self.edit_session(session)
             actions[menu.addAction("Duplicate")] = lambda: self.duplicate_session(session)
@@ -702,6 +704,11 @@ class SessionManager(QWidget):
                     if item.data(0, SESSION_ROLE)]
         sessions = [session for session in sessions if session is not None and not inside(session.folder)]
         return sessions, folders
+
+    def add_companion_actions(self, menu, actions, session):
+        """Open in SCP / Open in Terminal, from the page this sidebar is on."""
+        for label, action in self.page.companion_actions(session):
+            actions[menu.addAction(label)] = action
 
     def show_selection_menu(self, position, sessions, folders):
         """The right-click menu when several sessions and folders are selected."""

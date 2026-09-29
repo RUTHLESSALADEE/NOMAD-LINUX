@@ -108,7 +108,6 @@ class FileSessionView(PromptAnswers, QWidget):
         synchronize = menu.addAction("Synchronize...")
         synchronize.setEnabled(self.state == CONNECTED)
         actions[synchronize] = self.show_sync
-        actions[menu.addAction("Open in Terminal")] = self.open_terminal
         hidden = menu.addAction("Show Hidden Files")
         hidden.setCheckable(True)
         hidden.setChecked(self.remote.show_hidden)
