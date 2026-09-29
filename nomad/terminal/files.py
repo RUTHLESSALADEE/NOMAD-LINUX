@@ -24,9 +24,11 @@ log = logging.getLogger(__name__)
 SFTP, SCP = "SFTP", "SCP"
 PART_SUFFIX = ".filepart"  # Unfinished transfers, as WinSCP names them, so either can resume the other's
 CHUNK = 32768
+PREFETCH_WINDOW = 16 * 1024 * 1024  # Bytes of a download requested ahead at a time
 HASHES = {"SHA-256": ("sha256", "sha256sum", "shasum -a 256"), "MD5": ("md5", "md5sum", "md5 -q"),
           "SHA-1": ("sha1", "sha1sum", "shasum -a 1")}
 EXEC_TIMEOUT = 30
+BROWSE_TIMEOUT = 30  # Seconds a browsing request (listing, rename...) may wait for the server before giving up
 TIME_TOLERANCE = 2  # Seconds: FAT and some servers keep modification times to 2 s
 
 
@@ -246,6 +248,11 @@ class RemoteFS:
     """The operations the SCP page needs. Paths are absolute POSIX paths."""
     kind = ""
     can_resume = False
+    aborted = False  # abort() was called: this one can't be used again
+
+    def abort(self):
+        """Stop whatever is running right now, from any thread, without waiting for the server (Cancel and Pause,
+        even while the network is stalled). Afterwards this file system is finished with."""
 
     def __init__(self, connection):
         self.connection = connection
@@ -309,18 +316,34 @@ class RemoteFS:
         self.download(path, Sink(), cancelled=cancelled)
         return digest.hexdigest()
 
-    def walk_files(self, path, cancelled=lambda: False):
-        """(relative path, Entry) for every file under a folder, and each folder as it's entered."""
-        stack = [("", path)]
+    def realpath(self, path):
+        """Where a path really is, with links resolved (for noticing a link that loops back)."""
+        return path
+
+    def walk_files(self, path, cancelled=lambda: False, follow_links=False):
+        """(relative path, Entry) for every file under a folder, and each folder as it's entered. follow_links goes
+        into links to folders too (for copying), skipping any that lead back to a folder already being walked."""
+        stack = [("", path, frozenset({self.realpath(path)} if follow_links else ()))]
         while stack:
-            relative, folder = stack.pop()
+            relative, folder, ancestors = stack.pop()
             if cancelled():
                 raise TransferCancelled()
             for entry in sorted(self.listdir(folder), key=lambda item: item.name):
                 child = f"{relative}/{entry.name}" if relative else entry.name
+                if entry.is_dir and entry.is_link:
+                    if not follow_links:
+                        yield child, entry
+                        continue
+                    real = self.realpath(entry.path)
+                    if real in ancestors:
+                        continue  # A link back up the tree: copying it would never end
+                    yield child, entry
+                    stack.append((child, entry.path, ancestors | {real}))
+                    continue
                 yield child, entry
-                if entry.is_dir and not entry.is_link:
-                    stack.append((child, entry.path))
+                if entry.is_dir:
+                    stack.append((child, entry.path, ancestors | ({self.realpath(entry.path)} if follow_links
+                                                                   else frozenset())))
 
     def close(self):
         pass
@@ -342,6 +365,17 @@ class SftpFS(RemoteFS):
         super().__init__(connection)
         self.client = client
 
+    def abort(self):
+        self.aborted = True
+        try:
+            self.client.get_channel().close()  # A blocked read or write fails straight away
+        except (OSError, EOFError, paramiko.SSHException):
+            pass
+
+    def set_timeout(self, seconds):
+        """Give up on any request the server takes longer than this to answer (None waits for ever)."""
+        self.client.get_channel().settimeout(seconds)
+
     def entry(self, attributes, folder, name=None):
         name = name if name is not None else attributes.filename
         mode = attributes.st_mode or 0
@@ -362,6 +396,12 @@ class SftpFS(RemoteFS):
             return self.client.normalize(".")
         except (OSError, paramiko.SSHException):
             return "/"
+
+    def realpath(self, path):
+        try:
+            return self.client.normalize(path)
+        except (OSError, paramiko.SSHException):
+            return path
 
     def listdir(self, path):
         try:
@@ -440,18 +480,19 @@ class SftpFS(RemoteFS):
         try:
             size = self.client.stat(remote).st_size or 0
             with self.client.open(remote, "rb") as source:
-                if offset:
-                    source.seek(offset)
-                source.prefetch(size)
-                while True:
-                    if cancelled():
-                        raise TransferCancelled()
-                    data = source.read(CHUNK * 4)
-                    if not data:
-                        break
-                    local_file.write(data)
-                    if progress is not None:
-                        progress(len(data))
+                # Pipelined reads, a window at a time: fast over slow links, but never more than one window
+                # requested ahead (prefetching the whole file made a cancel wait for all of it to arrive)
+                position = offset
+                while position < size:
+                    end = min(size, position + PREFETCH_WINDOW)
+                    chunks = [(start, min(CHUNK, end - start)) for start in range(position, end, CHUNK)]
+                    for data in source.readv(chunks):
+                        if cancelled():
+                            raise TransferCancelled()
+                        local_file.write(data)
+                        if progress is not None:
+                            progress(len(data))
+                    position = end
             return float(self.client.stat(remote).st_mtime or 0)
         except (OSError, paramiko.SSHException, EOFError) as error:
             raise _sftp_error(error, remote) from None
@@ -493,6 +534,13 @@ class ShellFS(RemoteFS):
     def __init__(self, connection):
         super().__init__(connection)
         self.gnu_ls = None  # Whether ls understands --time-style (GNU); found on first use
+        self.channel = None  # The scp channel of the file being copied
+
+    def abort(self):
+        self.aborted = True
+        channel = self.channel
+        if channel is not None:
+            channel.close()
 
     def run(self, command, path):
         status, out, err = self.connection.run(command)
@@ -520,6 +568,12 @@ class ShellFS(RemoteFS):
             return self.run("pwd", "~").strip() or "/"
         except RemoteError:
             return "/"
+
+    def realpath(self, path):
+        try:
+            return self.run(f"cd {quote(path)} && pwd -P", path).strip() or path
+        except RemoteError:
+            return path
 
     def listdir(self, path):
         entries = parse_ls(self.ls("-la", path.rstrip("/") + "/" if path != "/" else "/"), path)
@@ -568,22 +622,28 @@ class ShellFS(RemoteFS):
     def download(self, remote, local_file, offset=0, progress=None, cancelled=lambda: False):
         if offset:
             raise RemoteError("SCP can't resume a transfer.")
-        channel = self.connection.exec_channel(f"scp -p -f {quote(remote)}")
+        channel = self.channel = self.connection.exec_channel(f"scp -p -f {quote(remote)}")
         try:
             _, mtime = scp_receive(channel, local_file.write, progress, cancelled)
             return mtime
+        except (OSError, EOFError, paramiko.SSHException) as error:
+            raise RemoteError(f"The transfer stopped: {error}") from None
         finally:
+            self.channel = None
             channel.close()
 
     def upload(self, local_file, size, remote, offset=0, mode=None, mtime=None, progress=None,
                cancelled=lambda: False):
         if offset:
             raise RemoteError("SCP can't resume a transfer.")
-        channel = self.connection.exec_channel(f"scp -p -t {quote(remote)}")
+        channel = self.channel = self.connection.exec_channel(f"scp -p -t {quote(remote)}")
         try:
             scp_send(channel, local_file.read, size, posixpath.basename(remote), 0o644 if mode is None else mode,
                      mtime, progress, cancelled)
+        except (OSError, EOFError, paramiko.SSHException) as error:
+            raise RemoteError(f"The transfer stopped: {error}") from None
         finally:
+            self.channel = None
             channel.close()
 
 
@@ -633,7 +693,8 @@ class FileConnection:
         self.ssh = SshTransport(session, prompter, known_hosts=known_hosts)
         if vault is not None:
             self.ssh.vault = vault
-        self.mode = mode  # SFTP, SCP, or None to use SFTP when the server has it
+        # SFTP, SCP, or None to use SFTP when the server has it; the session's File transfer setting by default
+        self.mode = mode or {"SFTP": SFTP, "SCP": SCP}.get(getattr(session, "file_protocol", "Auto"))
         self.kind = None
         self.description = ""
         self.notice = ""
@@ -648,6 +709,8 @@ class FileConnection:
         username = self.ssh.login()
         self.notice = self.ssh.notice
         fs = self.open_fs()
+        if isinstance(fs, SftpFS):
+            fs.set_timeout(BROWSE_TIMEOUT)  # A quiet network mustn't leave the pane waiting for ever
         self.description = f"{fs.kind} to {username}@{self.session.host.strip()}"
         if fs.kind == SCP and self.mode != SCP:
             self.notice = ("This server doesn't offer SFTP, so NOMAD is using SCP: browsing uses ls, and interrupted "
@@ -806,7 +869,7 @@ def expand(fs, transfer, cancelled=lambda: False):
                                       verify=transfer.verify))
     else:
         folders.append(transfer.local)
-        for relative, entry in fs.walk_files(transfer.remote, cancelled):
+        for relative, entry in fs.walk_files(transfer.remote, cancelled, follow_links=True):
             local = os.path.join(transfer.local, *relative.split("/"))
             if entry.is_dir:
                 folders.append(local)
@@ -829,6 +892,12 @@ class TransferRunner:
 
     def cancelled(self):
         return self.cancel_current
+
+    def cancel(self):
+        """Stop the file being copied now (from another thread). The file system is aborted, so the caller opens a
+        new one for the next file."""
+        self.cancel_current = True
+        self.fs.abort()
 
     def decide(self, transfer, existing):
         """What to do when the target exists: (OVERWRITE / SKIP / RENAME)."""
@@ -857,11 +926,16 @@ class TransferRunner:
                 transfer.state = DONE
         except TransferCancelled:
             transfer.state = CANCELLED
-        except RemoteError as error:
-            transfer.state, transfer.message = FAILED, str(error)
-        except OSError as error:
-            transfer.state, transfer.message = FAILED, f"{error.filename or transfer.local}: " \
-                                                       f"{error.strerror or error}"
+        except (RemoteError, OSError, EOFError, paramiko.SSHException) as error:
+            if self.cancel_current:  # Aborting the channel broke whatever was running: that's the cancel
+                transfer.state = CANCELLED
+            elif isinstance(error, RemoteError):
+                transfer.state, transfer.message = FAILED, str(error)
+            elif isinstance(error, OSError):
+                transfer.state, transfer.message = FAILED, f"{error.filename or transfer.local}: " \
+                                                           f"{error.strerror or error}"
+            else:
+                transfer.state, transfer.message = FAILED, f"The transfer stopped: {error or 'connection closed'}"
         self.progress(transfer)
         return transfer
 
@@ -1006,7 +1080,7 @@ def local_files(root, cancelled=lambda: False):
 
 
 def remote_files(fs, root, cancelled=lambda: False):
-    return {relative: entry for relative, entry in fs.walk_files(root, cancelled)
+    return {relative: entry for relative, entry in fs.walk_files(root, cancelled, follow_links=True)
             if not entry.is_dir and not entry.name.endswith(PART_SUFFIX)}
 
 

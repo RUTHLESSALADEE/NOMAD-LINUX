@@ -11,7 +11,7 @@ import pytest
 
 from nomad.terminal.files import BOTH_WAYS, CANCELLED, DIFFERENT, DONE, DOWNLOAD, FAILED, LOCAL_NEWER, LOCAL_ONLY, \
     NEWER, OVERWRITE, PART_SUFFIX, REMOTE_NEWER, REMOTE_ONLY, RENAME, SAME, SCP, SFTP, SKIP, SKIPPED, TO_LOCAL, \
-    TO_REMOTE, UPLOAD, Entry, FileConnection, RemoteError, ShellFS, Transfer, TransferRunner, chmod_tree, compare, \
+    TO_REMOTE, UPLOAD, Entry, FileConnection, RemoteError, RemoteFS, ShellFS, Transfer, TransferRunner, chmod_tree, compare, \
     expand, folder_mode, local_files, parse_ls, parse_permissions, permission_text, remote_files, remove_tree, \
     scp_receive, scp_send
 from nomad.terminal.hostkeys import KnownHosts
@@ -25,6 +25,19 @@ def host_key():
 
 
 # ----------------------------------------------------------------- A small SSH server with SFTP over a folder
+
+class SlowHandle(paramiko.SFTPHandle):
+    """Answers reads and writes slowly, like a server over a slow link."""
+    delay = 0.0
+
+    def read(self, offset, length):
+        time.sleep(self.delay)
+        return super().read(offset, length)
+
+    def write(self, offset, data):
+        time.sleep(self.delay)
+        return super().write(offset, data)
+
 
 class FolderSFTP(paramiko.SFTPServerInterface):
     root = ""
@@ -72,7 +85,7 @@ class FolderSFTP(paramiko.SFTPServerInterface):
             mode = "a+b" if flags & os.O_APPEND else "r+b"
         else:
             mode = "rb"
-        handle = paramiko.SFTPHandle(flags)
+        handle = SlowHandle(flags)
         handle.filename = real
         handle.readfile = handle.writefile = os.fdopen(descriptor, mode)
         return handle
@@ -325,6 +338,61 @@ def test_cancel_leaves_a_part_to_resume(remote, tmp_path):
     assert (tmp_path / "big.iso").read_bytes() == (root / "big.iso").read_bytes()
 
 
+@pytest.fixture
+def slow_server():
+    SlowHandle.delay = 0.004  # About 8 MB/s: the file below takes seconds to finish
+    yield
+    SlowHandle.delay = 0.0
+
+
+def cancel_part_way(runner, transfer, threshold):
+    """Run a transfer on a thread, cancel it once threshold bytes are done, and time how long the cancel takes."""
+    started = threading.Event()
+
+    def progress(item):
+        if item.done > threshold:
+            started.set()
+    runner.progress = progress
+    thread = threading.Thread(target=runner.run, args=(transfer,))
+    thread.start()
+    assert started.wait(10)
+    begun = time.monotonic()
+    runner.cancel()
+    thread.join(10)
+    return time.monotonic() - begun
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")  # paramiko's read-ahead thread dies
+def test_cancel_stops_a_big_download_straight_away(remote, tmp_path, slow_server):
+    connection, _, root, _ = remote
+    data = os.urandom(24_000_000)
+    write(root / "big.iso", data)
+    fs = connection.open_fs()
+    runner = TransferRunner(fs)
+    transfer = Transfer(DOWNLOAD, str(tmp_path / "big.iso"), "/big.iso")
+    took = cancel_part_way(runner, transfer, 500_000)
+    assert transfer.state == CANCELLED and took < 1.5, (transfer.state, took)  # Not after the rest arrives
+    assert fs.aborted and not (tmp_path / "big.iso").exists()
+    part_size = (tmp_path / ("big.iso" + PART_SUFFIX)).stat().st_size
+    assert 0 < part_size < len(data)
+    # The login is still good: a new channel resumes from the part
+    SlowHandle.delay = 0.0
+    again = TransferRunner(connection.open_fs()).run(Transfer(DOWNLOAD, str(tmp_path / "big.iso"), "/big.iso"))
+    assert again.state == DONE and again.resumed_from == part_size
+    assert (tmp_path / "big.iso").read_bytes() == data
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")  # paramiko's read-ahead thread dies
+def test_cancel_stops_a_big_upload_straight_away(remote, tmp_path, slow_server):
+    connection, _, root, _ = remote
+    local = write(tmp_path / "big.iso", os.urandom(24_000_000))
+    runner = TransferRunner(connection.open_fs())
+    transfer = Transfer(UPLOAD, str(local), "/big.iso")
+    took = cancel_part_way(runner, transfer, 500_000)
+    assert transfer.state == CANCELLED and took < 1.5, (transfer.state, took)
+    assert not (root / "big.iso").exists()
+
+
 def test_conflicts_skip_rename_newer_and_ask(remote, tmp_path):
     _, fs, root, _ = remote
     write(root / "a.conf", b"server")
@@ -534,3 +602,61 @@ def test_compare_real_folders(remote, tmp_path):
     result = {item.relative: item.status for item in compare(local, remote_side, BOTH_WAYS)}
     assert result == {"a.conf": SAME, "sub/b.conf": LOCAL_ONLY, "c.conf": REMOTE_ONLY}
     assert stat.S_ISREG(os.stat(tmp_path / "cfg" / "a.conf").st_mode)
+
+
+# ----------------------------------------------------------------- Links to folders, protocol choice, old edit copies
+
+class TreeFS(RemoteFS):
+    """An in-memory tree with links: {path: [Entry]}, and where each link really goes."""
+
+    def __init__(self, tree, links):
+        super().__init__(None)
+        self.tree, self.links = tree, links
+
+    def listdir(self, path):
+        return self.tree[self.links.get(path, path)]
+
+    def realpath(self, path):
+        return self.links.get(path, path)
+
+
+def test_copying_follows_links_to_folders_but_not_loops():
+    tree = {
+        "/site": [Entry("index.html", "/site/index.html", size=1),
+                  Entry("shared", "/site/shared", is_dir=True, is_link=True),
+                  Entry("again", "/site/again", is_dir=True, is_link=True)],
+        "/srv/shared": [Entry("logo.png", "/site/shared/logo.png", size=2)],
+    }
+    fs = TreeFS(tree, {"/site/shared": "/srv/shared", "/site/again": "/site"})  # "again" loops back to /site
+    followed = sorted(relative for relative, _ in fs.walk_files("/site", follow_links=True))
+    assert followed == ["index.html", "shared", "shared/logo.png"]  # The loop ("again") is left out entirely
+    # Without following (delete and chmod), links are listed but never entered
+    assert sorted(relative for relative, _ in fs.walk_files("/site")) == ["again", "index.html", "shared"]
+
+
+def test_session_can_force_scp(tmp_path, host_key):
+    root = tmp_path / "server"
+    (root / "home" / "admin").mkdir(parents=True)
+    port, _ = run_file_server(host_key, str(root))
+    session = Session("x", SSH, "127.0.0.1", port, username="admin", file_protocol="SCP")
+    connection = FileConnection(session, PasswordPrompter(), known_hosts=KnownHosts(str(tmp_path / "known")))
+    try:
+        assert connection.connect().kind == SCP  # SFTP is there, but the session asked for SCP
+        assert "doesn't offer SFTP" not in connection.notice
+    finally:
+        connection.close()
+    assert FileConnection(Session("y", SSH, file_protocol="SFTP")).mode == SFTP
+    assert FileConnection(Session("z", SSH)).mode is None
+
+
+def test_old_edit_copies_are_cleaned(tmp_path, monkeypatch):
+    from nomad.ui import remote_editor
+    monkeypatch.setattr(remote_editor, "EDIT_FOLDER", str(tmp_path))
+    old, recent = tmp_path / "old1", tmp_path / "new1"
+    write(old / "nginx.conf", b"x")
+    write(recent / "motd", b"y")
+    week_ago = time.time() - 7 * 86400
+    for path in (old / "nginx.conf", old):
+        os.utime(path, (week_ago, week_ago))
+    assert remote_editor.clean_old_edits() == 1
+    assert not old.exists() and recent.exists()

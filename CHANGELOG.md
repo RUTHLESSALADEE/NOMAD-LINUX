@@ -6,6 +6,25 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.6.2] - 2026-09-29
+
+### Added
+
+- Upload ▶ and ◀ Download buttons under the SCP page's panes copy the selected files to the other side (as F5 does).
+- File transfer setting for SSH sessions (Edit Session): Auto uses SFTP when the server has it and SCP otherwise, as before; SFTP only or SCP can be chosen for servers whose SFTP is broken rather than missing.
+
+### Fixed
+
+- Answering "Do the same for the rest of the queue" when a file exists no longer carries on to files queued later: once the queue runs out, the next file that exists is asked about again (or follows the "If it exists" setting).
+- Downloading or synchronizing a folder that has links to other folders in it copies what the links lead to, instead of making empty folders. A link that leads back up the tree is skipped. Delete and Permissions still act on a link itself, never on what it leads to.
+- The SCP page's local side lists folders in the background, and finds drives without asking each one, so a slow network share or a disconnected mapped drive no longer freezes NOMAD.
+- Cancelling an upload in SCP mode (servers without SFTP) removes the part-written file from the server.
+- Copies downloaded for Edit With that were left behind (NOMAD didn't close normally) are deleted once they're two days old.
+- Cancelling (or pausing) an SCP transfer now stops it straight away. Before, a big download kept going in the background until the rest of the file had arrived, so Cancel seemed to hang; downloads now read ahead 16 MB at a time instead of the whole file, which also keeps memory use down.
+- A transfer that stops getting data (Wi-Fi off, VPN dropped, server busy) shows "Stalled: no data for N s" in the queue instead of "Transferring". It carries on by itself if the connection comes back, and Cancel works while it's stalled.
+- Browsing on the SCP page gives up after 30 seconds without an answer from the server, instead of showing "Listing..." for ever.
+- SSH logins (Terminal and SCP) could occasionally wait 30 seconds and then report a correct password as wrong, when the server answered very quickly. This came from paramiko sending the login request before it was ready to hear the answer.
+
 ## [1.6.1] - 2026-09-28
 
 ### Added

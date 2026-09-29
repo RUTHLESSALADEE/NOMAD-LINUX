@@ -3,7 +3,7 @@ import os
 import posixpath
 import time
 
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import QTimer, Qt, pyqtSignal
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel, QMenu, \
     QPushButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
@@ -19,6 +19,7 @@ STATE_COLORS = {DONE: "success", FAILED: "error", SKIPPED: "muted", CANCELLED: "
 POLICIES = [("Ask", ASK), ("Overwrite", OVERWRITE), ("Overwrite if newer", NEWER), ("Skip", SKIP),
             ("Rename the new file", RENAME)]
 FINISHED = (DONE, FAILED, SKIPPED, CANCELLED)
+STALL_SECONDS = 10  # A running transfer with no data for this long shows as stalled
 
 
 def format_speed(rate):
@@ -45,6 +46,10 @@ class QueuePanel(QWidget):
         self.transfers = {}  # Transfer id: Transfer
         self.samples = {}  # Transfer id: (time, bytes done) at the last speed update
         self.speeds = {}
+        self.progress_seen = {}  # Transfer id: (bytes done, when that changed), to notice a stalled transfer
+        self.stall_timer = QTimer(self)
+        self.stall_timer.timeout.connect(self.check_stalls)
+        self.stall_timer.start(1000)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
@@ -150,12 +155,36 @@ class QueuePanel(QWidget):
             status = transfer.message if transfer.state == RUNNING else f"{transfer.state}: {transfer.message}"
         if transfer.state == RUNNING and transfer.resumed_from:
             status += f" (resumed at {format_size(transfer.resumed_from)})"
+        stalled = self.stalled_for(transfer)
+        if stalled:
+            status = (f"Stalled: no data for {stalled} s. The network or server may be down; it carries on by itself "
+                      "if the connection comes back, or Cancel it.")
         item.setText(STATUS, status)
         item.setToolTip(STATUS, status)
-        color = QColor(COLORS[STATE_COLORS.get(transfer.state, "text")])
+        color = QColor(COLORS["warning" if stalled else STATE_COLORS.get(transfer.state, "text")])
         for column in (PROGRESS, STATUS):
             item.setForeground(column, color)
         self.update_summary()
+
+    def stalled_for(self, transfer):
+        """Seconds a running transfer has had no data for, once that's STALL_SECONDS or more (otherwise 0)."""
+        if transfer.state != RUNNING or transfer.message:  # A message means checking or listing, not copying
+            self.progress_seen.pop(transfer.id, None)
+            return 0
+        now = time.monotonic()
+        seen = self.progress_seen.get(transfer.id)
+        if seen is None or seen[0] != transfer.done:
+            self.progress_seen[transfer.id] = (transfer.done, now)
+            return 0
+        quiet = int(now - seen[1])
+        return quiet if quiet >= STALL_SECONDS else 0
+
+    def check_stalls(self):
+        """Once a second: a stalled transfer sends no updates, so look at the running ones here."""
+        for transfer_id in list(self.progress_seen):
+            transfer = self.transfers.get(transfer_id)
+            if transfer is not None and transfer.state == RUNNING:
+                self.update(transfer)
 
     def speed_text(self, transfer):
         if transfer.state != RUNNING:
