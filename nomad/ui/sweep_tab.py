@@ -286,18 +286,6 @@ class SweepTab(QWidget):
         self.window.set_busy("sweep", f"Sweeping {network}")
         self.update_buttons()
 
-    def sweep_subnet(self, cidr, source=None, network_id=None):
-        """Sweep a subnet from the IP Addresses page, comparing the hosts with that IPAM network."""
-        self.window.navigator.setCurrentWidget(self)
-        if self.worker is not None:
-            set_hint(self.status_label, "A sweep is already running: stop it first to sweep another subnet.",
-                     "warning")
-            return
-        self.subnet_input.setText(cidr)
-        if network_id is not None:
-            self.ipam_bar.compare_with(source, network_id)
-        self.start_sweep()
-
     def stop_sweep(self):
         if self.worker is not None:
             self.worker.stop()

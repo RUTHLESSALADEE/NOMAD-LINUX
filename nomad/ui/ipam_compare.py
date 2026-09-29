@@ -96,10 +96,6 @@ class IpamComparison(QWidget):
         self.chosen = self.network_combo.currentData()
         self.compare_now()
 
-    def compare_with(self, source, network_id):
-        """Compare with this network (picked on the IP Addresses page), whether or not hosts found are in it."""
-        self.chosen = f"{source}:{network_id}"
-
     def fill_networks(self):
         candidates = candidate_networks(self.ipam.ipam_stores(), list(self.found)) if self.found else []
         current = self.chosen  # Only what the user picked; otherwise the best match (first)
