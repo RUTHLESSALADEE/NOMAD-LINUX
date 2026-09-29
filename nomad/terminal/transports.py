@@ -266,6 +266,21 @@ class SshTransport(Transport):
 
     def connect(self):
         session = self.session
+        username = self.login()
+        try:
+            self.channel = self.transport.open_session()
+            columns, rows = self.size
+            self.channel.get_pty(term=session.terminal_type, width=columns, height=rows)
+            self.channel.invoke_shell()
+        except paramiko.SSHException as error:
+            self.close()
+            raise ConnectionFailed(f"Logged in, but the device wouldn't open a terminal: {error}") from None
+        self.description = f"SSH to {username}@{session.host.strip()} ({describe_algorithms(self.transport)})"
+
+    def login(self):
+        """Connect, check the host key and log in, leaving self.transport ready for channels. Returns the user name.
+        Shared by the terminal and the SCP page."""
+        session = self.session
         host, port = session.host.strip(), int(session.port)
         try:
             sock = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
@@ -295,20 +310,12 @@ class SshTransport(Transport):
             self.close()
             raise Cancelled()
         self.authenticate(username)
-        try:
-            self.channel = self.transport.open_session()
-            columns, rows = self.size
-            self.channel.get_pty(term=session.terminal_type, width=columns, height=rows)
-            self.channel.invoke_shell()
-        except paramiko.SSHException as error:
-            self.close()
-            raise ConnectionFailed(f"Logged in, but the device wouldn't open a terminal: {error}") from None
         if session.keepalive:
             self.transport.set_keepalive(int(session.keepalive))
-        self.description = f"SSH to {username}@{host} ({describe_algorithms(self.transport)})"
         if uses_legacy(self.transport):
             self.notice = ("This device only supports older SHA-1 SSH algorithms. The connection works, but "
                            "consider updating its firmware.")
+        return username
 
     def check_host_key(self, host, port):
         key = self.transport.get_remote_server_key()

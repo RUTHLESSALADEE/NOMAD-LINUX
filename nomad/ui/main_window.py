@@ -12,6 +12,7 @@ from ..ipconfig import flush_dns
 from ..profiles import ProfileStore
 from ..snapshot import NetworkSnapshot, load_snapshot
 from ..system import APP_FULL_NAME, APP_NAME, is_admin, relaunch_as_admin
+from ..terminal.sessions import SessionStore
 from .adapter_tab import AdapterTab
 from .capture_tab import CaptureTab
 from .common import run_in_background
@@ -31,6 +32,7 @@ from .ping_tab import PingTab
 from .ports_tab import PortsTab
 from .report_dialog import ReportDialog
 from .routing_tab import RoutingTab
+from .scp_tab import ScpTab
 from .snmp_tab import SnmpTab
 from .sweep_tab import SweepTab
 from .switch_tab import SwitchTab
@@ -147,13 +149,15 @@ class MainWindow(QMainWindow):
         self.syslog_tab = SyslogTab(self)
         self.tftp_tab = TftpTab(self)
         self.utilities_tab = UtilitiesTab(self)
-        self.terminal_tab = TerminalTab(self)
+        self.session_store = SessionStore()  # Shared by the Terminal and SCP pages
+        self.terminal_tab = TerminalTab(self, self.session_store)
+        self.scp_tab = ScpTab(self, self.session_store)
         self.ipam_tab = IpamTab(self)
         sections = [
             ("This Computer", [(self.adapter_tab, "Interfaces"), (self.routing_tab, "Routing Table"),
                                (self.neighbors_tab, "ARP"), (self.connections_tab, "Connections"),
                                (self.netreset_tab, "Network Reset")]),
-            ("Connect", [(self.terminal_tab, "Terminal")]),
+            ("Connect", [(self.terminal_tab, "Terminal"), (self.scp_tab, "SCP")]),
             ("Manage", [(self.ipam_tab, "IP Addresses")]),
             ("Test", [(self.ping_tab, "Ping"), (self.latency_tab, "Latency"), (self.traceroute_tab, "Traceroute"),
                       (self.mtu_tab, "MTU"), (self.ports_tab, "Ports"), (self.iperf_tab, "iperf")]),
@@ -190,12 +194,25 @@ class MainWindow(QMainWindow):
 
     def init_menus(self):
         file_menu = self.menuBar().addMenu("&File")
-        file_menu.addAction("&Import Profiles...", self.adapter_tab.import_profiles)
-        file_menu.addAction("&Export Profiles...", self.adapter_tab.export_profiles)
+        file_menu.addAction("&Import Interface Profiles...", self.adapter_tab.import_profiles)
+        file_menu.addAction("&Export Interface Profiles...", self.adapter_tab.export_profiles)
+        file_menu.addSeparator()
+        file_menu.addAction("Import Sessions from &PuTTY",
+                            lambda: self.show_terminal(self.terminal_tab.manager.import_from_putty))
+        file_menu.addAction("Import Sessions from &SecureCRT...",
+                            lambda: self.show_terminal(self.terminal_tab.manager.import_from_securecrt))
         file_menu.addSeparator()
         if not self.admin:
             file_menu.addAction("Restart as &Administrator", self.restart_as_admin)
         file_menu.addAction("E&xit", self.close)
+
+        edit_menu = self.menuBar().addMenu("&Edit")
+        edit_menu.addAction("New &Session...", lambda: self.show_terminal(
+            lambda: self.terminal_tab.manager.new_session(self.terminal_tab.manager.selected_folder())))
+        edit_menu.addAction("New &Folder...", lambda: self.show_terminal(
+            lambda: self.terminal_tab.manager.new_folder(self.terminal_tab.manager.selected_folder())))
+        edit_menu.addSeparator()
+        edit_menu.addAction("Clear &Recent Connections", self.terminal_tab.manager.clear_recent)
 
         view_menu = self.menuBar().addMenu("&View")
         self.sidebar_action = QAction("Show &Sidebar", self)
@@ -247,7 +264,7 @@ class MainWindow(QMainWindow):
         tools_menu.addAction(find_action)
         tools_menu.addSeparator()
         tools_menu.addAction("&Flush DNS Cache", self.flush_dns)
-        tools_menu.addAction("Saved Password &Protection...", lambda: self.terminal_tab.show_protection())
+        tools_menu.addAction("Saved Password &Protection...", lambda: self.terminal_tab.manager.show_protection())
         tools_menu.addAction("&IPAM Server...", self.show_ipam_server)
         tools_menu.addSeparator()
         tools_menu.addAction("Add &PuTTY to PATH", self.sweep_tab.add_putty_to_path)
@@ -258,6 +275,11 @@ class MainWindow(QMainWindow):
         help_menu = self.menuBar().addMenu("&Help")
         help_menu.addAction("&Keyboard Shortcuts", self.show_shortcuts)
         help_menu.addAction("&About", self.show_about)
+
+    def show_terminal(self, then):
+        """Switch to the Terminal page, then do something there (so what it adds is on screen)."""
+        self.navigator.setCurrentWidget(self.terminal_tab)
+        then()
 
     # ----------------------------------------------------------------- Settings
 
@@ -283,7 +305,7 @@ class MainWindow(QMainWindow):
         self.settings.sync()
 
     def closeEvent(self, event):
-        if not self.terminal_tab.confirm_close():
+        if not self.terminal_tab.confirm_close() or not self.scp_tab.confirm_close():
             event.ignore()
             return
         self.save_settings()
@@ -316,7 +338,8 @@ class MainWindow(QMainWindow):
         """Give the current page the whole window: no sidebar, adapter bar, banner, status bar or session list."""
         on = bool(on)
         self.focus_action.setChecked(on)
-        self.terminal_tab.focus_button.setChecked(on)
+        for page in (self.terminal_tab, self.scp_tab):
+            page.focus_button.setChecked(on)
         if on == self.focus_mode:
             return
         self.focus_mode = on
@@ -325,11 +348,11 @@ class MainWindow(QMainWindow):
         self.admin_banner.setVisible(not on and not self.admin)
         self.statusBar().setVisible(not on)
         self.central_layout.setContentsMargins(*((0, 0, 0, 0) if on else self.normal_margins))
-        terminal = self.terminal_tab
-        if on:
-            terminal.set_manager_visible(False, remember=False)
-        else:
-            terminal.show_page(terminal.stack.currentIndex())
+        for page in (self.terminal_tab, self.scp_tab):
+            if on:
+                page.set_manager_visible(False, remember=False)
+            else:
+                page.show_page(page.stack.currentIndex())
         if on:
             self.show_status("Focus mode: press F11 to bring everything back.", "info")
 
@@ -555,6 +578,9 @@ class MainWindow(QMainWindow):
                                 "Ctrl+= / Ctrl+-\tLarger / smaller text (Ctrl+0 for the default size)\n"
                                 "Ctrl+F\tFilter the routing table\n"
                                 "Delete\tDelete the selected route (Routing Table tab)\n"
+                                "SCP page (in a file list): F5 copy to the other side, F4 edit, F2 rename, "
+                                "F7 new folder, F8/Delete delete, Alt+Enter properties, Ctrl+R refresh, "
+                                "Ctrl+Alt+H hidden files, Ctrl+F filter, Backspace up a folder\n"
                                 "Enter\tStart ping / traceroute / port scan / iperf / lookup / sweep from their "
                                 "input fields")
 

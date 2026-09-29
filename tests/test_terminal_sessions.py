@@ -93,3 +93,42 @@ def test_credentials_round_trip():
         unprotect("not base64!")
     with pytest.raises(CredentialError):
         unprotect(protect("x")[:-8] + "AAAAAAA=")
+
+
+def test_move_sessions_and_folders(tmp_path):
+    path = str(tmp_path / "sessions.json")
+    store = SessionStore(path)
+    core = Session("core", SSH, "10.0.0.1", folder="Imported/Site A/Switches")
+    edge = Session("edge", SSH, "10.0.0.2", folder="Imported/Site A")
+    other_core = Session("core", SSH, "10.9.0.1", folder="Site A/Switches")
+    loose = Session("loose", SSH, "10.0.0.3")
+    for session in (core, edge, other_core, loose):
+        store.sessions.append(session)
+    store.save()
+
+    # Moving a folder where one of the same name exists merges them; a clashing session name gets " (2)"
+    assert store.move_folder("Imported/Site A", "") == "Site A"
+    assert (store.get(core.id).folder, store.get(core.id).name) == ("Site A/Switches", "core (2)")
+    assert store.get(other_core.id).name == "core"  # The one already there keeps its name
+    assert store.get(edge.id).folder == "Site A"
+    assert "Imported" in store.all_folders()  # The folder it came out of stays, now empty
+
+    # Moving up a level and into another folder; a folder can't go inside itself
+    assert store.move_folder("Site A/Switches", "Imported") == "Imported/Switches"
+    with pytest.raises(ValueError):
+        store.move_folder("Imported", "Imported/Switches")
+    with pytest.raises(ValueError):
+        store.rename_folder("Imported", "Imported/Inner")
+    assert store.move_folder("Imported", "") == "Imported"  # Already there: nothing changes
+
+    # Sessions: several at once, to a folder or the top level, names made unique
+    assert store.move_sessions({core.id, other_core.id}, "") == 2
+    assert sorted(store.get(item).name for item in (core.id, other_core.id)) == ["core", "core (2)"]
+    assert "Imported/Switches" in store.all_folders()  # Emptied by the move, still there
+    assert store.move_sessions({loose.id}, "New/Deep") == 1 and "New" in store.all_folders()
+    assert store.move_sessions({loose.id}, "New/Deep") == 0
+
+    store.delete_many({core.id, edge.id})
+    reloaded = SessionStore(path)
+    assert {session.name for session in reloaded.sessions} == {"core", "loose"}  # other_core and loose
+    assert {"Imported", "Imported/Switches", "Site A", "New/Deep"} <= reloaded.all_folders()
