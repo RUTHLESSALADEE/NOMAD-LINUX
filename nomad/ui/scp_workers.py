@@ -138,7 +138,7 @@ class TransferWorker(QThread):
         with self.wake:
             self.paused = paused
             if paused and self.runner is not None and self.current is not None:
-                self.runner.cancel_current = True
+                self.runner.cancel()
             if not paused:
                 for transfer in self.transfers:
                     if transfer.state == PAUSED:
@@ -157,7 +157,7 @@ class TransferWorker(QThread):
         with self.wake:
             if transfer is self.current and self.runner is not None:
                 self.cancel_requested.add(transfer.id)
-                self.runner.cancel_current = True
+                self.runner.cancel()  # Straight away, even mid-read or while the network is stalled
             elif transfer.state in (QUEUED, PAUSED):
                 transfer.state, transfer.message = CANCELLED, ""
                 self.changed.emit(transfer)
@@ -165,8 +165,8 @@ class TransferWorker(QThread):
     def stop(self):
         with self.wake:
             self.stopping = True
-            if self.runner is not None:
-                self.runner.cancel_current = True
+            if self.runner is not None and self.current is not None:
+                self.runner.cancel()
             if self.pending_conflict is not None:
                 self.pending_conflict.done.set()
             self.wake.notify_all()
@@ -182,6 +182,10 @@ class TransferWorker(QThread):
                             transfer.state = RUNNING
                             self.current = transfer
                             return transfer
+                    if self.runner is not None:
+                        # The queue has run out: an answer "for the rest of the queue" doesn't carry on to the next
+                        # files queued, which may be something else entirely
+                        self.runner.conflict = self.conflict_policy
                 self.wake.wait()
         return None
 
@@ -192,14 +196,12 @@ class TransferWorker(QThread):
             if transfer is None:
                 break
             try:
-                if fs is None:
-                    fs = self.connection.open_fs()
-                    self.runner = TransferRunner(fs, self.conflict_policy, self.ask, self.report,
-                                                 self.preserve_times)
+                fs = self.usable_fs(fs)
                 if transfer.is_dir:
                     self.expand(fs, transfer)
                 else:
                     self.runner.run(transfer)
+                    fs = self.usable_fs(fs)  # Cancel and Pause abort the channel; tidying up needs a new one
                     self.after_run(fs, transfer)
             except (ConnectionFailed, RemoteError, OSError) as error:
                 transfer.state, transfer.message = FAILED, str(error)
@@ -214,6 +216,18 @@ class TransferWorker(QThread):
                 break
         if fs is not None:
             fs.close()
+
+    def usable_fs(self, fs):
+        """The transfer file system, opening a new one (and runner) if there's none yet or the last was aborted."""
+        if fs is not None and not fs.aborted:
+            return fs
+        if fs is not None:
+            fs.close()
+        fs = self.connection.open_fs()
+        with self.wake:
+            conflict = self.runner.conflict if self.runner is not None else self.conflict_policy
+            self.runner = TransferRunner(fs, conflict, self.ask, self.report, self.preserve_times)
+        return fs
 
     def fail_rest(self, message):
         with self.wake:
@@ -270,8 +284,13 @@ class TransferWorker(QThread):
                 part = transfer.local + PART_SUFFIX
                 if os.path.exists(part):
                     os.remove(part)
-            elif fs.can_resume and fs.stat(transfer.remote + PART_SUFFIX) is not None:
-                fs.remove(transfer.remote + PART_SUFFIX)
+            elif fs.can_resume:
+                if fs.stat(transfer.remote + PART_SUFFIX) is not None:
+                    fs.remove(transfer.remote + PART_SUFFIX)
+            elif transfer.done and fs.stat(transfer.remote) is not None:
+                # SCP writes straight into the file, so once data went out it's a partial copy (before that, the
+                # file there is untouched and stays)
+                fs.remove(transfer.remote)
         except (OSError, RemoteError) as error:
             log.info("Couldn't remove the partial file of %s: %s", transfer.name, error)
 

@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 
 from PyQt5.QtCore import QObject, QTimer, Qt, pyqtSignal
@@ -340,6 +341,26 @@ def edit_folder():
 
 def remove_edit_copy(path):
     shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+
+
+def clean_old_edits(max_age=2 * 86400, now=None):
+    """Delete downloaded copies left behind (NOMAD closed without tidying up, such as a crash) once nothing in
+    them has changed for max_age seconds; newer ones may still be open in an editor. Returns how many went."""
+    now = time.time() if now is None else now
+    removed = 0
+    try:
+        folders = [entry.path for entry in os.scandir(EDIT_FOLDER) if entry.is_dir()]
+    except OSError:
+        return 0
+    for folder in folders:
+        try:
+            newest = max([os.path.getmtime(folder)] + [entry.stat().st_mtime for entry in os.scandir(folder)])
+        except OSError:
+            continue
+        if now - newest > max_age:
+            shutil.rmtree(folder, ignore_errors=True)
+            removed += 1
+    return removed
 
 
 def open_in_program(path, program=""):

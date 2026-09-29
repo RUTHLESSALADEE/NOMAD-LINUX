@@ -5,13 +5,14 @@ key exchange and "ssh-rsa" host keys. They're offered last, so any device that s
 it: the client's preference order decides, and the key exchange hash covers both sides' lists, so an attacker
 can't strip the modern ones out.
 """
+import threading
 import time
 from hashlib import sha1
 
 import paramiko
 from cryptography.hazmat.primitives import hashes
 from paramiko.auth_handler import AuthOnlyHandler
-from paramiko.common import cMSG_SERVICE_REQUEST
+from paramiko.common import cMSG_SERVICE_REQUEST, cMSG_USERAUTH_REQUEST
 from paramiko.kex_gex import KexGexSHA256
 from paramiko.kex_group14 import KexGroup14SHA256
 from paramiko.message import Message
@@ -50,10 +51,23 @@ LEGACY_NAMES = {kex.name for kex in LEGACY_KEX} | {"ssh-rsa"}
 
 
 class _AuthHandler(AuthOnlyHandler):
-    def auth_none(self, username):
-        # paramiko 5's AuthOnlyHandler.auth_none passes no finish_message and then calls it; a "none" request has no
-        # extra fields, so finish it with nothing
-        return self.send_auth_request(username, "none", finish_message=lambda message: None)
+    def send_auth_request(self, username, method, finish_message=None):
+        """paramiko's version, except the event that hears the answer exists before the request goes out. paramiko
+        sends first, so a server that answers quickly signals the old event, and a right password then waits out the
+        30 s auth timeout and counts as wrong."""
+        self.auth_method = method
+        self.username = username
+        message = Message()
+        message.add_byte(cMSG_USERAUTH_REQUEST)
+        message.add_string(username)
+        message.add_string("ssh-connection")
+        message.add_string(method)
+        if finish_message is not None:  # paramiko 5's auth_none passes none (a "none" request has no more fields)
+            finish_message(message)
+        self.auth_event = threading.Event()
+        with self.transport.lock:
+            self.transport._send_message(message)
+        return self.wait_for_response(self.auth_event)
 
 
 class CompatibleTransport(ServiceRequestingTransport):

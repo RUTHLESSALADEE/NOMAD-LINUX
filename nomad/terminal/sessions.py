@@ -18,6 +18,7 @@ SSH, TELNET, SERIAL, RAW = "SSH", "Telnet", "Serial", "Raw TCP"
 PROTOCOLS = [SSH, TELNET, SERIAL, RAW]
 DEFAULT_PORTS = {SSH: 22, TELNET: 23, RAW: 23}
 AUTH_PASSWORD, AUTH_KEY, AUTH_AGENT = "password", "key", "agent"
+FILE_PROTOCOLS = ["Auto", "SFTP", "SCP"]
 PARITIES = ["None", "Even", "Odd", "Mark", "Space"]
 FLOW_CONTROLS = ["None", "XON/XOFF", "RTS/CTS", "DSR/DTR"]
 BAUD_RATES = [1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
@@ -42,6 +43,7 @@ class Session:
     key_file: str = ""
     saved_passphrase: str = ""  # For an encrypted key file, also encrypted
     keepalive: int = 30  # Seconds; 0 turns it off
+    file_protocol: str = "Auto"  # The SCP page: "Auto" (SFTP if the server has it, else SCP), "SFTP" or "SCP"
     # Serial
     serial_port: str = "COM1"
     baud_rate: int = 9600

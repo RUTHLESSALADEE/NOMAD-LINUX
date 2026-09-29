@@ -3,6 +3,7 @@
 The panes only show files and say what the user asked for (open, drop, a key command); the SCP view does the work.
 Files dragged from one pane to the other, or from Windows Explorer, arrive through `dropped`.
 """
+import ctypes
 import json
 import os
 import string
@@ -11,10 +12,10 @@ import time
 from PyQt5.QtCore import QEvent, QMimeData, QUrl, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QDrag, QFont
 from PyQt5.QtWidgets import QAbstractItemView, QFileIconProvider, QHBoxLayout, QHeaderView, QLabel, QLineEdit, \
-    QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
+    QPushButton, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
 
 from ..terminal.files import Entry, parent as remote_parent
-from .common import format_size
+from .common import format_size, run_in_background
 from .theme import COLORS
 
 MIME_TYPE = "application/x-nomad-files"
@@ -206,6 +207,7 @@ class FileList(QTreeWidget):
 class FilePane(QWidget):
     """A path bar, the list, and a status line. Subclasses list folders."""
     navigated = pyqtSignal(str)  # The folder now shown
+    copy_text, copy_tip = "", ""  # The button that copies the selection to the other side
     command_requested = pyqtSignal(str)  # copy, rename, edit, mkdir, delete, properties: for the view
     title = ""
 
@@ -243,8 +245,16 @@ class FilePane(QWidget):
         layout.addWidget(self.list, 1)
         self.status = QLabel()
         self.status.setStyleSheet(f"color: {COLORS['muted']};")
-        layout.addWidget(self.status)
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.status, 1)
+        self.copy_button = QPushButton(self.copy_text)
+        self.copy_button.setToolTip(self.copy_tip)
+        self.copy_button.setEnabled(False)
+        self.copy_button.clicked.connect(lambda: self.command_requested.emit("copy"))
+        status_row.addWidget(self.copy_button)
+        layout.addLayout(status_row)
         self.icons = QFileIconProvider()
+        self.request = 0  # Numbers each listing, so a slow one that finishes late doesn't replace a newer one
 
         self.path_input.returnPressed.connect(lambda: self.go(self.normalize(self.path_input.text())))
         self.up_button.clicked.connect(self.go_up)
@@ -287,8 +297,12 @@ class FilePane(QWidget):
     def go(self, path, remember=True, select=None):
         if path is None:
             return
+        self.request += 1
+        request = self.request
 
         def done(listed, result):
+            if request != self.request:
+                return  # The user went somewhere else while this was listing
             if isinstance(result, str):
                 self.status.setText(result)
                 self.status.setStyleSheet(f"color: {COLORS['error']};")
@@ -401,14 +415,31 @@ class FilePane(QWidget):
             size = sum(entry.size for entry in selected if not entry.is_dir)
             text += f"  ·  {len(selected)} selected ({format_size(size)})"
         self.status.setText(text)
+        self.copy_button.setEnabled(bool(selected) and self.list.isEnabled())
 
     def selected_entries(self):
         return self.list.selected_entries()
 
 
+def read_folder(path):
+    """Entries for a local folder (raises OSError if it can't be read)."""
+    entries = []
+    with os.scandir(path) as items:
+        for item in items:
+            try:
+                info = item.stat()
+                is_dir = item.is_dir()
+            except OSError:
+                continue
+            entries.append(Entry(item.name, item.path, is_dir=is_dir, size=0 if is_dir else info.st_size,
+                                 mtime=info.st_mtime))
+    return entries
+
+
 class LocalPane(FilePane):
     """This computer. "" is the list of drives."""
     title = "Local"
+    copy_text, copy_tip = "Upload ▶", "Upload the selected files and folders to the remote folder (F5)"
 
     def __init__(self, view_id, parent=None):
         super().__init__("local", view_id, parent)
@@ -440,24 +471,15 @@ class LocalPane(FilePane):
 
     def list_folder(self, path, done):
         if path == "":
-            drives = [f"{letter}:\\" for letter in string.ascii_uppercase if os.path.exists(f"{letter}:\\")]
+            # Windows' list of drive letters: asking each drive if it exists can hang on a disconnected network drive
+            mask = ctypes.windll.kernel32.GetLogicalDrives()
+            drives = [f"{letter}:\\" for index, letter in enumerate(string.ascii_uppercase) if mask >> index & 1]
             done("", [Entry(drive[:2], drive, is_dir=True) for drive in drives])
             return
-        try:
-            entries = []
-            with os.scandir(path) as items:
-                for item in items:
-                    try:
-                        info = item.stat()
-                        is_dir = item.is_dir()
-                    except OSError:
-                        continue
-                    entries.append(Entry(item.name, item.path, is_dir=is_dir, size=0 if is_dir else info.st_size,
-                                         mtime=info.st_mtime))
-        except OSError as error:
-            done(path, f"Can't open {path}: {error.strerror or error}")
-            return
-        done(path, entries)
+        self.status.setText("Listing...")
+        # Off the UI thread: a slow network share or a drive that's gone mustn't freeze the window
+        run_in_background(lambda: read_folder(path), lambda entries: done(path, entries),
+                          lambda error: done(path, f"Can't open {path}: {getattr(error, 'strerror', None) or error}"))
 
     def icon_for(self, entry):
         if not self.path:
@@ -474,6 +496,7 @@ class LocalPane(FilePane):
 class RemotePane(FilePane):
     """The server, listed through the view's browsing worker."""
     title = "Remote"
+    copy_text, copy_tip = "◀ Download", "Download the selected files and folders to the local folder (F5)"
 
     def __init__(self, view_id, parent=None):
         super().__init__("remote", view_id, parent)
@@ -522,3 +545,4 @@ class RemotePane(FilePane):
             widget.setEnabled(connected)
         if not connected:
             self.status.setText("Not connected.")
+            self.copy_button.setEnabled(False)

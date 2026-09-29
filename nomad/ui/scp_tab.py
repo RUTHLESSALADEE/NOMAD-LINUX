@@ -3,6 +3,8 @@ Each tab is its own SSH connection; tabs can be popped out into windows."""
 from PyQt5.QtWidgets import QMessageBox
 
 from ..terminal.sessions import SSH
+from .common import run_in_background
+from .remote_editor import clean_old_edits
 from .scp_view import FileSessionView
 from .session_page import SessionPage
 
@@ -17,6 +19,10 @@ class ScpTab(SessionPage):
                         "them (or from Windows Explorer), or select them and press F5. F4 edits a remote file, F2 "
                         "renames, F7 makes a folder and F8 deletes.\n\nSFTP is used where the server offers it "
                         "(interrupted transfers resume); otherwise NOMAD falls back to SCP.")
+
+    def __init__(self, window, store):
+        super().__init__(window, store)
+        run_in_background(clean_old_edits)  # Copies left by "Edit With" when NOMAD didn't close normally
 
     def make_view(self, session):
         return FileSessionView(session, self.store, self)

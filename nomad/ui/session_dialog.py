@@ -153,6 +153,14 @@ class SessionDialog(QDialog):
         self.keepalive_input.setSpecialValueText("Off")
         self.keepalive_input.setValue(int(self.session.keepalive))
         self.keepalive_input.setToolTip("Send a keepalive this often, so firewalls don't drop an idle session.")
+        self.file_protocol_combo = QComboBox()
+        for value, label in (("Auto", "Auto (SFTP if the server has it, otherwise SCP)"), ("SFTP", "SFTP only"),
+                             ("SCP", "SCP (browse with ls)")):
+            self.file_protocol_combo.addItem(label, value)
+        self.file_protocol_combo.setCurrentIndex(max(0, self.file_protocol_combo.findData(
+            self.session.file_protocol)))
+        self.file_protocol_combo.setToolTip("How the SCP page moves files. Choose SCP for servers whose SFTP is "
+                                            "broken rather than missing (SCP transfers can't resume).")
         ssh_form.addRow("User name:", self.username_input)
         ssh_form.addRow("Log in with:", self.auth_combo)
         self.password_label = QLabel("Password:")
@@ -162,6 +170,7 @@ class SessionDialog(QDialog):
         self.passphrase_label = QLabel("Passphrase:")
         ssh_form.addRow(self.passphrase_label, passphrase_row)
         ssh_form.addRow("Keepalive:", self.keepalive_input)
+        ssh_form.addRow("File transfer:", self.file_protocol_combo)
         self.password_widgets = [self.password_label, self.password_input, self.save_password_check]
         self.key_widgets = [self.key_label, self.key_input, key_browse, self.passphrase_label, self.passphrase_input,
                             self.save_passphrase_check]
@@ -321,6 +330,7 @@ class SessionDialog(QDialog):
             session.auth = self.auth_combo.currentData()
             session.key_file = self.key_input.text().strip()
             session.keepalive = self.keepalive_input.value()
+            session.file_protocol = self.file_protocol_combo.currentData()
             try:
                 session.saved_password = self.secret_to_store(self.password_input, self.save_password_check,
                                                               self.session.saved_password)
