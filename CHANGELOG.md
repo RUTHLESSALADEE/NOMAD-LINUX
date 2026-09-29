@@ -6,6 +6,17 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-09-29
+
+### Added
+
+- Work as root on the SCP page: right-click the tab (or the remote side) > Work as Root (sudo), or tick "Work as root (sudo) on the SCP page" in a session's settings. The tab reconnects with SFTP run through sudo (as WinSCP does), so browsing, copying, editing and Synchronize all happen as root, and the remote side's title turns amber: "Remote (as root)". NOMAD tries your login password for sudo and asks only if that doesn't work (servers where sudo needs no password just work); the password is kept in memory for that connection only. It says clearly when the user isn't allowed to use sudo, when sudo needs a terminal (requiretty), or when the server's sftp-server can't be found. Needs SFTP (the session's File transfer set to Auto or SFTP).
+- Changing owners on the SCP page: Properties has User and Group fields, listing the server's users and groups (numbers work too), and can apply them to everything inside a folder. Links are left alone. A "Permission denied" message suggests Work as Root.
+
+### Fixed
+
+- Selecting text in a terminal while the device was printing could fail with "cannot unpack non-iterable NoneType object" when the mouse button was let go. The selection now stays on the text it covers as new output scrolls it up (as in PuTTY), and is copied when you let go. Once the scrollback was full, it could also copy a different line from the one selected; that's fixed too. While scrolled back, the view keeps showing the same text when the scrollback is full.
+
 ## [1.6.2] - 2026-09-29
 
 ### Added

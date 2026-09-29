@@ -6,6 +6,7 @@ Everything blocks: run it off the UI thread.
 """
 import errno
 import hashlib
+import io
 import logging
 import os
 import posixpath
@@ -17,7 +18,7 @@ from dataclasses import dataclass, field
 
 import paramiko
 
-from .transports import ConnectionFailed, SshTransport
+from .transports import Cancelled, ConnectionFailed, SshTransport
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +30,14 @@ HASHES = {"SHA-256": ("sha256", "sha256sum", "shasum -a 256"), "MD5": ("md5", "m
           "SHA-1": ("sha1", "sha1sum", "shasum -a 1")}
 EXEC_TIMEOUT = 30
 BROWSE_TIMEOUT = 30  # Seconds a browsing request (listing, rename...) may wait for the server before giving up
+# Finds the server's sftp-server program, for running it through sudo: where sshd_config says, else the usual places
+SFTP_SERVER_SEARCH = (
+    "p=$(awk 'tolower($1)==\"subsystem\" && $2==\"sftp\" {print $3; exit}' /etc/ssh/sshd_config 2>/dev/null); "
+    "[ -x \"$p\" ] && { echo \"$p\"; exit 0; }; "
+    "for p in /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server /usr/lib/ssh/sftp-server "
+    "/usr/libexec/sftp-server /usr/lib/sftp-server /usr/local/libexec/sftp-server; do "
+    "[ -x \"$p\" ] && { echo \"$p\"; exit 0; }; done; exit 1")
+SUDO_TRIES = 3
 TIME_TOLERANCE = 2  # Seconds: FAT and some servers keep modification times to 2 s
 
 
@@ -52,6 +61,8 @@ class Entry:
     group: str = ""
     is_link: bool = False
     link_target: str = ""
+    uid: int = None  # Numeric owner and group, when the server says (SFTP does)
+    gid: int = None
 
     @property
     def permissions(self):
@@ -249,6 +260,7 @@ class RemoteFS:
     kind = ""
     can_resume = False
     aborted = False  # abort() was called: this one can't be used again
+    as_root = False  # Running through sudo
 
     def abort(self):
         """Stop whatever is running right now, from any thread, without waiting for the server (Cancel and Pause,
@@ -282,8 +294,27 @@ class RemoteFS:
     def chmod(self, path, mode):
         raise NotImplementedError
 
+    def chown(self, path, owner=None, group=None):
+        """Change a file's owner and/or group (names or numbers; None leaves one as it is)."""
+        raise NotImplementedError
+
     def set_mtime(self, path, mtime):
         raise NotImplementedError
+
+    def read_bytes(self, path):
+        buffer = io.BytesIO()
+        self.download(path, buffer)
+        return buffer.getvalue()
+
+    def accounts(self):
+        """({user name: uid}, {group name: gid}) from the server's /etc/passwd and /etc/group ({} if unreadable)."""
+        found = []
+        for path in ("/etc/passwd", "/etc/group"):
+            try:
+                found.append(parse_ids(self.read_bytes(path).decode("utf-8", "replace")))
+            except (RemoteError, OSError):
+                found.append({})
+        return found[0], found[1]
 
     def download(self, remote, local_file, offset=0, progress=None, cancelled=lambda: False):
         """Copy a remote file into an open local file, starting at offset. Returns the remote mtime (or 0)."""
@@ -388,7 +419,7 @@ class SftpFS(RemoteFS):
                       mtime=float(attributes.st_mtime or 0), mode=stat.S_IMODE(mode), owner=owner or
                       str(attributes.st_uid if attributes.st_uid is not None else ""),
                       group=group or str(attributes.st_gid if attributes.st_gid is not None else ""),
-                      is_link=stat.S_ISLNK(mode))
+                      is_link=stat.S_ISLNK(mode), uid=attributes.st_uid, gid=attributes.st_gid)
         return entry
 
     def home(self):
@@ -469,6 +500,20 @@ class SftpFS(RemoteFS):
 
     def chmod(self, path, mode):
         self._do(self.client.chmod, path, path, mode)
+
+    def chown(self, path, owner=None, group=None):
+        # SFTP only takes numbers, and both at once
+        users, groups = self.accounts() if not all(str(value).isdigit() for value in (owner, group)
+                                                   if value is not None) else ({}, {})
+        current = None
+        if owner is None or group is None:
+            try:
+                current = self.client.stat(path)
+            except (OSError, paramiko.SSHException) as error:
+                raise _sftp_error(error, path) from None
+        uid = current.st_uid if owner is None else resolve_id(owner, users, "user")
+        gid = current.st_gid if group is None else resolve_id(group, groups, "group")
+        self._do(self.client.chown, path, path, uid, gid)
 
     def set_mtime(self, path, mtime):
         try:
@@ -615,6 +660,13 @@ class ShellFS(RemoteFS):
     def chmod(self, path, mode):
         self.run(f"chmod {mode & 0o7777:o} {quote(path)}", path)
 
+    def chown(self, path, owner=None, group=None):
+        if owner is not None:
+            self.run(f"chown {quote(str(owner) + (':' + str(group) if group is not None else ''))} {quote(path)}",
+                     path)
+        elif group is not None:
+            self.run(f"chgrp {quote(str(group))} {quote(path)}", path)
+
     def set_mtime(self, path, mtime):
         stamp = time.strftime("%Y%m%d%H%M.%S", time.localtime(mtime))
         self.connection.run(f"touch -t {stamp} {quote(path)}")
@@ -657,6 +709,38 @@ def make_remote_folders(fs, folder):
         fs.mkdir(path)
 
 
+def parse_ids(text):
+    """{name: id} from /etc/passwd or /etc/group text."""
+    found = {}
+    for line in text.splitlines():
+        parts = line.split(":")
+        if len(parts) >= 3 and parts[0] and not parts[0].startswith("#") and parts[2].isdigit():
+            found[parts[0]] = int(parts[2])
+    return found
+
+
+def resolve_id(value, names, kind):
+    """A uid or gid from a name or number."""
+    text = str(value).strip()
+    if text.isdigit():
+        return int(text)
+    if text in names:
+        return names[text]
+    raise RemoteError(f"There's no {kind} called {text} on the server (or its /etc/{'passwd' if kind == 'user' else 'group'} "
+                      "couldn't be read; the number works too).")
+
+
+def chown_tree(fs, entry, owner=None, group=None, recursive=False, cancelled=lambda: False):
+    """Change the owner and/or group of a file or folder, and optionally everything inside. Links are left alone
+    (changing one over SFTP would change what it leads to)."""
+    if not entry.is_link:
+        fs.chown(entry.path, owner, group)
+    if recursive and entry.is_dir and not entry.is_link:
+        for _, child in fs.walk_files(entry.path, cancelled):
+            if not child.is_link:
+                fs.chown(child.path, owner, group)
+
+
 def remove_tree(fs, entry, cancelled=lambda: False):
     """Delete a remote file, link or folder (with everything in it). Links are removed, not followed."""
     if not entry.is_dir or entry.is_link:
@@ -688,13 +772,17 @@ def chmod_tree(fs, entry, mode, recursive=False, cancelled=lambda: False):
 class FileConnection:
     """One SSH login, with any number of file system channels on it (one to browse, one for the transfer queue)."""
 
-    def __init__(self, session, prompter=None, vault=None, known_hosts=None, mode=None):
+    def __init__(self, session, prompter=None, vault=None, known_hosts=None, mode=None, sudo=None):
         self.session = session
         self.ssh = SshTransport(session, prompter, known_hosts=known_hosts)
         if vault is not None:
             self.ssh.vault = vault
         # SFTP, SCP, or None to use SFTP when the server has it; the session's File transfer setting by default
         self.mode = mode or {"SFTP": SFTP, "SCP": SCP}.get(getattr(session, "file_protocol", "Auto"))
+        self.sudo = getattr(session, "scp_sudo", False) if sudo is None else sudo  # Work as root
+        self.sudo_ready = False  # sudo has been checked (and its password found, if it needs one)
+        self.sudo_password = None  # In memory only; None when sudo doesn't ask for one
+        self.sftp_server = None
         self.kind = None
         self.description = ""
         self.notice = ""
@@ -708,16 +796,23 @@ class FileConnection:
         system, for browsing."""
         username = self.ssh.login()
         self.notice = self.ssh.notice
-        fs = self.open_fs()
+        try:
+            fs = self.open_fs()
+        except ConnectionFailed:
+            self.close()
+            raise
         if isinstance(fs, SftpFS):
             fs.set_timeout(BROWSE_TIMEOUT)  # A quiet network mustn't leave the pane waiting for ever
-        self.description = f"{fs.kind} to {username}@{self.session.host.strip()}"
+        self.description = f"{fs.kind}{' as root (sudo)' if self.sudo else ''} to {username}@" \
+                           f"{self.session.host.strip()}"
         if fs.kind == SCP and self.mode != SCP:
             self.notice = ("This server doesn't offer SFTP, so NOMAD is using SCP: browsing uses ls, and interrupted "
                            "transfers start again rather than resuming.")
         return fs
 
     def open_fs(self):
+        if self.sudo:
+            return self.open_sudo_fs()
         if self.mode != SCP and self.kind != SCP:
             try:
                 client = paramiko.SFTPClient.from_transport(self.transport)
@@ -730,6 +825,80 @@ class FileConnection:
         self.kind = SCP
         return ShellFS(self)
 
+    # ----------------------------------------------------------------- Sudo
+
+    def open_sudo_fs(self):
+        """SFTP as root: the server's sftp-server run through sudo, on an exec channel (as WinSCP does)."""
+        if self.mode == SCP:
+            raise ConnectionFailed("Sudo on the SCP page needs SFTP. Set the session's File transfer to Auto or SFTP.")
+        if not self.sudo_ready:
+            self.prepare_sudo()
+        server = quote(self.sftp_server)
+        if self.sudo_password is None:
+            channel = self.exec_channel(f"sudo -n {server}")
+        else:
+            channel = self.exec_channel(f"sudo -S -p '' {server}")
+            channel.sendall((self.sudo_password + "\n").encode())  # sudo reads one line; the rest is SFTP
+        try:
+            client = paramiko.SFTPClient(channel)
+        except (paramiko.SSHException, EOFError, OSError) as error:
+            detail = ""
+            if channel.recv_stderr_ready():
+                detail = channel.recv_stderr(4096).decode("utf-8", "replace").strip()
+            channel.close()
+            raise ConnectionFailed(f"sudo wouldn't start SFTP as root: {detail or error}") from None
+        self.kind = SFTP
+        fs = SftpFS(self, client)
+        fs.as_root = True
+        return fs
+
+    def prepare_sudo(self):
+        """Check sudo can be used, find sftp-server, and find the sudo password if it needs one (the login password
+        first, then asking)."""
+        host = self.session.host.strip()
+        status, _, err = self.run("sudo -n true")
+        if status == 127:
+            raise ConnectionFailed(f"sudo isn't installed on {host}.")
+        self.check_sudo_refusal(err)
+        if status == 0:
+            self.sudo_password = None  # Allowed without a password
+        else:
+            # The login password first (usually the sudo one too), then ask
+            passwords = ([self.ssh.password] if self.ssh.password else []) + [None] * SUDO_TRIES
+            prompt = f"Password for sudo on {host}:"
+            for password in passwords:
+                if password is None:
+                    answer = self.ssh.prompter.secret("Sudo Password", prompt, False)
+                    if answer is None:
+                        raise Cancelled()
+                    password = answer[0]
+                status, _, err = self.run("sudo -S -p '' -v", stdin=(password + "\n").encode())
+                self.check_sudo_refusal(err)
+                if status == 0:
+                    self.sudo_password = password
+                    break
+                prompt = "sudo didn't accept that password. Try again:" if password is not self.ssh.password else \
+                    f"sudo didn't accept your login password. Password for sudo on {host}:"
+            else:
+                raise ConnectionFailed("sudo didn't accept the password.")
+        status, out, _ = self.run(SFTP_SERVER_SEARCH)
+        if status != 0 or not out.strip():
+            raise ConnectionFailed(f"Couldn't find the sftp-server program on {host}, which sudo needs (usually "
+                                   "/usr/lib/openssh/sftp-server or /usr/libexec/openssh/sftp-server).")
+        self.sftp_server = out.decode("utf-8", "replace").strip().splitlines()[0]
+        self.sudo_ready = True
+
+    def check_sudo_refusal(self, err):
+        """Raise with a clear message if sudo said no for a reason a password won't fix."""
+        text = err.decode("utf-8", "replace")
+        lower = text.lower()
+        user = self.ssh.session.username or "This user"
+        if "not in the sudoers" in lower or "may not run sudo" in lower or "not allowed to" in lower:
+            raise ConnectionFailed(f"{user} isn't allowed to use sudo on {self.session.host.strip()}.")
+        if "must have a tty" in lower or "no tty present" in lower:
+            raise ConnectionFailed("sudo on this server needs a terminal (requiretty in sudoers), so it can't be used "
+                                   "for file transfer. Ask for requiretty to be turned off for your user.")
+
     def exec_channel(self, command):
         try:
             channel = self.transport.open_session()
@@ -738,9 +907,16 @@ class FileConnection:
         except (paramiko.SSHException, EOFError, OSError) as error:
             raise RemoteError(f"The server wouldn't run a command: {error}") from None
 
-    def run(self, command, timeout=EXEC_TIMEOUT):
-        """Run a command. Returns (exit status, stdout bytes, stderr bytes)."""
+    def run(self, command, timeout=EXEC_TIMEOUT, stdin=None):
+        """Run a command, with stdin bytes if given. Returns (exit status, stdout bytes, stderr bytes)."""
         channel = self.exec_channel(command)
+        if stdin is not None:
+            try:
+                channel.sendall(stdin)
+                channel.shutdown_write()
+            except (OSError, paramiko.SSHException, EOFError) as error:
+                channel.close()
+                raise RemoteError(f"The command failed: {error}") from None
         out, err = bytearray(), bytearray()
         deadline = time.monotonic() + timeout
         try:

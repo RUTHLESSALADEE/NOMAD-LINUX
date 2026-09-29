@@ -161,6 +161,10 @@ class SessionDialog(QDialog):
             self.session.file_protocol)))
         self.file_protocol_combo.setToolTip("How the SCP page moves files. Choose SCP for servers whose SFTP is "
                                             "broken rather than missing (SCP transfers can't resume).")
+        self.scp_sudo_check = QCheckBox("Work as root (sudo) on the SCP page")
+        self.scp_sudo_check.setChecked(bool(self.session.scp_sudo))
+        self.scp_sudo_check.setToolTip("Browse, copy and edit as root, by running SFTP through sudo. NOMAD tries "
+                                       "your login password for sudo and asks if that doesn't work.")
         ssh_form.addRow("User name:", self.username_input)
         ssh_form.addRow("Log in with:", self.auth_combo)
         self.password_label = QLabel("Password:")
@@ -171,6 +175,7 @@ class SessionDialog(QDialog):
         ssh_form.addRow(self.passphrase_label, passphrase_row)
         ssh_form.addRow("Keepalive:", self.keepalive_input)
         ssh_form.addRow("File transfer:", self.file_protocol_combo)
+        ssh_form.addRow("", self.scp_sudo_check)
         self.password_widgets = [self.password_label, self.password_input, self.save_password_check]
         self.key_widgets = [self.key_label, self.key_input, key_browse, self.passphrase_label, self.passphrase_input,
                             self.save_passphrase_check]
@@ -331,6 +336,7 @@ class SessionDialog(QDialog):
             session.key_file = self.key_input.text().strip()
             session.keepalive = self.keepalive_input.value()
             session.file_protocol = self.file_protocol_combo.currentData()
+            session.scp_sudo = self.scp_sudo_check.isChecked()
             try:
                 session.saved_password = self.secret_to_store(self.password_input, self.save_password_check,
                                                               self.session.saved_password)

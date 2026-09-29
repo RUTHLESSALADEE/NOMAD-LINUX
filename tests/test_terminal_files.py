@@ -12,11 +12,11 @@ import pytest
 from nomad.terminal.files import BOTH_WAYS, CANCELLED, DIFFERENT, DONE, DOWNLOAD, FAILED, LOCAL_NEWER, LOCAL_ONLY, \
     NEWER, OVERWRITE, PART_SUFFIX, REMOTE_NEWER, REMOTE_ONLY, RENAME, SAME, SCP, SFTP, SKIP, SKIPPED, TO_LOCAL, \
     TO_REMOTE, UPLOAD, Entry, FileConnection, RemoteError, RemoteFS, ShellFS, Transfer, TransferRunner, chmod_tree, compare, \
-    expand, folder_mode, local_files, parse_ls, parse_permissions, permission_text, remote_files, remove_tree, \
+    SFTP_SERVER_SEARCH, chown_tree, expand, folder_mode, local_files, parse_ids, parse_ls, parse_permissions, permission_text, remote_files, remove_tree, \
     scp_receive, scp_send
 from nomad.terminal.hostkeys import KnownHosts
 from nomad.terminal.sessions import SSH, Session
-from nomad.terminal.transports import Prompter
+from nomad.terminal.transports import Cancelled, ConnectionFailed, Prompter
 
 
 @pytest.fixture(scope="module")
@@ -125,6 +125,8 @@ class FolderSFTP(paramiko.SFTPServerInterface):
         real = self.real(path)
         if attr.st_mode is not None:
             FileServer.modes[self.canonicalize(path)] = attr.st_mode
+        if attr.st_uid is not None:
+            FileServer.owners[self.canonicalize(path)] = (attr.st_uid, attr.st_gid)
         if attr.st_mtime is not None:
             os.utime(real, (attr.st_atime or attr.st_mtime, attr.st_mtime))
         return paramiko.SFTP_OK
@@ -132,9 +134,12 @@ class FolderSFTP(paramiko.SFTPServerInterface):
 
 class FileServer(paramiko.ServerInterface):
     modes = {}  # chmod calls seen (Windows can't store Unix modes)
+    owners = {}  # chown calls seen: path: (uid, gid)
 
-    def __init__(self, root, sftp=True, exec_commands=True):
+    def __init__(self, root, sftp=True, exec_commands=True, sudo="secret", sudoers=True):
         self.root, self.sftp, self.exec_commands = root, sftp, exec_commands
+        self.sudo = sudo  # sudo's password for admin, or None if sudo doesn't ask (NOPASSWD)
+        self.sudoers = sudoers  # admin may use sudo at all
         self.commands = []
 
     def get_allowed_auths(self, username):
@@ -156,10 +161,58 @@ class FileServer(paramiko.ServerInterface):
             return False
         command = command.decode()
         self.commands.append(command)
-        threading.Thread(target=self.execute, args=(channel, command), daemon=True).start()
+        # A moment later, as a real server does: answering and closing before this returns (and paramiko confirms
+        # the request) would look to the client like a channel that closed at once
+        timer = threading.Timer(0.05, self.execute, args=(channel, command))
+        timer.daemon = True
+        timer.start()
+        return True
+
+    @staticmethod
+    def read_line(channel):
+        line = b""
+        while not line.endswith(b"\n"):
+            byte = channel.recv(1)
+            if not byte:
+                break
+            line += byte
+        return line.rstrip(b"\n").decode()
+
+    def fake_sudo(self, channel, command):
+        """Like sudo: -n (no password), -S (password on stdin), -v (just check it), and running sftp-server.
+        Returns True if it handled the command."""
+        refused = b"Sorry, user admin may not run sudo on test.\n"
+        if command == SFTP_SERVER_SEARCH:
+            channel.sendall(b"/usr/lib/openssh/sftp-server\n")
+            channel.send_exit_status(0)
+        elif command == "sudo -n true":
+            if not self.sudoers:
+                channel.sendall_stderr(refused)
+            elif self.sudo is not None:
+                channel.sendall_stderr(b"sudo: a password is required\n")
+            channel.send_exit_status(0 if self.sudoers and self.sudo is None else 1)
+        elif command.startswith("sudo -S -p '' -v"):
+            ok = self.read_line(channel) == self.sudo
+            if not ok:
+                channel.sendall_stderr(b"Sorry, try again.\nsudo: 1 incorrect password attempt\n")
+            channel.send_exit_status(0 if ok else 1)
+        elif command.endswith("/usr/lib/openssh/sftp-server") and command.startswith("sudo "):
+            if command.startswith("sudo -S") and self.read_line(channel) != self.sudo:
+                channel.sendall_stderr(b"sudo: 1 incorrect password attempt\n")
+                channel.send_exit_status(1)
+            else:
+                # sftp-server as root: serve SFTP on this exec channel, as the real one does
+                handler = paramiko.SFTPServer(channel, "sftp", self, FolderSFTP)
+                handler.start()
+                return True
+        else:
+            return False
+        channel.close()
         return True
 
     def execute(self, channel, command):
+        if self.fake_sudo(channel, command):
+            return
         words = shlex.split(command)
         path = os.path.join(self.root, words[-1].lstrip("/")) if words else ""
         if words[:1] == ["sha256sum"] and os.path.isfile(path):
@@ -181,8 +234,7 @@ def run_file_server(host_key, root, **options):
     server = FileServer(root, **options)
     FolderSFTP.root = root
 
-    def serve():
-        connection, _ = listener.accept()
+    def serve(connection):
         transport = paramiko.Transport(connection)
         transport.add_server_key(host_key)
         transport.set_subsystem_handler("sftp", paramiko.SFTPServer, FolderSFTP)
@@ -194,9 +246,17 @@ def run_file_server(host_key, root, **options):
             pass
         finally:
             transport.close()
-            listener.close()
 
-    threading.Thread(target=serve, daemon=True).start()
+    def accept():
+        """Every connection (reconnecting makes a new one), until the test ends."""
+        while True:
+            try:
+                connection, _ = listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=serve, args=(connection,), daemon=True).start()
+
+    threading.Thread(target=accept, daemon=True).start()
     return port, server
 
 
@@ -660,3 +720,87 @@ def test_old_edit_copies_are_cleaned(tmp_path, monkeypatch):
         os.utime(path, (week_ago, week_ago))
     assert remote_editor.clean_old_edits() == 1
     assert not old.exists() and recent.exists()
+
+
+# ----------------------------------------------------------------- Sudo and owners
+
+class SudoPrompter(PasswordPrompter):
+    """Logs in with "secret"; answers sudo's question with sudo_answers, in turn."""
+
+    def __init__(self, sudo_answers=()):
+        self.sudo_answers, self.asked = list(sudo_answers), []
+
+    def secret(self, title, prompt, can_save):
+        if title == "Sudo Password":
+            self.asked.append(prompt)
+            return (self.sudo_answers.pop(0), False) if self.sudo_answers else None
+        return "secret", False
+
+
+def sudo_connection(tmp_path, host_key, prompter, **server_options):
+    root = tmp_path / "server"
+    (root / "home" / "admin").mkdir(parents=True, exist_ok=True)
+    port, server = run_file_server(host_key, str(root), **server_options)
+    connection = FileConnection(Session("x", SSH, "127.0.0.1", port, username="admin"), prompter,
+                                known_hosts=KnownHosts(str(tmp_path / "known")), sudo=True)
+    return connection, server, root
+
+
+def test_sudo_with_the_login_password(tmp_path, host_key):
+    prompter = SudoPrompter()
+    connection, server, root = sudo_connection(tmp_path, host_key, prompter)
+    try:
+        fs = connection.connect()
+        assert fs.as_root and connection.description.startswith("SFTP as root (sudo) to admin@")
+        assert prompter.asked == []  # The login password worked for sudo
+        write(root / "etc" / "shadow", b"x")
+        assert [entry.name for entry in fs.listdir("/etc")] == ["shadow"]
+        transfers = connection.open_fs()  # The queue's channel: root too, without checking the password again
+        assert transfers.as_root and transfers.listdir("/etc")
+        assert sum(command.startswith("sudo -S -p '' -v") for command in server.commands) == 1
+        assert sum(command == "sudo -S -p '' /usr/lib/openssh/sftp-server" for command in server.commands) == 2
+    finally:
+        connection.close()
+
+
+def test_sudo_asks_when_the_login_password_is_not_it(tmp_path, host_key):
+    prompter = SudoPrompter(["wrong", "rootpw"])
+    connection, _, _ = sudo_connection(tmp_path, host_key, prompter, sudo="rootpw")
+    try:
+        assert connection.connect().as_root
+        assert "didn't accept your login password" in prompter.asked[0]
+        assert "Try again" in prompter.asked[1]
+    finally:
+        connection.close()
+
+
+def test_sudo_without_a_password_and_refusals(tmp_path, host_key):
+    connection, server, _ = sudo_connection(tmp_path / "a", host_key, SudoPrompter(), sudo=None)
+    try:
+        assert connection.connect().as_root
+        assert "sudo -n /usr/lib/openssh/sftp-server" in server.commands
+    finally:
+        connection.close()
+    connection, _, _ = sudo_connection(tmp_path / "b", host_key, SudoPrompter(), sudoers=False)
+    with pytest.raises(ConnectionFailed, match="isn't allowed to use sudo"):
+        connection.connect()
+    connection, _, _ = sudo_connection(tmp_path / "c", host_key, SudoPrompter(), sudo="other")
+    with pytest.raises(Cancelled):  # The login password didn't work and the user cancelled the question
+        connection.connect()
+
+
+def test_chown_by_name_and_number(remote):
+    _, fs, root, _ = remote
+    write(root / "etc" / "passwd", b"root:x:0:0:root:/root:/bin/bash\nwww-data:x:33:33::/var/www:/usr/sbin/nologin\n")
+    write(root / "etc" / "group", b"root:x:0:\nadm:x:4:syslog\nwww-data:x:33:\n")
+    assert parse_ids((root / "etc" / "group").read_text()) == {"root": 0, "adm": 4, "www-data": 33}
+    write(root / "site" / "index.html", b"x")
+    write(root / "site" / "css" / "a.css", b"y")
+    FileServer.owners.clear()
+    chown_tree(fs, fs.stat("/site"), "www-data", "adm", recursive=True)
+    assert FileServer.owners == {"/site": (33, 4), "/site/css": (33, 4), "/site/index.html": (33, 4),
+                                 "/site/css/a.css": (33, 4)}
+    fs.chown("/site/index.html", "1001")  # A number; the group stays as it was
+    assert FileServer.owners["/site/index.html"][0] == 1001
+    with pytest.raises(RemoteError, match="no user called nobody-here"):
+        fs.chown("/site/index.html", "nobody-here")

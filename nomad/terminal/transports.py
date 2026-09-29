@@ -263,6 +263,7 @@ class SshTransport(Transport):
         self.known_hosts = known_hosts or KnownHosts()
         self.transport = None
         self.channel = None
+        self.password = None  # The password that logged in (kept in memory only, for sudo on the SCP page)
 
     def connect(self):
         session = self.session
@@ -379,7 +380,10 @@ class SshTransport(Transport):
                 self.transport.auth_interactive(username, lambda title, instructions, prompts: [
                     password if not echo else (self.prompter.text(title or "Login", prompt) or "")
                     for prompt, echo in prompts])
-            return self.transport.is_authenticated()
+            if self.transport.is_authenticated():
+                self.password = password
+                return True
+            return False
         except paramiko.AuthenticationException:
             if not self.transport.is_active():
                 self.disconnected_during_login()

@@ -223,7 +223,7 @@ class FilePane(QWidget):
         layout.setSpacing(2)
         bar = QHBoxLayout()
         bar.setSpacing(2)
-        label = QLabel(self.title)
+        label = self.title_label = QLabel(self.title)
         label.setStyleSheet(f"color: {COLORS['muted']}; font-weight: bold;")
         self.path_input = QLineEdit()
         self.path_input.setToolTip("The folder shown. Type a path and press Enter to go there.")
@@ -538,6 +538,10 @@ class RemotePane(FilePane):
     def open_file(self, entry):
         if self.open_requested is not None:
             self.open_requested(entry)
+
+    def set_title(self, text, warning=False):
+        self.title_label.setText(text)
+        self.title_label.setStyleSheet(f"color: {COLORS['warning' if warning else 'muted']}; font-weight: bold;")
 
     def set_connected(self, connected):
         for widget in (self.list, self.path_input, self.up_button, self.back_button, self.home_button,
