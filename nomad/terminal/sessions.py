@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from dataclasses import dataclass, field
 from urllib.parse import unquote
@@ -24,6 +25,7 @@ LINE_ENDINGS = {"CR": "\r", "LF": "\n", "CR+LF": "\r\n"}
 ENCODINGS = ["utf-8", "cp437", "latin-1", "cp1252"]
 FILE_NAME = "sessions.json"
 FORMAT_VERSION = 1
+RECENT_LIMIT = 10
 
 
 @dataclass
@@ -114,6 +116,32 @@ def session_from_dict(data):
     return session
 
 
+def target_key(session):
+    """What makes two connections "the same place", for the recent list."""
+    if session.protocol == SERIAL:
+        return SERIAL, session.serial_port.upper(), int(session.baud_rate)
+    return session.protocol, session.host.lower(), int(session.port), session.username.lower()
+
+
+@dataclass
+class RecentEntry:
+    """A connection made recently. session is a copy without saved secrets; saved_id is the saved session it came
+    from (or was later saved as), which is used instead while it still exists."""
+    session: Session
+    saved_id: str = ""
+    last_used: float = 0.0
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+
+    def to_dict(self):
+        return {"id": self.id, "saved_id": self.saved_id, "last_used": self.last_used,
+                "session": dataclasses.asdict(self.session)}
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(session_from_dict(data.get("session") or {}), str(data.get("saved_id") or ""),
+                   float(data.get("last_used") or 0), str(data.get("id") or uuid.uuid4().hex))
+
+
 class SessionStore:
     """Sessions and folders, saved as JSON in the roaming app data folder."""
 
@@ -121,12 +149,14 @@ class SessionStore:
         self.path = path or os.path.join(app_data_dir(), FILE_NAME)
         self.sessions = []
         self.folders = set()  # Includes empty folders, which have no session to imply them
+        self.recent = []  # RecentEntry, newest first
         self.vault_settings = {}  # Master password salt and check value (no secrets), kept by the Vault
         self.vault = Vault(self.vault_settings, self.save)
+        self.listeners = []  # Called after every save, so each page showing the sessions can refresh
         self.load()
 
     def load(self):
-        self.sessions, self.folders = [], set()
+        self.sessions, self.folders, self.recent = [], set(), []
         self.vault_settings.clear()
         if not os.path.exists(self.path):
             return
@@ -139,12 +169,15 @@ class SessionStore:
         self.sessions = [session_from_dict(item) for item in data.get("sessions", []) if isinstance(item, dict)]
         self.folders = {normalize_folder(folder) for folder in data.get("folders", []) if isinstance(folder, str)}
         self.folders.discard("")
+        self.recent = [RecentEntry.from_dict(item) for item in data.get("recent", [])
+                       if isinstance(item, dict)][:RECENT_LIMIT]
         if isinstance(data.get("vault"), dict):
             self.vault_settings.update(data["vault"])
 
     def save(self):
         data = {"version": FORMAT_VERSION, "folders": sorted(self.all_folders()),
-                "sessions": [dataclasses.asdict(session) for session in self.sessions]}
+                "sessions": [dataclasses.asdict(session) for session in self.sessions],
+                "recent": [entry.to_dict() for entry in self.recent]}
         if self.vault_settings:
             data["vault"] = dict(self.vault_settings)
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
@@ -152,6 +185,8 @@ class SessionStore:
         with open(temporary, "w", encoding="utf-8") as file:
             json.dump(data, file, indent=2)
         os.replace(temporary, self.path)  # Never leave a half-written file behind
+        for listener in list(self.listeners):
+            listener()
 
     def all_folders(self):
         """Every folder, including the parents of nested ones."""
@@ -188,8 +223,14 @@ class SessionStore:
         return folder
 
     def rename_folder(self, old, new):
-        """Rename a folder (and everything under it)."""
+        """Rename a folder, or give it a new path to move it (with everything under it). If the new path is already
+        a folder, the two merge; a session whose name is taken there gets " (2)" added. The folder it came out of
+        stays, even if that leaves it empty."""
         old, new = normalize_folder(old), normalize_folder(new)
+        if not old or not new or old == new:
+            return
+        if new.startswith(old + "/"):
+            raise ValueError("A folder can't be moved into itself.")
 
         def moved(folder):
             if folder == old:
@@ -198,10 +239,45 @@ class SessionStore:
                 return new + folder[len(old):]
             return folder
 
+        self.folders = self.all_folders()  # Keep folders that only existed because of the sessions moving out
         for session in self.sessions:
-            session.folder = moved(session.folder)
+            folder = moved(session.folder)
+            if folder != session.folder:
+                session.folder = folder
+                session.name = self.unique_name(session.name, folder, ignore_id=session.id)
         self.folders = {moved(folder) for folder in self.folders}
         self.folders.discard("")
+        self.save()
+
+    def move_folder(self, folder, parent):
+        """Move a folder (and everything in it) into another folder, or to the top level with parent "". Returns
+        its new path."""
+        folder, parent = normalize_folder(folder), normalize_folder(parent)
+        name = folder.rpartition("/")[2]
+        new = f"{parent}/{name}" if parent else name
+        if parent == folder or parent.startswith(folder + "/"):
+            raise ValueError("A folder can't be moved into itself.")
+        self.rename_folder(folder, new)
+        return new
+
+    def move_sessions(self, session_ids, folder):
+        """Move sessions into a folder ("" for the top level). Names already taken there get " (2)" added.
+        Returns how many moved."""
+        folder = normalize_folder(folder)
+        self.folders = self.all_folders()  # Folders emptied by the move stay
+        if folder:
+            self.folders.add(folder)
+        moved = 0
+        for session in self.sessions:
+            if session.id in session_ids and session.folder != folder:
+                session.folder = folder
+                session.name = self.unique_name(session.name, folder, ignore_id=session.id)
+                moved += 1
+        self.save()
+        return moved
+
+    def delete_many(self, session_ids):
+        self.sessions = [session for session in self.sessions if session.id not in session_ids]
         self.save()
 
     def delete_folder(self, folder):
@@ -215,8 +291,54 @@ class SessionStore:
         self.folders = {path for path in self.folders if not inside(path)}
         self.save()
 
-    def unique_name(self, name, folder):
-        taken = {session.name.lower() for session in self.sessions if session.folder == folder}
+    # ----------------------------------------------------------------- Recent connections
+
+    def remember(self, session, when=None):
+        """Put a connection at the top of the recent list (moving it up if it's already there)."""
+        saved_id = session.id if self.get(session.id) is not None else ""
+        key = target_key(session)
+
+        def same(entry):
+            if saved_id:
+                return entry.saved_id == saved_id
+            return not self.get(entry.saved_id) and target_key(entry.session) == key
+
+        previous = next((entry for entry in self.recent if same(entry)), None)
+        entry = RecentEntry(session.copy(saved_password="", saved_passphrase=""), saved_id,
+                            time.time() if when is None else when, previous.id if previous else uuid.uuid4().hex)
+        self.recent = [entry] + [other for other in self.recent if other is not previous][:RECENT_LIMIT - 1]
+        self.save()
+        return entry
+
+    def recent_entry(self, entry_id):
+        return next((entry for entry in self.recent if entry.id == entry_id), None)
+
+    def recent_session(self, entry):
+        """What to open for a recent entry: the saved session if it still exists, otherwise a fresh copy."""
+        saved = self.get(entry.saved_id) if entry.saved_id else None
+        return saved if saved is not None else entry.session.copy()
+
+    def link_recent(self, session):
+        """A session was just saved: recent entries for the same place (not already tied to a saved session) now
+        open it, with its name and saved password."""
+        key = target_key(session)
+        changed = False
+        for entry in self.recent:
+            if not self.get(entry.saved_id) and target_key(entry.session) == key:
+                entry.saved_id = session.id
+                entry.session = session.copy(saved_password="", saved_passphrase="")
+                changed = True
+        if changed:
+            self.save()
+
+    def forget_recent(self, entry_id=None):
+        """Remove one recent entry, or all of them."""
+        self.recent = [entry for entry in self.recent if entry_id is not None and entry.id != entry_id]
+        self.save()
+
+    def unique_name(self, name, folder, ignore_id=None):
+        taken = {session.name.lower() for session in self.sessions
+                 if session.folder == folder and session.id != ignore_id}
         if name.lower() not in taken:
             return name
         number = 2

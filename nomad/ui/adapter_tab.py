@@ -555,32 +555,36 @@ class AdapterTab(QWidget):
         self.window.show_status(f"Deleted profile '{profile.name}'.")
 
     def import_profiles(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Import Profiles", "", "Profiles (*.json);;All files (*)")
+        path, _ = QFileDialog.getOpenFileName(self, "Import Interface Profiles", "",
+                                              "Interface profiles (*.json);;All files (*)")
         if not path:
             return
         try:
             added, replaced, problems = self.window.profile_store.import_file(path)
         except (OSError, ValueError) as error:
-            QMessageBox.critical(self, "Import Profiles", f"Could not import profiles:\n\n{error}")
+            QMessageBox.critical(self, "Import Interface Profiles",
+                                 f"Could not import interface profiles:\n\n{error}")
             return
         self.refresh_profiles_combo()
         message = f"Imported {added} new profile(s) and replaced {replaced}."
         if problems:
             message += "\n\nSkipped:\n" + "\n".join(problems)
-            QMessageBox.warning(self, "Import Profiles", message)
+            QMessageBox.warning(self, "Import Interface Profiles", message)
         self.window.show_status(message.split("\n")[0])
 
     def export_profiles(self):
         if not self.window.profile_store.profiles:
-            QMessageBox.information(self, "Export Profiles", "There are no profiles to export yet.")
+            QMessageBox.information(self, "Export Interface Profiles",
+                                    "There are no interface profiles to export yet.")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Export Profiles", "nomad-profiles.json",
-                                              "Profiles (*.json)")
+        path, _ = QFileDialog.getSaveFileName(self, "Export Interface Profiles", "nomad-profiles.json",
+                                              "Interface profiles (*.json)")
         if not path:
             return
         try:
             count = self.window.profile_store.export_file(path)
         except OSError as error:
-            QMessageBox.critical(self, "Export Profiles", f"Could not export profiles:\n\n{error}")
+            QMessageBox.critical(self, "Export Interface Profiles",
+                                 f"Could not export interface profiles:\n\n{error}")
             return
         self.window.show_status(f"Exported {count} profile(s) to {path}.")
