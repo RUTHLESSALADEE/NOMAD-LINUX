@@ -322,3 +322,19 @@ def test_refusal_keeps_the_newer_server_version(server, tmp_path):
     assert laptop.pending_ips(network.id) == {"10.0.0.50"}
     assert laptop.flush() == (0, 1)
     assert laptop.address(network.id, "10.0.0.50").name == "bob-online"
+
+
+def test_laptops_keep_the_servers_history(server, tmp_path):
+    from nomad.ipam.history import address_history
+    admin = team_store(server, tmp_path, "admin", ADMIN)
+    [network] = admin.import_networks([plan()])
+    alice = team_store(server, tmp_path, "alice")
+    alice.set_address(network.id, "10.0.0.5", RESERVED, "sw1-core")
+    bob = team_store(server, tmp_path, "bob")
+    assert bob.fetch_history() > 0
+    events = address_history(bob, network.id, "10.0.0.5")
+    assert [(event.action, event.who) for event in events] == [("Changed", "alice (PC)"), ("Recorded", "admin (PC)")]
+    assert bob.fetch_history() == 0  # Only new entries after that
+    bob.close()
+    offline = offline_store(server, tmp_path, "bob")  # Still there offline
+    assert len(address_history(offline, network.id, "10.0.0.5")) == 2

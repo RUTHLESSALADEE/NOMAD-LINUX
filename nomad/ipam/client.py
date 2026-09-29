@@ -34,6 +34,11 @@ COPY_FILE = "ipam-team.db"
 CONNECT_SECONDS = 4
 READ_SECONDS = 60  # A first sync or an import can take a while to send
 PENDING, REFUSED = "pending", "refused"
+HISTORY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS history (
+    seq INTEGER PRIMARY KEY, entity TEXT NOT NULL, entity_id TEXT NOT NULL, version INTEGER NOT NULL,
+    op TEXT NOT NULL, data TEXT NOT NULL, modified TEXT NOT NULL, modified_by TEXT NOT NULL);
+"""
 PENDING_SCHEMA = """
 CREATE TABLE IF NOT EXISTS pending (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, network_id TEXT NOT NULL, ip TEXT NOT NULL, sort_key TEXT NOT NULL,
@@ -206,6 +211,16 @@ class TeamClient:
         """Wait (up to `timeout` seconds) for a revision after `since`; returns the latest revision."""
         return self.request("GET", f"/api/wait?since={int(since)}&timeout={timeout}")["revision"]
 
+    def fetch_log(self, since):
+        """The server's change log after `since` (safe on a worker thread). Returns (entries, revision)."""
+        entries, revision = [], since
+        while True:
+            reply = self.request("GET", f"/api/log?since={int(revision)}")
+            entries.extend(reply["entries"])
+            revision = reply["revision"]
+            if not reply.get("more"):
+                return entries, revision
+
     def fetch_all_changes(self, since):
         """Every change after `since`, following `more` (safe to call on a worker thread). Returns (status, items,
         revision)."""
@@ -241,6 +256,7 @@ class TeamStore:
         self.last_error = ""
         self.key_rejected = False  # The server refused the tribe key (a new key file is needed)
         self.copy.db.executescript(PENDING_SCHEMA)
+        self.copy.db.executescript(HISTORY_SCHEMA)
         if self.copy.get_meta("server_id") not in ("", key.server_id):
             self.reset_copy()
 
@@ -258,7 +274,7 @@ class TeamStore:
     def reset_copy(self):
         """Empty the copy (for a different server), so the next sync fetches everything."""
         with self.copy.transaction():
-            for table in ("networks", "subnets", "addresses", "changes", "pending"):
+            for table in ("networks", "subnets", "addresses", "changes", "pending", "history"):
                 self.copy.db.execute(f"DELETE FROM {table}")
             self.copy.set_meta("revision", 0)
             self.copy.set_meta("server_id", self.key.server_id)
@@ -266,6 +282,26 @@ class TeamStore:
     @property
     def revision(self):
         return int(self.copy.get_meta("revision", "0") or 0)
+
+    @property
+    def history_revision(self):
+        """How far the copy of the server's change log (for history) reaches."""
+        return int(self.copy.get_meta("history_revision", "0") or 0)
+
+    def apply_log(self, entries, revision):
+        """Keep the server's change log entries (on the UI thread), so history works offline."""
+        with self.copy.transaction():
+            self.copy.db.executemany("INSERT OR REPLACE INTO history VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                     [(entry["seq"], entry["entity"], entry["entity_id"], entry["version"],
+                                       entry["op"], entry["data"], entry["modified"], entry["modified_by"])
+                                      for entry in entries])
+            self.copy.set_meta("history_revision", revision)
+
+    def fetch_history(self):
+        """Bring the history up to date now (blocking; the UI does the fetch on a worker thread)."""
+        entries, revision = self.client.fetch_log(self.history_revision)
+        self.apply_log(entries, revision)
+        return len(entries)
 
     @property
     def last_sync(self):

@@ -12,6 +12,7 @@ networks. Every edit names the Windows user and computer it came from, for the c
 API (JSON; "Authorization: Bearer <secret>"):
     GET  /api/status                  the server's id and name, latest revision, and the caller's role
     GET  /api/changes?since=N         rows changed after revision N (see IpamStore.changes_since)
+    GET  /api/log?since=N             the change log after revision N (who changed what, when), for history
     GET  /api/wait?since=N            answers as soon as there's a revision after N (or after about 25 seconds
                                       without one): each laptop keeps one of these waiting, so it syncs the
                                       moment anyone changes anything
@@ -53,7 +54,7 @@ TEAM, ADMIN = "team", "admin"
 ADMIN_ONLY_ACTIONS = {"add_network", "delete_network"}
 CERTIFICATE_YEARS = 20
 MAX_WAIT_SECONDS = 55
-API_LEVEL = 2  # 2 added /api/wait (instant sync). Clients fall back to polling servers below this
+API_LEVEL = 3  # 2 added /api/wait (instant sync), 3 /api/log (history). Clients cope with servers below this
 
 
 class ConflictError(IpamError):
@@ -270,6 +271,11 @@ class IpamServer:
         return {"server_id": self.config["server_id"], "name": socket.gethostname(), "version": __version__,
                 "api": API_LEVEL, "revision": revision, "role": role}
 
+    def log(self, since):
+        with self.store.lock:
+            entries, revision, more = self.store.log_since(since)
+        return {"entries": entries, "revision": revision, "more": more}
+
     def changes(self, since):
         with self.store.lock:
             items, revision, more = self.store.changes_since(since)
@@ -458,6 +464,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 query = parse_qs(url.query)
                 return self._reply(200, app.wait(int(query.get("since", ["0"])[0]),
                                                  float(query.get("timeout", ["25"])[0])))
+            if method == "GET" and url.path == "/api/log":
+                return self._reply(200, app.log(int(parse_qs(url.query).get("since", ["0"])[0])))
             if method == "GET" and url.path == "/api/changes":
                 since = int(parse_qs(url.query).get("since", ["0"])[0])
                 return self._reply(200, app.changes(since))

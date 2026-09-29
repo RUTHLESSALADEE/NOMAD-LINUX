@@ -330,6 +330,15 @@ class IpamStore:
         """The latest change's number (0 before any change): what a fully synced copy has seen."""
         return self.db.execute("SELECT COALESCE(MAX(seq), 0) FROM changes").fetchone()[0]
 
+    def log_since(self, revision, limit=5000):
+        """The change log after `revision` (who changed what, when), oldest first, for copies to keep as history.
+        Returns ([entries], the revision they reach, whether there's more)."""
+        rows = self.db.execute("SELECT seq, entity, entity_id, version, op, data, modified, modified_by FROM changes "
+                               "WHERE seq > ? ORDER BY seq LIMIT ?", (revision, limit + 1)).fetchall()
+        more = len(rows) > limit
+        rows = rows[:limit]
+        return [dict(row) for row in rows], (rows[-1]["seq"] if rows else revision), more
+
     def changes_since(self, revision, limit=5000):
         """Everything changed after `revision`, as each row's current state (deleted rows included, so copies
         remove them). Returns ([{"entity": table, "row": {column: value}}], the revision they bring a copy up to,
