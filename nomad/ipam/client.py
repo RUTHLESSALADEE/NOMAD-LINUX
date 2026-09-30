@@ -513,9 +513,9 @@ class TeamStore:
                 pass
         self._queue(network_id, ip, FREE, {})
 
-    def add_subnet(self, network_id, cidr, name="", gateway="", description="", fields=None):
+    def add_subnet(self, network_id, cidr, name="", gateway="", description="", fields=None, loopbacks=False):
         reply = self._send("add_subnet", network_id=network_id, cidr=cidr, name=name, gateway=gateway,
-                           description=description, fields=fields or {})
+                           description=description, fields=fields or {}, loopbacks=bool(loopbacks))
         created = [item["row"]["id"] for item in reply["items"] if item["entity"] == "subnets"]
         return self.copy.subnet(created[-1])
 

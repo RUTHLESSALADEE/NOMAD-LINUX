@@ -3,7 +3,7 @@ import logging
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QKeySequence
-from PyQt5.QtWidgets import QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, \
+from PyQt5.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, \
     QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QSplitter, QTableWidget, QTableWidgetItem, \
     QShortcut, QTabWidget, QVBoxLayout, QWidget
 
@@ -116,18 +116,30 @@ class SubnetDialog(_EditDialog):
             self.cidr_input.setToolTip("To change the range, add a new subnet and delete this one.")
         self.name_input = QLineEdit(subnet.name if subnet else "")
         self.gateway_input = QLineEdit(subnet.gateway if subnet else "")
+        self.loopbacks_check = QCheckBox("Loopbacks: every address is a /32 of its own (no network, broadcast or "
+                                         "gateway)")
+        self.loopbacks_check.setChecked(bool(subnet and subnet.loopbacks))
+        self.loopbacks_check.toggled.connect(self.on_loopbacks_toggled)
+        self.on_loopbacks_toggled(self.loopbacks_check.isChecked())
         self.description_input = QLineEdit(subnet.description if subnet else "")
         self.fields_editor = FieldsEditor(subnet.fields if subnet else {})
         self.form.addRow("Subnet:", self.cidr_input)
         self.form.addRow("Name:", self.name_input)
+        self.form.addRow("", self.loopbacks_check)
         self.form.addRow("Gateway:", self.gateway_input)
         self.form.addRow("Description:", self.description_input)
         self.form.addRow("Details:", self.fields_editor)
         self.finish_layout()
 
+    def on_loopbacks_toggled(self, loopbacks):
+        self.gateway_input.setEnabled(not loopbacks)
+        self.gateway_input.setPlaceholderText("None: loopbacks have no gateway" if loopbacks else "")
+
     def apply(self):
-        values = dict(name=self.name_input.text(), gateway=self.gateway_input.text(),
-                      description=self.description_input.text().strip(), fields=self.fields_editor.fields())
+        loopbacks = self.loopbacks_check.isChecked()
+        values = dict(name=self.name_input.text(), gateway="" if loopbacks else self.gateway_input.text(),
+                      description=self.description_input.text().strip(), fields=self.fields_editor.fields(),
+                      loopbacks=loopbacks)
         if self.subnet is None:
             return self.store.add_subnet(self.network_id, self.cidr_input.text(), **values)
         return self.store.update_subnet(self.subnet.id, **values)
@@ -186,6 +198,8 @@ def _subnet_text(subnet):
     if subnet is None:
         return "(not listed)"
     parts = [subnet.name or "(no name)"]
+    if subnet.loopbacks:
+        parts.append("loopbacks")
     if subnet.gateway:
         parts.append(f"gateway {subnet.gateway}")
     parts.extend(f"{name} {value}" for name, value in subnet.fields.items())

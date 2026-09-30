@@ -125,9 +125,10 @@ def ago(seconds):
     return f"{int(seconds // 86400)} days ago"
 
 
-def usable_count(network):
-    """Addresses that can be handed out: all but the network and broadcast (first and last) addresses."""
-    if network.version == 4 and network.num_addresses > 2:
+def usable_count(network, loopbacks=False):
+    """Addresses that can be handed out: all but the network and broadcast (first and last) addresses, or every one
+    in a loopback subnet."""
+    if not loopbacks and network.version == 4 and network.num_addresses > 2:
         return network.num_addresses - 2
     return network.num_addresses
 
@@ -1112,9 +1113,12 @@ class IpamTab(QWidget):
             while stack and not (stack[-1][0].version == network.version and network.subnet_of(stack[-1][0])):
                 stack.pop()
             used = self.store.count_addresses(self.network_id, network)
-            item = QTreeWidgetItem([subnet.cidr, subnet.name, f"{used} / {usable_count(network):,}"])
+            item = QTreeWidgetItem([subnet.cidr, subnet.name,
+                                    f"{used} / {usable_count(network, subnet.loopbacks):,}"])
             item.setData(0, Qt.UserRole, subnet)
             item.setToolTip(1, subnet.name)
+            if subnet.loopbacks:
+                item.setToolTip(0, "Loopbacks: every address is a /32 of its own")
             if stack:
                 stack[-1][1].addChild(item)
             else:
@@ -1241,6 +1245,8 @@ class IpamTab(QWidget):
             return
         try:
             network, hosts = sweep_hosts(subnet.cidr)
+            if subnet.loopbacks:
+                hosts = list(network)  # Each is a host route of its own, the first and last included
         except ValueError as error:
             set_hint(self.status_label, str(error), "error")
             return
@@ -1442,9 +1448,12 @@ class IpamTab(QWidget):
                 parts.append(subnet.name)
             if subnet.gateway:
                 parts.append(f"gateway {subnet.gateway}")
-            parts.append(f"netmask {network.netmask}" if network.version == 4 else f"{network.num_addresses:,} "
-                                                                                      "addresses")
-            parts.append(f"{len(recorded)} of {usable_count(network):,} recorded")
+            if subnet.loopbacks:
+                parts.append(f"loopbacks, each /{network.max_prefixlen}")
+            else:
+                parts.append(f"netmask {network.netmask}" if network.version == 4 else
+                             f"{network.num_addresses:,} addresses")
+            parts.append(f"{len(recorded)} of {usable_count(network, subnet.loopbacks):,} recorded")
             swept = sweep.swept_at(network.network_address) if sweep is not None else None
             if swept:
                 answered = sum(1 for address in sweep.hosts if address in network)

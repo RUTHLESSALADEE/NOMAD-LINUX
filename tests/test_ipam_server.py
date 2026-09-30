@@ -78,10 +78,14 @@ def test_laptop_edits_reach_everyone_and_record_who(server, tmp_path):
     alice.update_subnet(subnet.id, name="LAN renamed")
     added = alice.add_subnet(network.id, "10.0.1.0/24", "New")
     assert alice.subnet(added.id).name == "New"
+    loopbacks = alice.add_subnet(network.id, "10.0.2.0/29", "Loopbacks", loopbacks=True)
+    assert alice.subnet(loopbacks.id).loopbacks
 
     bob.sync()
     assert bob.address(network.id, "10.0.0.9").name == "printer"
-    assert {subnet.name for subnet in bob.subnets(network.id)} == {"LAN renamed", "New"}
+    assert {subnet.name for subnet in bob.subnets(network.id)} == {"LAN renamed", "New", "Loopbacks"}
+    assert [subnet.loopbacks for subnet in bob.subnets(network.id) if subnet.name == "Loopbacks"] == [True]
+    alice.delete_subnet(loopbacks.id)
 
     alice.delete_subnet(added.id)
     alice.free_address(network.id, "10.0.0.9")

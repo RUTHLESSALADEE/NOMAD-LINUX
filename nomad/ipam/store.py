@@ -2,7 +2,8 @@
 
 Each network is separate (such as an air-gapped network), so the same ranges can appear in more than one. Within a
 network a subnet's CIDR is unique; an address written with a mask stands for the subnet holding it (172.28.101.0/16
-is 172.28.0.0/16). Subnets may nest (a /20 block holding /24s), and an address belongs to the most specific subnet
+is 172.28.0.0/16). A loopback subnet is a pool of host routes (loopback addresses, each a /32 of its own), so it
+has no network, broadcast or gateway address. Subnets may nest (a /20 block holding /24s), and an address belongs to the most specific subnet
 containing it. Only addresses in use or reserved are stored; the rest of a subnet is free.
 
 Rows are never removed: deleting marks them deleted (a tombstone) and every change bumps the row's version and is
@@ -26,7 +27,7 @@ from ..system import app_data_dir
 log = logging.getLogger(__name__)
 
 FILE_NAME = "ipam.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # 2 added subnets.loopbacks
 USED, RESERVED = "used", "reserved"
 STATUSES = {USED: "Used", RESERVED: "Reserved"}
 MAX_NEXT_FREE_SCAN = 1 << 20  # Stop looking for a free address after this many (a /12's worth)
@@ -40,7 +41,7 @@ CREATE TABLE IF NOT EXISTS networks (
 CREATE TABLE IF NOT EXISTS subnets (
     id TEXT PRIMARY KEY, network_id TEXT NOT NULL, cidr TEXT NOT NULL, sort_key TEXT NOT NULL,
     name TEXT NOT NULL DEFAULT '', gateway TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '',
-    fields TEXT NOT NULL DEFAULT '{}',
+    fields TEXT NOT NULL DEFAULT '{}', loopbacks INTEGER NOT NULL DEFAULT 0,
     version INTEGER NOT NULL, modified TEXT NOT NULL, modified_by TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0);
 CREATE UNIQUE INDEX IF NOT EXISTS subnets_unique ON subnets (network_id, sort_key) WHERE deleted = 0;
 CREATE TABLE IF NOT EXISTS addresses (
@@ -163,6 +164,7 @@ class Subnet:
     gateway: str = ""
     description: str = ""
     fields: dict = field(default_factory=dict)
+    loopbacks: bool = False  # A pool of loopback addresses: each is a /32 (or /128) of its own
     version: int = 1
     modified: str = ""
     modified_by: str = ""
@@ -175,6 +177,8 @@ class Subnet:
         """Addresses in the subnet that can't be handed out: {address: label}."""
         network = self.network
         special = {}
+        if self.loopbacks:
+            return special  # Every address is a host route of its own, including the first and last
         if network.version == 4 and network.num_addresses > 2:
             special[network.network_address] = "Network"
             special[network.broadcast_address] = "Broadcast"
@@ -210,7 +214,7 @@ class Address:
 ENTITIES = {"networks": Network, "subnets": Subnet, "addresses": Address}
 EDITABLE = {
     "networks": {"name", "description", "fields"},
-    "subnets": {"name", "gateway", "description", "fields"},
+    "subnets": {"name", "gateway", "description", "fields", "loopbacks"},
     "addresses": {"status", "name", "mac", "description", "fields"},
 }
 
@@ -218,6 +222,8 @@ EDITABLE = {
 def _from_row(cls, row):
     values = {name: row[name] for name in row.keys() if name in cls.__dataclass_fields__}
     values["fields"] = json.loads(values.get("fields") or "{}")
+    if "loopbacks" in values:
+        values["loopbacks"] = bool(values["loopbacks"])
     return cls(**values)
 
 
@@ -239,9 +245,18 @@ class IpamStore:
         self.db.execute("PRAGMA journal_mode=WAL")
         self._depth = 0
         self.db.executescript(SCHEMA)
+        self._upgrade()
         with self.transaction():
             self.db.execute("INSERT OR IGNORE INTO meta VALUES ('schema', ?)", (str(SCHEMA_VERSION),))
             self.db.execute("INSERT OR IGNORE INTO meta VALUES ('replica_id', ?)", (uuid.uuid4().hex,))
+
+    def _upgrade(self):
+        """Add the columns newer versions brought to a database made by an older one."""
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(subnets)")}
+        if "loopbacks" not in columns:
+            self.db.execute("ALTER TABLE subnets ADD COLUMN loopbacks INTEGER NOT NULL DEFAULT 0")
+        self.db.execute("UPDATE meta SET value = ? WHERE key = 'schema' AND CAST(value AS INTEGER) < ?",
+                        (str(SCHEMA_VERSION), SCHEMA_VERSION))
 
     def close(self):
         self.db.close()
@@ -388,7 +403,7 @@ class IpamStore:
                     network = self.add_network(plan["name"], fields=fields)
                 for subnet in plan["subnets"]:
                     self.add_subnet(network.id, subnet["cidr"], subnet["name"], subnet["gateway"],
-                                    subnet["description"], subnet["fields"])
+                                    subnet["description"], subnet["fields"], subnet.get("loopbacks", False))
                 for address in plan["addresses"]:
                     self.set_address(network.id, address["ip"], address["status"], address["name"])
                 imported.append(network)
@@ -455,9 +470,9 @@ class IpamStore:
     def subnet(self, subnet_id):
         return self._get("subnets", subnet_id)
 
-    def add_subnet(self, network_id, cidr, name="", gateway="", description="", fields=None):
+    def add_subnet(self, network_id, cidr, name="", gateway="", description="", fields=None, loopbacks=False):
         network = parse_subnet(cidr)
-        gateway = self._check_gateway(gateway, network)
+        gateway = self._check_gateway(gateway, network, loopbacks)
         with self.transaction():
             self.network(network_id)
             existing = self.db.execute("SELECT name FROM subnets WHERE network_id = ? AND sort_key = ? AND deleted = 0",
@@ -465,13 +480,19 @@ class IpamStore:
             if existing is not None:
                 raise IpamError(f"{network} is already in this network ({existing['name'] or 'no name'}).")
             return self._insert("subnets", Subnet(uuid.uuid4().hex, network_id, str(network), name.strip(), gateway,
-                                                  description, dict(fields or {})))
+                                                  description, dict(fields or {}), bool(loopbacks)))
 
     def update_subnet(self, subnet_id, **changes):
         with self.transaction():
             subnet = self.subnet(subnet_id)
-            if "gateway" in changes:
-                changes["gateway"] = self._check_gateway(changes["gateway"], subnet.network)
+            if "loopbacks" in changes:
+                changes["loopbacks"] = bool(changes["loopbacks"])
+                if changes["loopbacks"]:
+                    changes.setdefault("gateway", "")  # A pool of loopbacks has no gateway
+            loopbacks = changes.get("loopbacks", subnet.loopbacks)
+            if "gateway" in changes or loopbacks:
+                changes["gateway"] = self._check_gateway(changes.get("gateway", subnet.gateway), subnet.network,
+                                                         loopbacks)
             if "name" in changes:
                 changes["name"] = changes["name"].strip()
             return self._update("subnets", subnet, changes)
@@ -486,10 +507,12 @@ class IpamStore:
             self._delete("subnets", subnet)
 
     @staticmethod
-    def _check_gateway(gateway, network):
+    def _check_gateway(gateway, network, loopbacks=False):
         gateway = (gateway or "").strip()
         if not gateway:
             return ""
+        if loopbacks:
+            raise IpamError("A loopback subnet has no gateway: each address is a host route of its own.")
         address = parse_address(gateway)
         if address not in network:
             raise IpamError(f"The gateway {address} isn't in {network}.")

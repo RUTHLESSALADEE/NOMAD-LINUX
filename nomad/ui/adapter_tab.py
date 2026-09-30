@@ -453,10 +453,28 @@ class AdapterTab(QWidget):
         enable = not adapter.enabled
         if not enable and not self.confirm("Disable Adapter", f"Disable {adapter.name}?", adapter):
             return
-        verb = "Enabling" if enable else "Disabling"
-        self.window.run_change(f"{verb} {adapter.name}", lambda: set_adapter_enabled(adapter.index, enable),
-                               on_success=lambda _: self.window.show_status(
-                                   f"{adapter.name} {'enabled' if enable else 'disabled'}."))
+        if enable:
+            self.window.run_change(f"Enabling {adapter.name}", lambda: set_adapter_enabled(adapter.index, True),
+                                   on_success=lambda _: self.window.show_status(f"{adapter.name} enabled."))
+        else:
+            self.window.run_change(f"Disabling {adapter.name}", lambda: set_adapter_enabled(adapter.index, False),
+                                   on_success=lambda _: self.confirm_keep_disabled(adapter))
+
+    def confirm_keep_disabled(self, adapter):
+        """Ask whether to leave the adapter disabled, re-enabling it if nobody answers."""
+        dialog = KeepChangesDialog(self, f"{adapter.name} is now disabled.", title="Keep Adapter Disabled?",
+                                   heading="The adapter has been disabled. Do you want to keep it disabled?",
+                                   countdown="Re-enabling the adapter in {} seconds...")
+        if dialog.exec_() == KeepChangesDialog.Accepted:
+            self.window.show_status(f"{adapter.name} disabled.")
+            return
+
+        def failed(error):
+            QMessageBox.critical(self, "Re-enable Failed", f"Could not re-enable {adapter.name}:\n\n{error}")
+
+        self.window.run_change(f"Re-enabling {adapter.name}", lambda: set_adapter_enabled(adapter.index, True),
+                               on_success=lambda _: self.window.show_status(f"Re-enabled {adapter.name}."),
+                               on_error=failed)
 
     def reset_adapter(self):
         adapter = self.configurable_adapter()

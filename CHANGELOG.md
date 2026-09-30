@@ -6,6 +6,16 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-09-29
+
+### Added
+
+- Loopback subnets in IPAM: a subnet can be marked Loopbacks (in its settings), meaning every address is a /32 of its own. It has no network, broadcast or gateway address, so Use Next Free can hand out the first and last addresses, the used count includes them, and Sweep Subnet pings them. Import Spreadsheet makes a loopback subnet from each Detailed Info block listed with the mask 255.255.255.255, named as the sheet names it (such as 68900 MAIN TCN Loopback); rows there marked Network or Broadcast are free loopbacks. A block whose addresses aren't one subnet is imported as several, all with the block's name, rather than being left out. Update the IPAM server and laptops together: the server's database gains a column for it.
+
+### Changed
+
+- Disabling an adapter on the Interfaces page now asks afterwards whether to keep it disabled, as changing its IP settings does: if you don't confirm within 15 seconds (say it cut off your remote session), it's enabled again.
+
 ## [1.8.0] - 2026-09-29
 
 ### Added

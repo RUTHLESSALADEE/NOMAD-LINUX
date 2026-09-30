@@ -153,6 +153,7 @@ def test_parse_page():
     matched = {subnet.cidr: subnet for subnet in sheet.matched}
     assert set(matched) == {"10.0.0.0/29", "10.0.0.8/29"}  # The /32 loopback rows cover a /29
     assert matched["10.0.0.0/29"].description == "Loopback0"  # From the summary
+    assert matched["10.0.0.0/29"].loopbacks and not matched["10.0.0.8/29"].loopbacks
     assert matched["10.0.0.8/29"].gateway == "10.0.0.9"
     assert matched["10.0.0.8/29"].fields == {"Telephony Rng": "68900"}
 
@@ -185,6 +186,9 @@ def test_import_needs_choices_then_fills_network(store):
     assert subnets == {"10.0.0.0/29": "MAIN Loopback", "10.0.0.8/29": "MAIN IN-CT", "10.0.2.0/30": "Renamed differently",
                        "10.0.3.0/30": "Only in detail", "10.0.4.0/29": "Misaligned"}
     assert len(store.addresses(network.id)) == 5
+    loopbacks = next(subnet for subnet in store.subnets(network.id) if subnet.cidr == "10.0.0.0/29")
+    assert loopbacks.loopbacks and loopbacks.special_addresses() == {}
+    assert store.address(network.id, "10.0.0.7") is None  # "Broadcast" on a /32 row is just a free loopback
 
     # Importing again over the same network replaces its contents
     for difference in sheet.differences:
@@ -349,3 +353,66 @@ def test_comparing_the_network_with_ipam(store):
     assert "IPAM has AA-BB-CC-00-00-06 for printer" in findings["10.0.0.6"].text
     quiet = silent(store, lab.id, found, [parse_subnet("10.0.0.0/24")])
     assert [record.ip for record in quiet] == ["10.0.0.8"]  # Reserved addresses needn't answer
+
+
+def test_loopback_subnets(store):
+    network = store.add_network("Lab")
+    pool = store.add_subnet(network.id, "10.0.0.0/29", "Loopbacks", loopbacks=True)
+    assert pool.special_addresses() == {}
+    assert str(store.next_free(pool)) == "10.0.0.0"  # The first and last addresses can be handed out too
+    for last in range(7):
+        store.set_address(network.id, f"10.0.0.{last}", USED, f"rtr{last}")
+    assert str(store.next_free(pool)) == "10.0.0.7"
+    with pytest.raises(IpamError, match="no gateway"):
+        store.add_subnet(network.id, "10.0.1.0/30", loopbacks=True, gateway="10.0.1.1")
+    with pytest.raises(IpamError, match="no gateway"):
+        store.update_subnet(pool.id, gateway="10.0.0.1")
+
+    # Turning a subnet into loopbacks drops its gateway; turning it back gives the network and broadcast back
+    lan = store.add_subnet(network.id, "10.0.2.0/29", "LAN", gateway="10.0.2.1")
+    lan = store.update_subnet(lan.id, loopbacks=True)
+    assert lan.loopbacks and lan.gateway == ""
+    lan = store.update_subnet(lan.id, loopbacks=False)
+    assert set(lan.special_addresses().values()) == {"Network", "Broadcast"}
+    assert store.subnet(lan.id).loopbacks is False
+
+
+def test_database_from_before_loopbacks_is_upgraded(tmp_path):
+    import sqlite3
+    path = str(tmp_path / "old.db")
+    old = sqlite3.connect(path)
+    old.executescript(SCHEMA_V1)
+    old.close()
+    upgraded = IpamStore(path, user="tester")
+    network = upgraded.add_network("Lab")
+    assert upgraded.add_subnet(network.id, "10.0.0.0/30", loopbacks=True).loopbacks
+    assert upgraded.get_meta("schema") == "2"
+    upgraded.close()
+
+
+SCHEMA_V1 = """
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+INSERT INTO meta VALUES ('schema', '1');
+CREATE TABLE subnets (
+    id TEXT PRIMARY KEY, network_id TEXT NOT NULL, cidr TEXT NOT NULL, sort_key TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '', gateway TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '',
+    fields TEXT NOT NULL DEFAULT '{}',
+    version INTEGER NOT NULL, modified TEXT NOT NULL, modified_by TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0);
+"""
+
+
+def test_loopback_rows_outside_one_block_keep_their_name():
+    sheet = parse_page("Page 1", page(
+        ["11AB", "HQ", "2025-04-25", "", "", "02"],
+        ["Detailed Info"],
+        ["POP Loopback", "68900", "10.0.0.2", "255.255.255.255", "", "Y", "POP-XT2R"],
+        ["", "", "10.0.0.3", "255.255.255.255", "", "Y", "POP-XFWH"],
+        ["", "", "10.0.0.4", "255.255.255.255", "", "", ""],
+        ["", "", "10.0.0.5", "255.255.255.255", "", "Y", "Network"],
+        ["End"],
+    ))
+    found = [(difference.cidr, difference.detail.name, difference.detail.loopbacks)
+             for difference in sheet.differences]
+    assert found == [("10.0.0.2/31", "POP Loopback", True), ("10.0.0.4/31", "POP Loopback", True)]
+    assert not sheet.problems
+    assert [address.ip for address in sheet.addresses] == ["10.0.0.2", "10.0.0.3"]

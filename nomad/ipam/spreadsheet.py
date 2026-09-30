@@ -9,6 +9,9 @@ Each page is one network:
     "End".
 The summary and the detailed section can disagree; each disagreement is a Difference the user decides before
 importing. Rows that can't be used are reported as problems rather than guessed at.
+
+Loopbacks are listed with the mask 255.255.255.255, a row per address under their subnet's name; they're imported
+as a loopback subnet (no network, broadcast or gateway address) covering the rows, named as the sheet names them.
 """
 import csv
 import datetime
@@ -73,6 +76,7 @@ class SheetSubnet:
     description: str = ""
     fields: dict = field(default_factory=dict)
     written: str = ""  # As the sheet has it, when that isn't the subnet's own CIDR (172.28.101.0/16)
+    loopbacks: bool = False  # Listed as host routes (255.255.255.255): a pool of loopback addresses
 
     @property
     def network(self):
@@ -242,7 +246,8 @@ def merged(chosen, other):
         return chosen
     return SheetSubnet(chosen.row, chosen.cidr, chosen.name or other.name, chosen.gateway or other.gateway,
                        chosen.description or other.description, dict(other.fields, **{
-                           name: value for name, value in chosen.fields.items() if value}), chosen.written)
+                           name: value for name, value in chosen.fields.items() if value}), chosen.written,
+                       chosen.loopbacks or other.loopbacks)
 
 
 @dataclass
@@ -427,11 +432,12 @@ def parse_page(title, rows):
             except IpamError as error:
                 sheet.problem(number, f"Summary {name or '(no name)'}: {str(error).rstrip('.')}, so it can't be imported.")
                 continue
+            loopbacks = network.num_addresses == 1
             _add_subnet(sheet, "Summary", SheetSubnet(number, str(network), name, "",
                                                       _cell(row, columns.get(ASSIGNMENT)),
                                                       _extra_fields(row, extra_columns),
-                                                      _written(_cell(row, columns[SUBNET]), network)),
-                        _cell(row, columns.get(GATEWAY)))
+                                                      _written(_cell(row, columns[SUBNET]), network), loopbacks),
+                        "" if loopbacks else _cell(row, columns.get(GATEWAY)))
 
         elif state == "base":
             values = [value for value in row if value]
@@ -502,17 +508,17 @@ def _finish_group(sheet, group, columns, extra_columns):
     else:
         if bad_text:
             sheet.problem(bad_rows[0][0], f"{name}: {bad_text}.")
-    if network is not None and network.num_addresses == 1 and len(addresses) > 1:
-        # Loopbacks are listed as host routes (/32 each); the block is the range the rows cover
-        low, high = min(address for _, address, _ in addresses), max(address for _, address, _ in addresses)
-        blocks = list(ipaddress.summarize_address_range(low, high))
-        if len(blocks) == 1:
-            network = parse_subnet(str(blocks[0]))
-        else:
-            sheet.problem(header_number, f"Detailed {name}: the rows {low} to {high} aren't one subnet, so the "
-                                         "subnet isn't imported (its addresses are).")
-            network = None
-    if network is not None:
+    if network is not None and network.num_addresses == 1:
+        # Loopbacks are listed as host routes (/32 each); the subnet is the range the rows cover, split into as
+        # few blocks as it takes when the range isn't one (each keeps the sheet's name)
+        low = min([address for _, address, _ in addresses] + [network.first])
+        high = max([address for _, address, _ in addresses] + [network.first])
+        for block in ipaddress.summarize_address_range(low, high):
+            block = parse_subnet(str(block))
+            _add_subnet(sheet, "Detailed Info", SheetSubnet(header_number, str(block), name,
+                                                            fields=_extra_fields(header, extra_columns),
+                                                            loopbacks=True), "")
+    elif network is not None:
         _add_subnet(sheet, "Detailed Info", SheetSubnet(header_number, str(network), name,
                                                         fields=_extra_fields(header, extra_columns),
                                                         written=_written(_cell(header, columns[SUBNET]), network)),
@@ -590,8 +596,9 @@ def import_plan(sheet, network_name, replace=False):
         "name": network_name.strip(),
         "replace": replace,
         "fields": dict(sheet.fields, **{"Imported from": sheet.title}),
-        "subnets": [{"cidr": subnet.cidr, "name": subnet.name, "gateway": subnet.gateway,
-                     "description": subnet.description, "fields": subnet.fields}
+        # A loopback subnet has no gateway, even if the summary gives the same range one
+        "subnets": [{"cidr": subnet.cidr, "name": subnet.name, "gateway": "" if subnet.loopbacks else subnet.gateway,
+                     "description": subnet.description, "fields": subnet.fields, "loopbacks": subnet.loopbacks}
                     for subnet in sheet.subnets_to_import()],
         "addresses": [{"ip": address.ip, "status": address.status, "name": address.name}
                       for address in sheet.addresses],

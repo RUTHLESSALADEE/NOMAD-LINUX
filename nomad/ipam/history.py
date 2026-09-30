@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from .store import STATUSES, IpamStore, ip_key, parse_address, parse_subnet, subnet_key
 
 FIELD_LABELS = {"name": "Name", "status": "Status", "mac": "MAC", "description": "Description",
-                "gateway": "Gateway", "fields": "Details"}
+                "gateway": "Gateway", "loopbacks": "Loopbacks", "fields": "Details"}
 CREATED, CHANGED, DELETED = "create", "update", "delete"
 
 
@@ -69,6 +69,8 @@ class Event:
 def show(name, value):
     if name == "status":
         return STATUSES.get(value, value or "(none)")
+    if name == "loopbacks":
+        return "Yes" if value else "No"
     if name == "fields":
         return ", ".join(f"{key} {text}" for key, text in (value or {}).items()) or "(none)"
     return value if value else "(none)"
@@ -83,6 +85,8 @@ def describe_row(entity, row):
         parts = [row.get("cidr", "")]
         if row.get("gateway"):
             parts.append(f"gateway {row['gateway']}")
+        if row.get("loopbacks"):
+            parts.append("loopbacks")
         return ", ".join(parts)
     return row.get("name", "")
 
