@@ -1,4 +1,4 @@
-"""NOMAD (Network Operations, Monitoring And Diagnostics): a friendlier GUI for Windows network settings.
+"""NOMAD: Network Operations, Monitoring And Diagnostics.
 
 Run with:  python Main.py   (or pythonw Main.py to avoid a console window)
 """

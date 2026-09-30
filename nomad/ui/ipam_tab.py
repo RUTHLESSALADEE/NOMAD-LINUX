@@ -1410,8 +1410,8 @@ class IpamTab(QWidget):
             self.refresh_current(address)
 
     def open_calculator(self, cidr):
-        self.window.navigator.setCurrentWidget(self.window.utilities_tab)
-        self.window.utilities_tab.calculate_subnet(cidr)
+        self.window.navigator.setCurrentWidget(self.window.subnet_tab)
+        self.window.subnet_tab.calculate_subnet(cidr)
 
     # ----------------------------------------------------------------- Addresses
 

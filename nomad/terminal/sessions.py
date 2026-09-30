@@ -61,6 +61,11 @@ class Session:
     scrollback: int = 10000
     log_to_file: bool = False
     log_folder: str = ""
+    # Sending, and staying connected
+    line_delay: int = 0  # Milliseconds between lines when pasting or sending several (slow consoles drop text)
+    auto_reconnect: bool = False  # When the connection drops (such as a device reloading), until it's back
+    anti_idle: int = 0  # Seconds without typing before sending anti_idle_text; 0 turns it off
+    anti_idle_text: str = " \\b"  # Space, backspace: nothing to see at a prompt. See decode_escapes
     notes: str = ""
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
@@ -105,6 +110,29 @@ def validate_session(session):
     if session.protocol == SSH and session.auth == AUTH_KEY and not session.key_file.strip():
         return "Choose the private key file, or use password authentication."
     return None
+
+
+ESCAPES = {"r": "\r", "n": "\n", "t": "\t", "b": "\b", "e": "\x1b", "\\": "\\", "0": "\x00"}
+
+
+def decode_escapes(text):
+    """Text typed with escapes, such as the anti-idle text: \\r \\n \\t \\b (backspace) \\e (Esc) \\0 \\\\
+    and \\xNN. An unknown escape is kept as typed."""
+    result = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        following = text[index + 1] if index + 1 < len(text) else ""
+        if char == "\\" and following in ESCAPES:
+            result.append(ESCAPES[following])
+            index += 2
+        elif char == "\\" and following == "x" and re.fullmatch(r"[0-9a-fA-F]{2}", text[index + 2:index + 4]):
+            result.append(chr(int(text[index + 2:index + 4], 16)))
+            index += 4
+        else:
+            result.append(char)
+            index += 1
+    return "".join(result)
 
 
 def normalize_folder(folder):

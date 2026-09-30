@@ -79,6 +79,43 @@ class SessionDialog(QDialog):
         terminal_form.addRow("Logging:", log_row)
         layout.addWidget(terminal)
 
+        sending = QGroupBox("Sending and Staying Connected")
+        sending_form = QFormLayout(sending)
+        self.line_delay_input = QSpinBox()
+        self.line_delay_input.setRange(0, 5000)
+        self.line_delay_input.setSingleStep(50)
+        self.line_delay_input.setSuffix(" ms")
+        self.line_delay_input.setSpecialValueText("Off")
+        self.line_delay_input.setValue(int(session.line_delay))
+        self.line_delay_input.setToolTip("When pasting several lines (or sending a command button), send them "
+                                         "one at a time this far apart. Consoles and older switches drop "
+                                         "characters from a fast paste; 100-300 ms usually fixes it.")
+        self.anti_idle_input = QSpinBox()
+        self.anti_idle_input.setRange(0, 86400)
+        self.anti_idle_input.setSingleStep(30)
+        self.anti_idle_input.setSuffix(" s")
+        self.anti_idle_input.setSpecialValueText("Off")
+        self.anti_idle_input.setValue(int(session.anti_idle))
+        self.anti_idle_input.setToolTip("After this long without typing, send the text beside it, so the device "
+                                        "doesn't log you out (Cisco exec-timeout, shell TMOUT).")
+        self.anti_idle_text_input = QLineEdit(session.anti_idle_text)
+        self.anti_idle_text_input.setToolTip("What to send: \\b is Backspace, \\r Enter, \\t Tab, \\e Esc, "
+                                             "\\xNN any character. A space then Backspace (\" \\b\") "
+                                             "leaves nothing to see at a prompt.")
+        anti_idle_row = QHBoxLayout()
+        anti_idle_row.addWidget(self.anti_idle_input)
+        anti_idle_row.addWidget(QLabel("then send:"))
+        anti_idle_row.addWidget(self.anti_idle_text_input, 1)
+        self.reconnect_check = QCheckBox("Reconnect automatically when the connection drops")
+        self.reconnect_check.setChecked(bool(session.auto_reconnect))
+        self.reconnect_check.setToolTip("Such as a device reloading: NOMAD keeps trying every 10 seconds until "
+                                        "it's back (for up to half an hour). Not after you type exit or "
+                                        "logout, or disconnect it yourself.")
+        sending_form.addRow("Line delay:", self.line_delay_input)
+        sending_form.addRow("Anti-idle:", anti_idle_row)
+        sending_form.addRow("", self.reconnect_check)
+        layout.addWidget(sending)
+
         self.notes_input = QLineEdit(session.notes)
         self.notes_input.setPlaceholderText("Optional notes, such as the device's location")
         notes = QFormLayout()
@@ -308,6 +345,10 @@ class SessionDialog(QDialog):
         session.scrollback = self.scrollback_input.value()
         session.log_to_file = self.log_check.isChecked()
         session.log_folder = self.log_folder_input.text().strip()
+        session.line_delay = self.line_delay_input.value()
+        session.anti_idle = self.anti_idle_input.value()
+        session.anti_idle_text = self.anti_idle_text_input.text()
+        session.auto_reconnect = self.reconnect_check.isChecked()
         session.notes = self.notes_input.text().strip()
         if session.protocol == SERIAL:
             session.serial_port = self.serial_port()

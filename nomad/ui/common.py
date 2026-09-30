@@ -3,7 +3,7 @@ import logging
 import threading
 
 from PyQt5.QtCore import QObject, QRunnable, QThread, QThreadPool, pyqtSignal
-from PyQt5.QtWidgets import QTableWidgetItem
+from PyQt5.QtWidgets import QAbstractItemView, QHeaderView, QTableWidget, QTableWidgetItem
 
 from .theme import COLORS
 
@@ -50,6 +50,19 @@ class SortableTableItem(QTableWidgetItem):
         if self.sort_key is not None and other_key is not None:
             return self.sort_key < other_key
         return super().__lt__(other)
+
+
+def read_only_table(columns):
+    """A table of results: rows are selected whole, one at a time, and can't be edited."""
+    table = QTableWidget(0, len(columns))
+    table.setHorizontalHeaderLabels(columns)
+    table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+    table.setSelectionBehavior(QAbstractItemView.SelectRows)
+    table.setSelectionMode(QAbstractItemView.SingleSelection)
+    table.verticalHeader().setVisible(False)
+    table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+    table.horizontalHeader().setStretchLastSection(True)
+    return table
 
 
 class _TaskSignals(QObject):

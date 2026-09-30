@@ -105,6 +105,39 @@ def validate_route_input(family, destination, netmask, gateway, metric, interfac
     }, errors, warnings
 
 
+def parse_route_lookup(family, text):
+    """The address or network a routing table filter is asking about, or None if it's ordinary filter text.
+
+    A partly typed IPv4 address with at least one dot, like "10.1" or "10.1.", means the network its octets cover
+    (10.1.0.0/16), so the lookup keeps working while an address is being typed.
+    """
+    text = text.strip()
+    if family == 4 and "/" not in text:
+        octets = text.rstrip(".").split(".")
+        if "." in text and len(octets) < 4 and all(octet.isdigit() for octet in octets):
+            text = ".".join(octets + ["0"] * (4 - len(octets))) + f"/{8 * len(octets)}"
+    try:
+        target = ipaddress.ip_network(text, strict=False)
+    except ValueError:
+        return None
+    return target if target.version == family else None
+
+
+def matching_routes(routes, target):
+    """Routes that would carry traffic to target (an address or network), as a router's lookup would find them.
+
+    Returns (matches, best). best is the active route Windows would pick: the longest prefix, then the lowest
+    metric. It is None when no active route matches.
+    """
+    matches = [route for route in routes
+               if route.family == target.version and target.subnet_of(route.network)]
+    candidates = [route for route in matches if route.active]
+    best = min(candidates, key=lambda route: (-route.network.prefixlen,
+                                              route.metric if route.metric is not None else float("inf")),
+               default=None)
+    return matches, best
+
+
 def _next_hop(family, gateway):
     return gateway or ("0.0.0.0" if family == 4 else "::")
 
@@ -116,11 +149,11 @@ def build_add_route_script(family, network, gateway, interface, metric, persiste
     parameters = lookup + (f" -RouteMetric {int(metric)}" if metric else "")
     if not persistent:
         return f"New-NetRoute {parameters} -PolicyStore ActiveStore | Out-Null"
-    # Add to the persistent store, then make sure it's active now too
-    return (f"New-NetRoute {parameters} -PolicyStore PersistentStore | Out-Null\n"
-            f"if (-not (Get-NetRoute {lookup} -PolicyStore ActiveStore -ErrorAction SilentlyContinue)) {{\n"
-            f"    New-NetRoute {parameters} -PolicyStore ActiveStore | Out-Null\n"
-            f"}}")
+    # New-NetRoute rejects -PolicyStore PersistentStore; with no store it adds to both the persistent and active
+    # stores. It fails if the route is already active, so drop an active-only copy first.
+    return (f"Get-NetRoute {lookup} -PolicyStore ActiveStore -ErrorAction SilentlyContinue | "
+            f"Remove-NetRoute -Confirm:$false\n"
+            f"New-NetRoute {parameters} | Out-Null")
 
 
 def build_delete_route_script(route):
@@ -130,8 +163,9 @@ def build_delete_route_script(route):
     return (
         "$found = $false\n"
         "foreach ($store in 'PersistentStore', 'ActiveStore') {\n"
-        f"    if (Get-NetRoute {lookup} -PolicyStore $store -ErrorAction SilentlyContinue) {{\n"
-        f"        Remove-NetRoute {lookup} -PolicyStore $store -Confirm:$false\n"
+        f"    $routes = @(Get-NetRoute {lookup} -PolicyStore $store -ErrorAction SilentlyContinue)\n"
+        "    if ($routes) {\n"
+        "        $routes | Remove-NetRoute -Confirm:$false\n"
         "        $found = $true\n"
         "    }\n"
         "}\n"
