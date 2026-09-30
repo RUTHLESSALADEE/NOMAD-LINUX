@@ -28,6 +28,7 @@ HEADERS = {"network name": NAME, "subnet": SUBNET, "mask": MASK, "gateway": GATE
 UNIT_FIELDS = ["Unit", "Location", "Revision date", "Revision"]  # The row after the header, in order
 SECRET_LABEL_ENDINGS = ("string", "community", "password")  # Base-info labels whose values are never imported
 IMPLIED_ASSIGNMENTS = {"network", "broadcast"}
+UNNAMED_USED = "in use"  # How NOMAD's own workbook export writes a used address with no name
 RESERVED_MARKS = ("y", "yes", "x", "true")  # Marker rows the subnet itself stands for
 
 
@@ -354,6 +355,8 @@ def _network(address, mask):
 
 def _add_subnet(sheet, section, subnet, gateway):
     """Add a subnet from the summary or the Detailed Info; a gateway outside it becomes a GatewayFix."""
+    if subnet.name.strip() in (subnet.cidr, str(subnet.network.first)):
+        subnet.name = ""  # Named only by its own address (as NOMAD's export names a subnet without a name)
     if gateway:
         try:
             address = ipaddress.ip_address(gateway)
@@ -529,7 +532,8 @@ def _finish_group(sheet, group, columns, extra_columns):
         reserved = _cell(row, columns.get(RESERVED_COLUMN)).casefold() in RESERVED_MARKS
         if assignment.casefold() in IMPLIED_ASSIGNMENTS or not (reserved or assignment):
             continue
-        sheet.addresses.append(SheetAddress(number, str(address), RESERVED if reserved else USED, assignment))
+        sheet.addresses.append(SheetAddress(number, str(address), RESERVED if reserved else USED,
+                                            "" if assignment.casefold() == UNNAMED_USED else assignment))
 
 
 def _find_differences(sheet):

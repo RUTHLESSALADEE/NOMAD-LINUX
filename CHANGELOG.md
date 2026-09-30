@@ -6,6 +6,22 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-09-29
+
+### Changed
+
+- Sweep results on the IP Addresses page last: the Last Sweep column is now Last Seen, and shows when each address last answered (today 14:05, Sep 27 09:30...) and, when the latest sweep got no answer, when it last did. They're kept in the database, and for tribe networks shared through the IPAM server (sweeps made offline, say in an air-gapped network, are sent when it's back), so everyone sees them, with who swept. Sweeps from the Sweep page's IPAM comparison are kept too. They aren't changes to the records, so they stay out of the history. The IPAM server needs updating for sharing them; until then each laptop keeps its own.
+
+### Added
+
+- Check Data (IP Addresses page, Network menu): lists likely mistakes in a network, most serious first: a name whose number doesn't match its Telephony Rng, a name that looks like a stray user name or note (such as "rojason."), a subnet named Loopback that isn't marked Loopbacks, a device recorded on a subnet's network or broadcast address, addresses outside every subnet, the same MAC on two addresses, reserved addresses with no name, gateways in unusual places and unnamed subnets. Double-click one to go to it; the list stays open, and Check Again re-checks.
+- Compare with Workbook (Network menu): compares a network with a page of a newer copy of the addressing workbook (settling its summary and Detailed Info differences as an import does) and lists every difference: subnets and addresses to add, change or remove, and network details. Tick the ones to make and apply them, instead of deleting and importing again, so edits made in NOMAD and the history are kept. Anything changed or deleted in NOMAD since the import, and anything only IPAM has, is left unticked.
+- Export to Workbook and Export All Networks to Workbook (Network menu): writes networks as .xlsx pages in the tribe's workbook layout (header, unit row, summary, Unit Base Info, Detailed Info with every address of subnets up to 256, End), so the spreadsheet can be kept up to date from IPAM. It imports back exactly as it went out. The layout has no place for addresses outside every subnet (the export says how many) or for addresses' MACs and descriptions (the CSV export has those).
+- Find Free Blocks (right-click a subnet): the unused space in it, as the largest free blocks or every free block of a size you choose, with Add as Subnet.
+- Changing many at once: select several addresses to Mark Used, Mark Reserved, or Edit Selected (status, description, or a detail); Ctrl/Shift-click several subnets and Edit Selected Subnets to set a detail (such as Telephony Rng), the description, or Loopbacks.
+- Free Address from IPAM on the Interfaces page: pick a network and subnet (it starts with the one the adapter is in) and it fills in the next free address, with the mask and gateway. Once you apply the settings and keep them, the address is recorded in IPAM as used, with this computer's name and the adapter's MAC.
+- Narrower searches on the IP Addresses page, which now has a search row of its own under the toolbar: choose what to find (everything, subnets, addresses, used addresses or reserved addresses), which network to look in (or all of them), and which field to match: any, the address or subnet, name, description, MAC, or a detail such as Telephony Rng. Changing any of them redoes the search showing, and results have a Details column (such as Telephony Rng: 68890).
+
 ## [1.8.2] - 2026-09-29
 
 ### Fixed

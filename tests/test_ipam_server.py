@@ -1,4 +1,5 @@
 import datetime
+import ipaddress
 import json
 import threading
 
@@ -290,11 +291,11 @@ def test_waiting_laptops_hear_about_changes_at_once(server, tmp_path):
     since = watcher.status()["revision"]
 
     started = time.monotonic()
-    assert watcher.wait(since, timeout=1) == since  # Nothing changed: answers after the timeout
+    assert watcher.wait(since, timeout=1)[0] == since  # Nothing changed: answers after the timeout
     assert 0.8 < time.monotonic() - started < 5
 
     result = {}
-    thread = threading.Thread(target=lambda: result.update(revision=watcher.wait(since, timeout=20)))
+    thread = threading.Thread(target=lambda: result.update(revision=watcher.wait(since, timeout=20)[0]))
     started = time.monotonic()
     thread.start()
     time.sleep(0.3)
@@ -306,7 +307,7 @@ def test_waiting_laptops_hear_about_changes_at_once(server, tmp_path):
 
 def test_older_server_is_recognised_not_offline(server, monkeypatch):
     from nomad.ipam.client import OldServerError
-    monkeypatch.setattr(IpamServer, "wait", lambda self, since, timeout: (_ for _ in ()).throw(
+    monkeypatch.setattr(IpamServer, "wait", lambda self, *arguments: (_ for _ in ()).throw(
         RequestError(404, "No such request.")))  # A server from before instant sync
     client = TeamClient(key_for(server))
     with pytest.raises(OldServerError, match="older version"):
@@ -348,3 +349,54 @@ def test_laptops_keep_the_servers_history(server, tmp_path):
     bob.close()
     offline = offline_store(server, tmp_path, "bob")  # Still there offline
     assert len(address_history(offline, network.id, "10.0.0.5")) == 2
+
+
+def sync_sightings(laptop):
+    """What the IP Addresses page does with sweep results when it syncs."""
+    laptop.apply_sent_sightings(laptop.send_sightings(laptop.outgoing_sightings()))
+    fetched = laptop.client.fetch_sightings(laptop.sighting_revision)
+    if fetched is not None:
+        laptop.apply_sightings(*fetched)
+
+
+def test_sweep_results_are_shared_but_not_history(server, tmp_path):
+    import time
+    admin = team_store(server, tmp_path, "admin", ADMIN)
+    [network] = admin.import_networks([plan()])
+    alice = team_store(server, tmp_path, "alice")
+    bob = team_store(server, tmp_path, "bob")
+    revision = alice.revision
+    swept = time.time()
+    alice.record_sightings(network.id, [{"ip": "10.0.0.5", "seen": swept, "rtt": 2, "mac": "aa-bb", "name": "sw1"}],
+                           [{"cidr": "10.0.0.0/24", "started": swept - 5, "finished": swept + 1}])
+    assert alice.sightings(network.id)[0]  # Shown on Alice's laptop at once
+    watcher = TeamClient(key_for(server), user="carol")
+    before = watcher.status()["sightings"]
+    sync_sightings(alice)
+    assert watcher.wait(watcher.status()["revision"], 1, before)[1] > before  # Waiting laptops hear of it
+
+    sync_sightings(bob)
+    hosts, ranges = bob.sightings(network.id)
+    [(address, row)] = hosts.items()
+    assert str(address) == "10.0.0.5" and row["mac"] == "aa-bb" and row["seen_by"] == "alice (PC)"
+    assert [str(block) for block, *_ in ranges] == ["10.0.0.0/24"]
+    alice.sync()
+    assert alice.revision == revision  # Sweeps aren't changes: nothing in the history
+    assert alice.outgoing_sightings() == []
+
+    # Swept offline (in an air-gapped network): kept, and sent once the server is back
+    alice.close()
+    offline = offline_store(server, tmp_path)
+    offline.record_sightings(network.id, [{"ip": "10.0.0.6", "seen": swept + 60, "rtt": None, "mac": "", "name": ""}])
+    assert offline.send_sightings(offline.outgoing_sightings()) == []  # Can't reach the server: kept
+    offline.close()
+    alice = online_again(server, tmp_path)
+    sync_sightings(alice)
+    sync_sightings(bob)
+    assert {str(address) for address in bob.sightings(network.id)[0]} == {"10.0.0.5", "10.0.0.6"}
+
+    # An older sighting doesn't replace a newer one
+    bob.record_sightings(network.id, [{"ip": "10.0.0.5", "seen": swept - 3600, "rtt": 9, "mac": "cc", "name": ""}])
+    sync_sightings(bob)
+    sync_sightings(alice)
+    assert alice.sightings(network.id)[0][ipaddress.ip_address("10.0.0.5")]["mac"] == "aa-bb"

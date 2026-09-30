@@ -43,3 +43,48 @@ def test_selecting_each_subnet(app, tmp_path):
     assert "netmask 255.255.255.0" in shown["10.0.0.0/24"]
     assert "fd00::/64" in shown
     store.close()
+
+
+def test_search_by_network_and_kind(app, tmp_path):
+    store = IpamStore(str(tmp_path / "ipam.db"), user="tester")
+    first, second = store.add_network("First"), store.add_network("Second")
+    for network in (first, second):
+        store.add_subnet(network.id, "10.0.0.0/24", "68890 LAN")
+        store.set_address(network.id, "10.0.0.7", USED, "68890-sw1")
+    tab = IpamTab(Window())
+    tab.local_store = store
+    tab.fill_networks()
+    assert [tab.search_network_combo.itemText(index) for index in range(tab.search_network_combo.count())] ==         ["All networks", "First", "Second"]
+
+    def results():
+        return [tuple(tab.results_table.item(row, column).text() for column in (0, 1, 3))
+                for row in range(tab.results_table.rowCount())]
+
+    tab.search_input.setText("68890")
+    tab.search()
+    assert len(results()) == 4 and "in any network" in tab.results_label.text()
+    tab.search_network_combo.setCurrentIndex(tab.search_network_combo.findText("Second"))  # Searches again
+    assert sorted(results()) == [("Second", "10.0.0.0/24", ""), ("Second", "10.0.0.0/24", "10.0.0.7")]
+    tab.search_kind_combo.setCurrentIndex(tab.search_kind_combo.findText("Addresses"))
+    assert results() == [("Second", "10.0.0.0/24", "10.0.0.7")]
+    assert tab.results_label.text() == "1 result for '68890' (addresses) in Second"
+
+    # Matching one detail only, which shows in the results
+    store.add_subnet(first.id, "10.0.1.0/24", "Voice", fields={"Telephony Rng": "68890"})
+    tab.fill_networks()
+    assert tab.search_match_combo.findText("Telephony Rng") >= 0
+    tab.search_kind_combo.setCurrentIndex(0)
+    tab.search_network_combo.setCurrentIndex(0)
+    tab.search_match_combo.setCurrentIndex(tab.search_match_combo.findText("Telephony Rng"))
+    assert results() == [("First", "10.0.1.0/24", "")]
+    assert tab.results_table.item(0, 6).text() == "Telephony Rng: 68890"
+    assert tab.results_label.text() == "1 result for Telephony Rng '68890' in any network"
+    tab.search_network_combo.setCurrentIndex(tab.search_network_combo.findText("Second"))
+
+    # The chosen network stays chosen when the list of networks is refreshed, and falls back to All if it's gone
+    tab.fill_networks()
+    assert tab.search_network_combo.currentText() == "Second"
+    store.delete_network(second.id)
+    tab.fill_networks()
+    assert tab.search_network_combo.currentText() == "All networks"
+    store.close()
