@@ -1,11 +1,97 @@
 """Command buttons under the terminal sessions: saved commands (or blocks of configuration) sent with one click."""
-from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout, QLabel, \
-    QLineEdit, QMenu, QMessageBox, QPlainTextEdit, QScrollArea, QToolButton, QVBoxLayout, QWidget
+from PyQt5.QtCore import QMimeData, Qt, QTimer
+from PyQt5.QtGui import QDrag
+from PyQt5.QtWidgets import QApplication, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout, \
+    QLabel, QLineEdit, QMenu, QMessageBox, QPlainTextEdit, QScrollArea, QToolButton, QVBoxLayout, QWidget
 
 from ..terminal.commands import CommandButton
 from .common import set_hint
 from .theme import COLORS, monospace_font
+
+BUTTON_MIME = "application/x-nomad-command-button"
+
+
+class DraggableButton(QToolButton):
+    """A command button that can be dragged along the bar to change the order (and so its Ctrl+number)."""
+
+    def __init__(self, button_id):
+        super().__init__()
+        self.button_id = button_id
+        self.press_position = None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.press_position = event.pos()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.press_position is None or not event.buttons() & Qt.LeftButton or \
+                (event.pos() - self.press_position).manhattanLength() < QApplication.startDragDistance():
+            super().mouseMoveEvent(event)
+            return
+        self.press_position = None
+        self.setDown(False)  # A drag, not a click: nothing is sent
+        mime = QMimeData()
+        mime.setData(BUTTON_MIME, self.button_id.encode())
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.setPixmap(self.grab())
+        drag.setHotSpot(event.pos())
+        drag.exec_(Qt.MoveAction)
+
+
+class ButtonRow(QWidget):
+    """The row the buttons sit in: a button dropped on it goes where it's dropped."""
+
+    def __init__(self, store):
+        super().__init__()
+        self.store = store
+        self.setAcceptDrops(True)
+        self.marker = QFrame(self)  # Where a dragged button will land
+        self.marker.setStyleSheet(f"background: {COLORS['accent']};")
+        self.marker.setFixedWidth(2)
+        self.marker.hide()
+
+    def buttons(self, leaving_out=None):
+        """The buttons in the row, in order (not old ones still waiting to be deleted)."""
+        items = (self.layout().itemAt(index) for index in range(self.layout().count()))
+        return [item.widget() for item in items if isinstance(item.widget(), DraggableButton) and
+                item.widget().button_id != leaving_out]
+
+    def drop_position(self, x, button_id):
+        """Where a button dropped at x goes, counting the others (0 first)."""
+        others = sorted(self.buttons(button_id), key=lambda widget: widget.x())
+        return sum(1 for widget in others if widget.geometry().center().x() < x), others
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat(BUTTON_MIME):
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        if not event.mimeData().hasFormat(BUTTON_MIME):
+            return
+        event.acceptProposedAction()
+        button_id = bytes(event.mimeData().data(BUTTON_MIME)).decode()
+        position, others = self.drop_position(event.pos().x(), button_id)
+        if others:
+            x = others[position].x() - 3 if position < len(others) else others[-1].geometry().right() + 2
+        else:
+            x = 0
+        self.marker.setGeometry(max(0, x), 2, 2, max(4, self.height() - 4))
+        self.marker.show()
+        self.marker.raise_()
+
+    def dragLeaveEvent(self, event):
+        self.marker.hide()
+
+    def dropEvent(self, event):
+        self.marker.hide()
+        if not event.mimeData().hasFormat(BUTTON_MIME):
+            return
+        button_id = bytes(event.mimeData().data(BUTTON_MIME)).decode()
+        position, _ = self.drop_position(event.pos().x(), button_id)
+        event.acceptProposedAction()
+        QTimer.singleShot(0, lambda: self.store.move_to(button_id, position))  # After the drag has finished
 
 
 class CommandDialog(QDialog):
@@ -76,7 +162,7 @@ class CommandBar(QFrame):
         self.scroll.setFrameShape(QFrame.NoFrame)
         self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.row = QWidget()
+        self.row = ButtonRow(self.store)
         self.row_layout = QHBoxLayout(self.row)
         self.row_layout.setContentsMargins(0, 0, 0, 0)
         self.row_layout.setSpacing(4)
@@ -96,7 +182,20 @@ class CommandBar(QFrame):
                                else None)
         self.fill()
         self.setVisible(False)
-        self.setMaximumHeight(self.sizeHint().height() + 12)
+
+    def fit_height(self):
+        """Just one row of buttons tall (a scroll area's own size is far taller), with room for the scrollbar only
+        when the buttons don't fit across."""
+        row_height = max(self.row.sizeHint().height(), QToolButton().sizeHint().height())
+        crowded = self.row.sizeHint().width() > self.scroll.viewport().width()
+        bar = self.scroll.horizontalScrollBar().sizeHint().height() if crowded else 0
+        self.scroll.setFixedHeight(row_height + bar)
+        margins = self.layout().contentsMargins()
+        self.setFixedHeight(row_height + bar + margins.top() + margins.bottom() + 1)  # 1: the border on top
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.fit_height()
 
     def fill(self):
         while self.row_layout.count():
@@ -107,10 +206,12 @@ class CommandBar(QFrame):
             hint = QLabel("No command buttons yet: + Add makes one (a command, or a block of configuration).")
             hint.setStyleSheet(f"color: {COLORS['muted']};")
             self.row_layout.addWidget(hint)
-        for button in self.store.buttons:
-            widget = QToolButton()
+        for number, button in enumerate(self.store.buttons, 1):
+            widget = DraggableButton(button.id)
             widget.setText(button.name)
-            widget.setToolTip(button.text + ("" if button.press_enter else "\n(without pressing Enter)"))
+            hotkey = f"Ctrl+{number} in a session. Drag to change the order.\n\n" if number <= 9 else \
+                "Drag to change the order.\n\n"
+            widget.setToolTip(hotkey + button.text + ("" if button.press_enter else "\n(without pressing Enter)"))
             widget.setContextMenuPolicy(Qt.CustomContextMenu)
             widget.clicked.connect(lambda _, button_id=button.id: self.send(button_id))
             widget.customContextMenuRequested.connect(
@@ -118,11 +219,14 @@ class CommandBar(QFrame):
                                                                                     widget.mapToGlobal(position)))
             self.row_layout.addWidget(widget)
         self.row_layout.addStretch()
+        self.fit_height()
+        QTimer.singleShot(0, self.fit_height)  # Again once the new buttons are showing (Qt shows them just after)
 
     # ----------------------------------------------------------------- Sending
 
-    def send(self, button_id, to_all=None):
-        """Send a button's commands: to the session you're in, or to all (to_all None: all while Type in All)."""
+    def send(self, button_id, to_all=None, target=None):
+        """Send a button's commands: to the session you're in (or `target`), or to all (to_all None: all while
+        Type in All)."""
         button = self.store.get(button_id)
         if button is None:
             return
@@ -131,7 +235,7 @@ class CommandBar(QFrame):
         if to_all:
             targets = self.page.broadcast_targets(self.page.broadcast_scope, self.tabs)
         else:
-            current = self.tabs.currentWidget()
+            current = target or self.tabs.currentWidget()
             targets = [current] if current is not None and hasattr(current, "send_block") else []
         count = sum(bool(view.send_block(button.text, button.press_enter)) for view in targets)
         if not count:
@@ -157,8 +261,16 @@ class CommandBar(QFrame):
         menu.addAction("Edit...", lambda: self.edit(button))
         menu.addAction("Duplicate", lambda: self.store.put(CommandButton(f"{button.name} (copy)", button.text,
                                                                          button.press_enter)))
-        menu.addAction("Move Left", lambda: self.store.move(button_id, -1))
-        menu.addAction("Move Right", lambda: self.store.move(button_id, 1))
+        index, count = self.store.index_of(button_id), len(self.store.buttons)
+        menu.addAction("Move Left", lambda: self.store.move(button_id, -1)).setEnabled(index > 0)
+        menu.addAction("Move Right", lambda: self.store.move(button_id, 1)).setEnabled(index < count - 1)
+        positions = menu.addMenu("Move to Position")
+        positions.setEnabled(count > 1)
+        for position in range(count):
+            label = f"{position + 1}" + (f"  (Ctrl+{position + 1})" if position < 9 else "")
+            action = positions.addAction(label, lambda position=position: self.store.move_to(button_id, position))
+            action.setCheckable(True)
+            action.setChecked(position == index)
         menu.addSeparator()
         menu.addAction("Delete", lambda: self.delete(button))
         menu.exec_(global_position)

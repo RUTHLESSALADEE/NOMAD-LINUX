@@ -417,8 +417,12 @@ def parse_page(title, rows):
         if state == "summary":
             if not unit_row_seen and not _cell(row, columns[MASK]):
                 unit_row_seen = True
-                values = [value for value in row if value]
-                sheet.fields.update({label: value for label, value in zip(UNIT_FIELDS, values)})
+                # By position, from the name column: unit, location, revision date, then the revision somewhere
+                # to the right (so a blank one doesn't shift the others along)
+                cells = [_cell(row, column) for column in range(name_column, len(row))] + ["", "", ""]
+                later = [value for value in cells[3:] if value]
+                values = cells[:3] + [later[0] if later else ""]
+                sheet.fields.update({label: value for label, value in zip(UNIT_FIELDS, values) if value})
                 continue
             unit_row_seen = True
             # A row for a device (or interface) in a subnet already listed: a host list, like HSMC XLESS

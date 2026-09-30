@@ -27,7 +27,20 @@ class TerminalTab(SessionPage):
         view = SessionView(session, self.store)
         view.mirror = self.mirror_typed
         view.view.highlighter = self.highlighter()
+        view.view.hotkey = lambda number, view=view: self.press_button(view, number)
         return view
+
+    def press_button(self, view, number):
+        """Ctrl+1 to Ctrl+9 in a session: the command button with that number, whether or not the Buttons bar is
+        showing. True if sent; with no button of that number, the key goes to the device."""
+        tabs = view.parentWidget()
+        while tabs is not None and getattr(tabs, "command_bar", None) is None:
+            tabs = tabs.parentWidget()
+        bar = tabs.command_bar if tabs is not None else None
+        if bar is None or number >= len(self.commands.buttons):
+            return False
+        bar.send(self.commands.buttons[number].id, target=view)
+        return True
 
     def highlighter(self):
         return self.highlights.highlighter if self.highlights.enabled else None

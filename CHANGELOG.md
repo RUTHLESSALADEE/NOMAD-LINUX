@@ -6,6 +6,19 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.9.1] - 2026-09-30
+
+### Added
+
+- Hotkeys for command buttons: Ctrl+1 to Ctrl+9 in a session press the first nine buttons (sending to that session, or to all while Type in All is on), whether or not the Buttons bar is showing. Each button's tooltip says its key. Where there's no button with that number, Ctrl+digit goes to the device as before; with six or more buttons, use Ctrl+Shift+6 (not Ctrl+6) for Cisco's abort.
+- Rearranging command buttons: drag a button along the bar to where you want it (a marker shows where it will land), or right-click it > Move to Position, which lists each position with its hotkey. Move Left and Move Right are greyed out at the ends. A button's Ctrl+number follows its position.
+
+### Fixed
+
+- The Buttons bar on the Terminal page was far taller than its buttons. It's now one row of buttons tall (plus a scrollbar only when they don't all fit across), so it takes two lines from the sessions instead of six.
+- Terminal text jumped when the terminal got shorter: showing the Buttons bar (or Send to All, re-tiling, or making the window shorter) threw away lines from the top of the screen and left the cursor below the prompt, and hiding it again didn't bring them back. Now, as in xterm and Windows Terminal, text only moves when the prompt would otherwise go off the bottom, the lines that move go into the scrollback, and growing again brings them back exactly as they were.
+- A network exported to a workbook without a Unit or Location came back from it with its revision date as the Unit: the importer now reads the unit row by column.
+
 ## [1.9.0] - 2026-09-29
 
 ### Changed

@@ -1,78 +1,274 @@
 # NOMAD
 
-**Network Operations, Monitoring And Diagnostics**: a one stop shop to manage Network Interface Cards (NICs) and troubleshoot networks in Windows. (Formerly NIC Manager, now with the RADAR subnet sweep built in.)
+**Network Operations, Monitoring And Diagnostics**: one Windows app to set up network adapters, troubleshoot networks, talk to devices and keep track of IP addresses. (Formerly NIC Manager, with the RADAR subnet sweep and the Latenct latency monitor built in.)
 
-Pick a page from the sidebar, grouped into This Computer, Connect, Manage, Test, Discover, DNS & Web and Tools (Ctrl+Tab and Ctrl+Shift+Tab move between pages). Hide the sidebar for more room with its « button, View > Show Sidebar or Ctrl+B; a slim strip then keeps a menu of every page and a button to bring it back. Pick an adapter at the top of the window; the Interfaces, MTU, Ping, Sweep, DHCP Servers and other pages work with it. NOMAD always opens on the Interfaces page.
+![The Interfaces page](docs/screenshots/interfaces.png)
 
-Everything works without internet access: the tests only talk to the hosts you give them, and the MAC vendor list is built in (to update it, download https://standards-oui.ieee.org/oui/oui.csv and run python -m nomad.oui build oui.csv).
+- **Works offline.** Tests only talk to the hosts you give them, and the MAC vendor list is built in.
+- **One exe, nothing to install.** `NOMAD-<version>.exe` runs on its own ([build it](#running-from-source-and-building) with `build.ps1`).
+- **Safe changes.** New IP settings, and disabling an adapter, revert on their own unless you confirm within 15 seconds, so a change that cuts off your remote session undoes itself.
 
-This Computer:
-  Interfaces - shows the adapter's status, addresses, gateway, DNS servers, link speed and MAC address. Lets you switch between DHCP and a static IP (CIDR notation like 192.168.1.10/24 works), set DNS servers and MTU, and enable/disable, reset, release or renew the adapter. Free Address from IPAM fills in the next free address in a subnet you pick (starting with the one the adapter is in), with its mask and gateway, and records it in IPAM once you keep the new settings. After changing IP settings you get 15 seconds to confirm; if you don't (say the change cut off your remote session), the previous settings come back automatically. Disabling an adapter works the same way: confirm within 15 seconds, or it's enabled again. Save settings as named profiles to switch networks in one click, and import/export profiles to share them.
-  Routing Table - view, filter, sort, add, edit and delete IPv4 and IPv6 routes, including persistent routes that survive a reboot. System routes are hidden by default.
-  ARP - the ARP (IPv4) and neighbor (IPv6) tables: which MAC address answers for each IP, with the vendor of each device. Warns when one MAC answers for the gateway and other addresses (possible ARP spoofing), when an address starts answering from a different MAC (two devices sharing an IP), and when Windows reports that another device is using this computer's address. Delete an entry or clear the whole cache (like arp -d *). Its IPAM column compares each device with IPAM, as on the Sweep page, with the same Record Not in IPAM button and right-click actions.
-  Connections - every TCP connection and listening TCP/UDP port with the program that owns it, like netstat -ano. Filter by port, address or program to see what's using a port; optionally refresh every 2 seconds.
-  Network Reset - fixes for a damaged network stack: flush the DNS cache, clear the ARP cache, renew every DHCP lease, reset Winsock and reset TCP/IP (the resets ask first and offer to restart the computer), and open Windows' own full network reset. Also shows this user's proxy and the machine-wide WinHTTP proxy used by Windows services, with one click to turn a leftover proxy off (and Undo) or reset the WinHTTP proxy.
+Screenshots use made-up demo data.
 
-Connect:
-  Terminal - an SSH, Telnet, serial and raw TCP client in the style of MobaXterm and SecureCRT. Save sessions in folders (File > Import Sessions brings them in from PuTTY in one click, or from a SecureCRT XML export with their saved passwords), drag sessions and folders to rearrange them (or right-click > Move to...), reconnect to any of the last 10 connections from Recent at the top of the session list (right-click one to save it), open them in tabs, and pop any tab out into its own window (right-click the tab). Send to All (beside the tabs) sends a command to every connected session at once (or just those on screen, or in one window), and Type in All mirrors typing into all of them; right-click a tab > Leave Out of Send to All to skip one. Ctrl+C in the Send to All box interrupts every session, and its Keys menu sends Ctrl+Z, Ctrl+Shift+6, Space and more to all. Buttons (beside the tabs) shows command buttons: saved commands or blocks of configuration sent with one click (right-click a button to send it to all, edit or delete it). Each session can have a line delay for pasting into slow consoles, reconnect automatically when a device reloads, and send anti-idle keystrokes so exec-timeout doesn't log you out (session settings > Sending and Staying Connected). Keywords such as down, err-disabled, % Invalid and up, and IP and MAC addresses, are highlighted in colour (View > Terminal Keyword Highlighting to change them). Layout (beside the tabs) shows several sessions at once: two or three side by side or stacked, or a 2 × 2 or 3 × 2 grid, with the splitters between them draggable. Each pane has its own tabs: drag a tab onto another pane (or right-click it > Move to) to move the session there, even into another window. Open Session in an empty pane, or Sessions in a pop-out window, opens a saved or recent session (or Quick Connect) right there. Click in a pane to make it the active one (outlined in green); new sessions open in an empty pane, or else the active one. View > Terminal Layout does the same. Pop-out windows can be tiled too, and NOMAD remembers the Terminal page's layout. Quick connect takes admin@10.0.0.1, telnet 10.0.0.5, raw 10.0.0.9:9100 or COM3:115200. For more room, « beside the tabs hides the session list (Sessions ▾ then lists your saved sessions), and F11 (Focus mode) hides everything but the sessions; F11 in a pop-out window makes it full screen. Select text to copy it and right-click to paste; Ctrl+Shift+F finds text in the scrollback, Shift+PgUp scrolls back and Ctrl+mouse wheel zooms. Keys like Ctrl+B, Ctrl+R and F5 go to the device, not to NOMAD. SSH logs in with a password, a private key (OpenSSH format) or Pageant/SSH agent; saved passwords and key passphrases are encrypted for your Windows account (DPAPI), so they can't be read on another computer or account. For more protection, set a master password (click the master password status under the Terminal page's session list, or Tools > Saved Password Protection): saved passwords are then also encrypted with AES-256 using a key made from it (scrypt), so reading them needs both your Windows account and the master password. NOMAD asks for it once when a saved password is first needed, and can lock again after 15 minutes, 1 hour or 4 hours unused. A forgotten master password can't be recovered; Forget All Saved Passwords starts over (sessions are kept). NOMAD remembers each device's host key and warns if it changes. Older switches that only support SHA-1 SSH algorithms still connect (with a note suggesting a firmware update). Serial sessions list the COM ports present and can send a break (for Cisco ROMMON password recovery). Sessions can log everything to a text file. Sweep and Ports open SSH and Telnet sessions here.
+## Contents
 
-  SCP - a WinSCP-style file manager for SSH servers, using the Terminal page's saved sessions (just the SSH ones). Your computer is on the left and the server on the right: drag files between them (or from Windows Explorer), or select them and press F5 (or Upload ▶ / ◀ Download under the panes). F4 edits a remote file in NOMAD's editor (Ctrl+S saves it to the server) and Edit With opens it in another program, uploading each save; F2 renames, F7 makes a folder, F8 deletes and Alt+Enter shows properties: permissions (chmod) and owner (chown). Right-click the tab > Work as Root (sudo) to browse, copy and edit as root. Transfers queue up underneath with progress and speed, can be paused and resumed (SFTP picks up where it stopped, even after a dropped connection), and can be checked with SHA-256 afterwards; Checksum... shows a remote file's hash to compare with a vendor's. Synchronize compares a local and a remote folder and copies the differences you pick, one way or both. SFTP is used where the server has it; otherwise NOMAD falls back to SCP (browsing with ls). A session's File transfer setting can force SFTP or SCP.
+- [Getting around](#getting-around)
+- [Pages](#pages)
+- [Terminal and SCP](#terminal-and-scp)
+- [IP address management (IPAM)](#ip-address-management-ipam)
+- [Sharing IPAM with the tribe](#sharing-ipam-with-the-tribe)
+- [Good to know](#good-to-know)
+- [Running from source and building](#running-from-source-and-building)
 
-Manage:
-  IP Addresses - IP address management (IPAM) for several separate networks, such as air-gapped ones, which may reuse the same ranges. Pick a network to see its subnets as a tree (blocks hold the subnets inside them) with how much of each is used; select one to see every address in it as used, reserved, free, or the network, broadcast or gateway address, and record or free addresses. Use Next Free records the lowest free address; Sweep Subnet (also on a subnet's right-click menu) sweeps it right there, with the Sweep page's settings: the Last Seen column fills in as devices answer (answered, with its response time, or no answer, with when it last answered; red where IPAM records the address as used but nothing answered, amber where something answered that IPAM doesn't have), the host names and MAC addresses found show beside addresses IPAM doesn't have (and stay listed even with Hide free addresses), and Record Answering Devices and Update MACs save the results to IPAM (or right-click an address for Record from Sweep or Update MAC from Sweep). Sweep results are kept (on the IPAM server for tribe networks, so everyone sees when each address last answered and who swept it; sweeps made offline are sent when the server is back), and never clutter the history; Search (the row under the toolbar) finds an address, name or subnet in every network; the choices beside it narrow it to subnets, addresses, or used or reserved addresses, to one network, and to one field: the address or subnet, name, description, MAC, or a detail such as Telephony Rng (so 68890 finds the subnets whose Telephony Rng is 68890, not those that merely have it in their name). Results show each subnet's details. Import Spreadsheet reads the team's addressing workbooks (.xlsx, where every page becomes a network, or a .csv of one page): where the summary at the top of a page and its Detailed Info disagree, you choose which to keep; where a gateway isn't in its subnet, a likely one is suggested for you to accept or change; and rows that can't be used are listed with their row numbers. The window can be maximized or made full screen (F11). An address written with a mask stands for the subnet holding it (172.28.101.0/16 is 172.28.0.0/16), and a summary row for an address inside a subnet already listed is recorded as that address. Loopbacks listed with the mask 255.255.255.255 are imported as a loopback subnet named as the sheet names them (such as 68900 MAIN TCN Loopback): every address in it is a /32 of its own, so it has no network, broadcast or gateway address, even where a row says Network or Broadcast. Tick Loopbacks in a subnet's settings to make any subnet one. SNMP strings in the workbook are never imported. Export a network to CSV from the Network menu, or to Workbook (.xlsx) in the same layout as the tribe's addressing workbooks (summary, Unit Base Info and Detailed Info), a network or every network at once: it imports back as it went out. Network > Check Data lists likely mistakes (a name whose number doesn't match its Telephony Rng, a name like a stray user name, a subnet named Loopback that isn't marked Loopbacks, a device recorded on a network or broadcast address, addresses outside every subnet, the same MAC on two addresses, and more); double-click one to go to it. Network > Compare with Workbook compares a network with a page of a newer workbook and lists every difference to tick and apply, instead of importing it again: what was changed or deleted in NOMAD since the import, and what only IPAM has, is left unticked. Right-click a subnet > Find Free Blocks shows the unused space in it (largest first, or every free /28, say) to add new subnets in. Select several addresses (or Ctrl-click several subnets) to change them together: status, description, or a detail such as Telephony Rng, or Loopbacks. Every change records who made it and when, and History shows it: right-click an address or subnet (History...), or Network > Network History for every change in the network over the last day, week, month or all time, each with who made it and what changed ("Name: sw1 → sw1-core; Status: Used → Reserved"). An address's history carries on across each time it was freed and recorded again. Network > View As Of shows the whole network as it was at any moment (read-only, until Back to Now). Laptops keep a copy of the IPAM server's history, so this works offline too. Networks are either Local (kept on this computer, in %APPDATA%\NOMAD\ipam.db) or Tribe (shared by the tribe's IPAM server, below). Tribe > Connect with Tribe Key File connects a laptop to the server: it keeps a copy of the tribe's networks, so they can be looked up offline, and syncs the moment anyone changes anything (as well as when NOMAD starts, every 5 minutes as a fallback, and on Tribe > Sync Now). Beside the Tribe button is the server's name and whether it's connected or offline (hover over it for its address and the last problem, if any). While the server can be reached, changes to tribe networks go straight to it, and it refuses a change if someone else got there first (such as taking the same address), saying who; while it can't, you can still assign, edit and free addresses in tribe networks: each change is kept as pending (shown as "· pending" in blue) and sent in the order made as soon as the server is back, even after restarting NOMAD. If someone else changed that address in the meantime, the server keeps theirs and Review Refused Changes (beside the Tribe button) lists yours, to record at the next free address in the subnet instead or discard. Subnets and networks can only be changed online. The line under the toolbar says when the copy last synced. Import Spreadsheet on a laptop (Import Locally (Not Shared)) imports to that computer only: the tribe won't see those networks, as only the IPAM server itself imports tribe networks.
+## Getting around
 
-IPAM server: the tribe's shared IPAM runs on one always-on Windows machine as the NOMAD IPAM Server service. On that machine, run NOMAD as administrator and open Tools > IPAM Server, then Install Service: it sets up %ProgramData%\NOMAD\server (the database, a self-signed certificate, the tribe key and nightly backups kept for 14 days, readable only by Administrators and the service), copies NOMAD to %ProgramFiles%\NOMAD, installs and starts the service (it starts with Windows and restarts if it fails), and opens TCP port 8443 in Windows Firewall. Save Tribe Key File makes the file laptops connect with; give it only to the tribe, as anyone with it can change the tribe's IPAM, and Change Tribe Key locks out every old copy. Then, still as administrator on the server, the IP Addresses page manages the server's data directly (Server admin): Import Spreadsheet goes to the server, and only there can tribe networks be added or deleted. After updating NOMAD, use Update Service in the same window. To run the server in a console for troubleshooting instead, stop the service and run NOMAD.exe --ipam-server; its log is %ProgramData%\NOMAD\server\server.log.
+- Pick a page from the **sidebar** (Ctrl+Tab and Ctrl+Shift+Tab move between pages). Hide it with **«**, View > Show Sidebar or Ctrl+B.
+- Pick an **adapter** at the top of the window. Interfaces, MTU, Ping, Sweep, DHCP Servers and other pages work with it.
+- **F11** (focus mode) hides everything but the current page.
+- **View > Text Size** scales all text from 90% to 200% (Ctrl+= and Ctrl+- too, and Ctrl+0 to reset).
 
-Test:
-  Ping - ping a host with a running summary (loss, min/avg/max). Quick buttons ping the adapter's gateway or DNS server.
-  Latency - monitors several hosts at once (Google and Cloudflare DNS to start; add your gateway with one click), with a gauge per host, a graph of latency over time with lost pings marked in red, and last/average/min/max/loss for each. Switch hosts on and off while it runs, view the last minute up to the last 8 hours, and optionally log every ping to CSV. Compact shows just the gauges and graph. (This replaces the separate Latenct tool.)
-  Traceroute - shows each router on the way to a host, with loss, last/average/best/worst latency and jitter (standard deviation) for each hop, like MTR / WinMTR. Every hop is probed at once, so a trace takes seconds. Run a set number of probes per hop, or keep it running to watch a problem develop; Copy Report gives a text table to send to an ISP.
-  MTU - finds the largest MTU that reaches a remote host without fragmenting, from the selected adapter, and applies it with one click.
-  Ports - checks whether TCP ports on a host are open, closed (refused) or filtered (no answer, usually a firewall), with presets for common, web, remote access and file sharing ports, or any list and ranges up to all 65535. Open ports can be opened in the browser, Remote Desktop or PuTTY from the results.
-  iperf - measures bandwidth (TCP or UDP, upload or download, parallel streams) with a built-in iperf3-compatible client and server, so no iperf3 download is needed. Test against any iperf3 server, or switch to server mode and run iperf3 -c <this computer> (or another copy of NOMAD) elsewhere. Open Firewall Port adds the Windows Firewall rule server mode needs.
+## Pages
 
-Discover:
-  Sweep - finds every host on an IPv4 subnet that answers ping (hosts that miss are retried, 3 tries in all). On subnets this computer is directly connected to it also uses ARP, which finds devices whose firewall drops ping, and shows each host's MAC address and vendor. Host names come from DNS, or from NetBIOS on networks without a DNS server. One click fills in the selected adapter's subnet. From the results, open an SSH session in PuTTY, open the host's web page, ping, trace, scan ports or monitor its latency; copy the addresses or export them (with names, MACs and vendors) to CSV. Compare with IPAM picks the IPAM network the subnet belongs to (the one holding the most of the hosts found; pick another if the same range is in several separate networks) and fills the IPAM column: in IPAM with its name, not in IPAM, a different MAC address than IPAM records, or reserved in IPAM but answering. Record Not in IPAM records every missing host in one go (with its name and MAC), Recorded but Silent lists the addresses IPAM records as used that didn't answer a full sweep, and right-clicking a host records it, updates its MAC or shows it on the IP Addresses page. Tools > Add PuTTY to PATH and Tools > Default Browser Settings help set up those actions. (This replaces the separate RADAR tool.)
-  Switch Port - shows which switch, port and VLAN (and voice VLAN) the computer is plugged into, from the LLDP and CDP announcements managed switches send every 30-60 seconds, along with the switch's model, management address and software. Uses Windows' built-in packet monitor (pktmon), so nothing needs installing, but it needs administrator rights.
-  DHCP Servers - asks the selected adapter's network for a DHCP offer and lists every server that answers, with the address, gateway, DNS servers and lease each one offers. Select a server to see every option in its offer, named and decoded (NTP and WINS servers, static routes, domain search list, TFTP and boot servers for PXE and IP phones, vendor data and anything else it sends), and copy them as text. Any server other than the one this adapter's lease came from is flagged as a possible rogue DHCP server (such as a home router plugged in the wrong way round). Only a request is sent: no address is taken.
-  SNMP - reads switches, routers, printers and UPSes over SNMP v1/v2c with a community string: walk any part of the MIB (presets for system details, interfaces, IP and ARP tables, MAC address tables, LLDP neighbors and hardware serial numbers) or get one value, with names for common OIDs. Interface Summary gives one row per port with its name, description, status, speed and error counters. Copy or export to CSV. (SNMPv3 isn't supported yet.)
+### This Computer
 
-DNS & Web:
-  DNS Lookup - look up A, AAAA, MX, TXT and other records, optionally against a specific DNS server.
-  DNS Servers - Times how fast each DNS server answers (the adapter's, the gateway, well-known public servers and any you add; remove any you don't want with Remove Selected or the Delete key, and Restore Removed brings them back), asking each directly so Windows' cache doesn't skew the result, and checks that a name's addresses have PTR records pointing back to it.
-  Web Check - Fetches a page and shows how long DNS, connecting, the TLS handshake and the first byte took, the certificate (who issued it, the names it covers, days until it expires, and why it isn't trusted if it isn't) and the reply, following redirects.
+| Page | Function |
+| --- | --- |
+| **Interfaces** | The adapter's status, addresses, gateway, DNS, speed and MAC. Switch between DHCP and a static IP (CIDR like `192.168.1.10/24` works), set DNS and MTU, and enable, disable, reset, release or renew. **Free Address from IPAM** fills in the next free address in a subnet you pick. Save settings as **profiles** to switch networks in one click. |
+| **Routing Table** | View, filter, add, edit and delete IPv4 and IPv6 routes, persistent ones included. Type an address in the filter to see which route Windows would use for it. |
+| **ARP** | Which MAC answers for each IP, with vendors. Warns about possible ARP spoofing and address conflicts. |
+| **Connections** | Every TCP connection and listening port with the program that owns it, like `netstat -ano`. |
+| **Network Reset** | Flush DNS, clear ARP, renew DHCP, reset Winsock and TCP/IP, and turn off a leftover proxy. |
 
-Tools:
-  Packet Capture - captures traffic on every adapter with Windows' built-in packet monitor (pktmon) and saves a pcapng file that opens in Wireshark, optionally filtered by address, port and protocol, with a size limit and an automatic stop time. Needs administrator rights; nothing to install.
-  Syslog - receives syslog messages (UDP, and optionally TCP) from switches, firewalls and access points, understands both the BSD and RFC 5424 formats, colours them by severity, and filters by severity or text. Save them, or write everything to a log file as it arrives. Open Firewall Port adds the Windows Firewall rule.
-  TFTP - a TFTP server for firmware and config transfers (serve a folder; optionally accept uploads, such as config backups, without replacing existing files), with a live list of transfers, and a TFTP client to download from or upload to another server. Supports large blocks for speed, and falls back to the basic protocol for old devices.
-  Subnet Calculator - network, netmask, broadcast, host range and counts for IPv4 and IPv6, and splitting a network into smaller subnets by prefix or by hosts needed.
-  Wake-on-LAN - wake a computer by its MAC address, save devices you wake often, or pick one from the Sweep or ARP page.
+![The Routing Table page](docs/screenshots/routing.png)
 
-The program starts without administrator rights, so viewing, ping, latency monitoring, traceroute, port scans, sweeps and lookups work straight away. Changing settings needs administrator rights; NOMAD offers to restart itself as administrator when you first try (switch discovery, packet capture and the network resets need it too) (or use File > Restart as Administrator).
+### Connect
 
-Diagnostics report: Tools > Run Diagnostics Report (Ctrl+R) checks the selected adapter's settings, the gateway, DNS, internet access, the route to the internet, the path MTU and the ARP table in about half a minute, then saves the findings as a web page to email or attach to a ticket. On a network without internet access it says so rather than reporting a fault.
+| Page | What it does |
+| --- | --- |
+| **Terminal** | SSH, Telnet, serial and raw TCP sessions in tabs, tiles and pop-out windows. [More below.](#terminal-and-scp) |
+| **SCP** | A WinSCP-style file manager for SSH servers. [More below.](#terminal-and-scp) |
 
-Text size: View > Text Size makes all text from 90% to 200% of normal, and NOMAD remembers the choice. Ctrl+= and Ctrl+- also change it, and Ctrl+0 goes back to the default.
+### Manage
 
-Shortcuts: F5 refreshes, Ctrl+Tab / Ctrl+Shift+Tab move between pages, Ctrl+B hides or shows the sidebar, F11 switches focus mode on and off, Ctrl+R runs a diagnostics report, Ctrl+F filters the routing table, Delete removes the selected route, Ctrl+= / Ctrl+- / Ctrl+0 change the text size.
+| Page | Functions |
+| --- | --- |
+| **IP Addresses** | IP address management for several separate networks, shared with the tribe through an IPAM server and usable offline. [More below.](#ip-address-management-ipam) |
 
-Terminal sessions are saved in %APPDATA%\NOMAD\sessions.json and known SSH host keys in %APPDATA%\NOMAD\known_hosts.
+### Test
 
-Logs are written to %LOCALAPPDATA%\NOMAD\nomad.log (Tools > View Log). Profiles are saved in %APPDATA%\NOMAD\profiles.json. The first time NOMAD runs it moves over the folders and settings from NIC Manager.
+| Page | Functions |
+| --- | --- |
+| **Ping** | Ping with a running summary; quick buttons for the gateway and DNS server. |
+| **Latency** | Watches several hosts at once, with gauges, a graph over time (lost pings in red) and optional CSV logging. |
+| **Traceroute** | Loss, latency and jitter for every hop, like MTR/WinMTR. Every hop is probed at once, so a trace takes seconds. |
+| **MTU** | Finds the largest MTU that reaches a host without fragmenting, and applies it. |
+| **Ports** | Open, closed or filtered, for common port presets or any list and range. |
+| **iperf** | Bandwidth tests with a built-in iperf3-compatible client and server. |
 
-Running from source:
+### Discover
+
+| Page | Functions |
+| --- | --- |
+| **Sweep** | Finds every host on a subnet (ping, plus ARP on local subnets), with names, MACs and vendors. **Compare with IPAM** shows which hosts IPAM has, is missing or records with a different MAC. |
+| **Switch Port** | Which switch, port and VLAN you're plugged into, from LLDP and CDP. |
+| **DHCP Servers** | Every DHCP server that answers, with each option it offers decoded, and warns about rogue servers. Nothing is leased. |
+| **SNMP** | Walk or get over SNMP v1/v2c, with presets and a per-port interface summary. |
+
+### DNS & Web
+
+| Page | Functions |
+| --- | --- |
+| **DNS Lookup** | A, AAAA, MX, TXT and other records, from any DNS server. |
+| **DNS Servers** | Times how fast each DNS server answers, and checks reverse (PTR) records. |
+| **Web Check** | DNS, connect, TLS and first-byte timings, the certificate, and redirects. |
+
+### Tools
+
+| Page | Functions |
+| --- | --- |
+| **Packet Capture** | Captures to a pcapng file for Wireshark with Windows' built-in pktmon. Nothing to install. |
+| **Syslog** | Receives syslog from network devices, coloured by severity and filterable. |
+| **TFTP** | A TFTP server and client for firmware and config transfers. |
+| **Subnet Calculator** | Network, mask, host range and counts for IPv4 and IPv6, and splitting a network into smaller subnets. |
+| **Wake-on-LAN** | Wake a computer by its MAC, and save the ones you wake often. |
+
+![The Subnet Calculator](docs/screenshots/subnet-calculator.png)
+
+## Terminal and SCP
+
+![Two sessions side by side on the Terminal page](docs/screenshots/terminal.png)
+
+**Sessions**
+
+- Save sessions in folders, and import them from PuTTY or a SecureCRT export.
+- **Quick connect** takes `admin@10.0.0.1`, `telnet 10.0.0.5`, `raw 10.0.0.9:9100` or `COM3:115200`.
+- **Recent** at the top of the list keeps your last 10 connections.
+- **Layout** tiles sessions side by side, stacked, or in a 2 × 2 or 3 × 2 grid. Drag tabs between panes and windows.
+- Pop any tab out into its own window (right-click the tab).
+
+**Working with many devices**
+
+- **Send to All** sends a command (or Ctrl+C, Ctrl+Z, Ctrl+Shift+6...) to every session, and **Type in All** mirrors your typing.
+- **Command buttons** send saved commands or blocks of configuration with one click, or with Ctrl+1 to Ctrl+9 (even with the Buttons bar hidden). Drag a button, or right-click it > Move to Position, to change the order and so its hotkey.
+- **Keyword highlighting** colours down, err-disabled, % Invalid, up, and IP and MAC addresses. Change the rules in View > Terminal Keyword Highlighting.
+
+**Staying connected**
+
+- A per-session **line delay** keeps slow consoles from dropping pasted text.
+- **Reconnect automatically** when a device reloads.
+- **Anti-idle** keystrokes keep exec-timeout from logging you out.
+
+**Security**
+
+- SSH logs in with a password, an OpenSSH private key, or Pageant/SSH agent.
+- Saved passwords are encrypted for your Windows account (DPAPI). Add a **master password** (AES-256) for more protection.
+- Host keys are remembered, and NOMAD warns if one changes.
+- Older switches that only speak SHA-1 SSH algorithms still connect.
+
+**Serial**
+
+- Serial sessions list the COM ports present, and can send a break (for Cisco ROMMON).
+
+**Keys**
+
+- Ctrl+Shift+F finds text, Shift+PgUp scrolls back, and Ctrl+mouse wheel zooms.
+- Keys like Ctrl+B and F5 go to the device, not to NOMAD.
+
+**SCP** is a WinSCP-style file manager using the same saved sessions:
+
+- Drag files between your computer and the server, or press F5.
+- F4 edits a remote file in place; F2 renames, F7 makes a folder, F8 deletes.
+- Change permissions and owners (chmod and chown).
+- **Work as Root** (sudo) browses, copies and edits as root.
+- Transfers queue with progress, can be paused and resumed, and can be checked with SHA-256.
+- **Synchronize** compares a local and a remote folder and copies the differences.
+
+## IP address management (IPAM)
+
+The **IP Addresses** page keeps track of addresses for several separate networks, such as air-gapped ones that reuse the same ranges.
+
+![The IP Addresses page](docs/screenshots/ip-addresses.png)
+
+**Everyday use**
+
+- **Subnets as a tree** (blocks hold the subnets inside them), each with how much is used.
+- **Every address** in a subnet as used, reserved or free, or as its network, broadcast or gateway address.
+- **Use Next Free** records the lowest free address.
+- **Loopback subnets:** every address is its own /32, with no network, broadcast or gateway address.
+- **Select several** addresses or subnets to change them together.
+- **Find Free Blocks** (right-click a subnet) shows the unused space in it, ready to add new subnets in.
+
+**Sweeps and Last Seen**
+
+- **Sweep Subnet** pings every address in place. **Last Seen** shows when each address last answered:
+  - red where IPAM says used but nothing answered;
+  - amber where something answered that IPAM doesn't have.
+- **Record Answering Devices** and **Update MACs** save what a sweep found.
+- Sweep results are kept, and shared through the IPAM server with who swept, including sweeps made offline.
+
+**Search**
+
+Search every network, or narrow it to subnets, addresses, one network, or one field (such as a name, a MAC, or a detail column from your workbook).
+
+![Searching one detail column](docs/screenshots/ipam-search.png)
+
+**Workbooks**
+
+- **Import Spreadsheet** reads your addressing workbook (`.xlsx`, a network per page, or a `.csv` of one page).
+  - Where a page's summary and its detailed listing disagree, you choose which to keep.
+  - Impossible gateways get a suggested fix.
+  - Unusable rows are listed by row number.
+  - SNMP strings are never imported.
+- **Export to Workbook** writes networks back in the same layout, and it imports back unchanged. **Export to CSV** is there too.
+- **Compare with Workbook** lists every difference from a newer copy of the workbook to tick and apply, instead of importing it again. Edits made in NOMAD since the import are left unticked.
+
+![Compare with Workbook](docs/screenshots/compare-workbook.png)
+
+**Checking and history**
+
+- **Check Data** lists likely mistakes, most serious first. Double-click one to go to it. It looks for:
+  - a device on a network or broadcast address;
+  - addresses outside every subnet;
+  - names that look like a stray note;
+  - "Loopback" subnets not marked as loopbacks;
+  - duplicate MACs, and more.
+- **History** shows every change with who made it and when: an address, a subnet, or the whole network.
+- **View As Of** shows a network as it was at any moment.
+
+![Check Data](docs/screenshots/check-data.png)
+
+**On the Interfaces page**, **Free Address from IPAM** fills in the next free address, mask and gateway. It records the address in IPAM once you keep the new settings.
+
+## Sharing IPAM with the tribe
+
+Networks are either **Local** (on this computer) or **Tribe** (shared by an IPAM server on one always-on Windows machine).
+
+**Setting up the server**
+
+1. On the server machine, run NOMAD as administrator and open **Tools > IPAM Server**.
+2. Click **Install Service**. It sets up the database, a certificate and nightly backups (kept 14 days) in `%ProgramData%\NOMAD\server`, installs the NOMAD IPAM Server service, and opens TCP port 8443.
+3. **Save Tribe Key File** and give it only to the tribe: anyone with it can change the tribe's IPAM. **Change Tribe Key** locks out every old copy.
+4. After updating NOMAD, click **Update Service** in the same window.
+
+Spreadsheets are imported, and tribe networks added or deleted, only in NOMAD on the server itself (running as administrator).
+
+**On each laptop**
+
+1. **Tribe > Connect with Tribe Key File.**
+2. The laptop keeps a copy of the tribe's networks and history, so lookups work offline.
+3. It syncs the moment anyone changes anything.
+
+**Offline and conflicts**
+
+- **Offline**, you can still assign, edit and free addresses. Changes wait as *pending* and are sent in order when the server is back.
+- If someone else changed the same address first, **Review Refused Changes** lets you take the next free address instead, or discard yours.
+- Subnets and networks can only be changed online.
+
+**Troubleshooting:** stop the service and run `NOMAD.exe --ipam-server` to run the server in a console. Its log is `%ProgramData%\NOMAD\server\server.log`.
+
+## Good to know
+
+- **Administrator rights:** NOMAD starts without them, so viewing and testing work straight away. When a change needs them, it offers to restart as administrator (or use File > Restart as Administrator).
+- **Diagnostics report:** Tools > Run Diagnostics Report (Ctrl+R) checks the adapter, gateway, DNS, internet access, route, path MTU and ARP table in about half a minute. It saves the findings as a web page to attach to a ticket.
+- **Updating the MAC vendor list:** download https://standards-oui.ieee.org/oui/oui.csv and run `python -m nomad.oui build oui.csv`.
+
+**Shortcuts**
+
+| Keys | Does |
+| --- | --- |
+| F5 | Refresh |
+| Ctrl+Tab / Ctrl+Shift+Tab | Next / previous page |
+| Ctrl+B | Hide or show the sidebar |
+| F11 | Focus mode |
+| Ctrl+R | Diagnostics report |
+| Ctrl+F | Filter the routing table |
+| Ctrl+1 to Ctrl+9 | The first nine command buttons (in a Terminal session) |
+| Ctrl+= / Ctrl+- / Ctrl+0 | Text size |
+
+**Where things are kept**
+
+| What | Where |
+| --- | --- |
+| Terminal sessions and SSH host keys | `%APPDATA%\NOMAD\sessions.json`, `known_hosts` |
+| Profiles | `%APPDATA%\NOMAD\profiles.json` |
+| Local IPAM networks | `%APPDATA%\NOMAD\ipam.db` |
+| Log (Tools > View Log) | `%LOCALAPPDATA%\NOMAD\nomad.log` |
+| IPAM server | `%ProgramData%\NOMAD\server` |
+
+The first time NOMAD runs, it moves over the folders and settings from NIC Manager.
+
+## Running from source and building
 
     pip install -r requirements.txt
     pythonw Main.py
 
-Running the tests and building a standalone exe (dist\NOMAD-<version>.exe, e.g. dist\NOMAD-1.0.0.exe):
+Tests, and a standalone exe (`dist\NOMAD-<version>.exe`):
 
     pip install -r requirements-dev.txt
     python -m pytest
     .\build.ps1
 
-Versions and releases: the version is set in nomad\__init__.py and shows in the title bar, Help > About, the log, the exe's file name and its Properties > Details. Note changes under Unreleased in CHANGELOG.md as you go, then release with:
+**Releases:** the version lives in `nomad\__init__.py`. Note changes under Unreleased in `CHANGELOG.md` as you go, then:
 
     python -m nomad.version bump patch     (or minor / major)
     git add -A
@@ -80,20 +276,8 @@ Versions and releases: the version is set in nomad\__init__.py and shows in the 
     git tag vX.Y.Z
     .\build.ps1
 
-Screenshots below are from an earlier version, before the sidebar.
+## Third-party software
 
-NIC Tab:
-
-![image](https://github.com/user-attachments/assets/e37cd314-97d2-4cba-8dd0-3faa197ae232)
-
-Routing Table Tab:
-
-![image](https://github.com/user-attachments/assets/ce43098e-7e4b-420a-afb9-679cb0687f4b)
-
-MTU Tab:
-
-![image](https://github.com/user-attachments/assets/d9809bb0-f1e3-4d29-86b7-0aec12695b8b)
-
-Third-party software: NOMAD uses PyQt5 (GPL), paramiko (LGPL 2.1) for SSH, pyte (LGPL 3) for terminal emulation and pyserial (BSD) for serial ports, all bundled in the exe.
+NOMAD bundles PyQt5 (GPL), paramiko (LGPL 2.1) for SSH, pyte (LGPL 3) for terminal emulation, pyserial (BSD) for serial ports, openpyxl (MIT) for workbooks, and pywin32 (PSF) for the IPAM server service.
 
 Happy troubleshooting!

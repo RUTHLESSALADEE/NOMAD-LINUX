@@ -75,12 +75,21 @@ class CommandStore:
         self.buttons = [button for button in self.buttons if button.id != button_id]
         self.save()
 
+    def index_of(self, button_id):
+        return next((index for index, button in enumerate(self.buttons) if button.id == button_id), None)
+
     def move(self, button_id, step):
         """Move a button left (-1) or right (+1)."""
-        index = next((index for index, button in enumerate(self.buttons) if button.id == button_id), None)
+        index = self.index_of(button_id)
+        if index is not None:
+            self.move_to(button_id, index + step)
+
+    def move_to(self, button_id, position):
+        """Put a button at a position (0 first), shifting the others along; its Ctrl+number follows."""
+        index = self.index_of(button_id)
         if index is None:
             return
-        target = max(0, min(len(self.buttons) - 1, index + step))
+        target = max(0, min(len(self.buttons) - 1, position))
         if target != index:
             self.buttons.insert(target, self.buttons.pop(index))
             self.save()
