@@ -90,7 +90,8 @@ class Device:
 
     def route(self, destination, mask, next_hop, if_index, kind=4, protocol=3):
         """An ipCidrRouteTable row: kind 3 is connected, 4 remote; protocol 2 is connected, 3 static, 13 OSPF."""
-        index = tuple(int(part) for part in f"{destination}.{mask}".split(".")) + (0,) +             tuple(int(part) for part in next_hop.split("."))
+        index = tuple(int(part) for part in f"{destination}.{mask}".split(".")) + (0,)
+        index += tuple(int(part) for part in next_hop.split("."))
         self.set(collect.CIDR_ROUTE_ENTRY, 5, index, number(if_index))
         self.set(collect.CIDR_ROUTE_ENTRY, 6, index, number(kind))
         self.set(collect.CIDR_ROUTE_ENTRY, 7, index, number(protocol))
@@ -109,6 +110,13 @@ class Device:
         self.set(collect.FDB_ENTRY, 2, index, number(bridge_port), mib=mib)
         self.set(collect.FDB_ENTRY, 3, index, number(status), mib=mib)
         self.set(collect.BASE_PORT_IFINDEX, bridge_port, number(if_index), mib=mib)
+
+    def learned_by_vlan(self, mac, bridge_port, if_index, vlan, status=3):
+        """A Q-BRIDGE-MIB dot1qTpFdbTable entry, as NX-OS has."""
+        index = (vlan,) + tuple(mac_bytes(mac))
+        self.set(collect.Q_FDB_ENTRY, 2, index, number(bridge_port))
+        self.set(collect.Q_FDB_ENTRY, 3, index, number(status))
+        self.set(collect.BASE_PORT_IFINDEX, bridge_port, number(if_index))
 
     def lag(self, member, parent):
         self.set(collect.IF_STACK_STATUS, parent, member, number(1))
@@ -259,9 +267,9 @@ def build_network():
     acc2.vlan(1)
     acc2.vlan(10)
     for position, mac in enumerate(LAB_MACS):
-        acc2.learned(mac, 10, 10)
-    acc2.learned(CORE_MAC, 1, 1)
-    acc2.learned(FW_MAC, 100, 11)  # The firewall's MAC, on a port-channel member: makes port-channel1 an uplink
+        acc2.learned_by_vlan(mac, 10, 10, 30 if position % 2 else 31)
+    acc2.learned_by_vlan(CORE_MAC, 1, 1, 1)
+    acc2.learned_by_vlan(FW_MAC, 100, 11, 1)  # The firewall's MAC on a port-channel member: port-channel1 is an uplink
 
     network.pingable.add("10.0.0.254")  # rtr1: no SNMP for us
     network.pingable.add("10.0.0.253")

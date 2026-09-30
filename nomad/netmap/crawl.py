@@ -5,23 +5,26 @@ don't answer SNMP are pinged, so the map can tell "wrong community or ACL" from 
 tables (per VLAN on Cisco IOS, where each VLAN has its own table) and routers' ARP tables put hosts on the edge
 ports they're plugged into.
 """
+import copy
 import datetime
 import ipaddress
 import logging
 import re
+import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 
 from ..oui import format_mac, vendor
 from ..snmp import V2C, SnmpClient, SnmpError, parse_oid
 from . import collect, l3
-from .model import AP, HOST, NETWORK_KINDS, NO_SNMP, PHONE, SNMP, UNKNOWN, UNREACHABLE, Device, Host, \
+from .model import AP, HOST, KIND_NAMES, NETWORK_KINDS, NO_SNMP, PHONE, SNMP, UNKNOWN, UNREACHABLE, Device, Host, \
     Link, NetworkMap, Trace, display_name, normalize_name, port_key, short_port
 
 log = logging.getLogger(__name__)
 
 WORKERS = 8
 STOPPED = "Stopped"
+LIVE_INTERVAL = 1.5  # Seconds between snapshots of the map for drawing it while it's crawled
 ROUTE_ROWS = 20000  # Per column: a core with the full internet table shouldn't take all day
 MAX_ROUTES = 5000  # Kept per device in the map
 END_DEVICE_KINDS = {PHONE, HOST}  # Shown as hosts on their switch port, not as devices on the map
@@ -57,8 +60,20 @@ def parse_networks(lines):
 
 class Crawler:
     def __init__(self, settings, client_factory=SnmpClient, pinger=None, should_stop=lambda: False,
-                 progress=lambda message: None, echo=None):
+                 progress=lambda message: None, echo=None, events=lambda kind, *details: None):
+        """events(kind, *details) reports progress for a live view, from the crawl's own and its worker threads:
+            ("started", address, key or None)  a device is being read
+            ("step", address, text)            what it's doing now (the table, the VLAN, the community)
+            ("finished", address, outcome)     snmp, no-snmp, unreachable, again (a second address), stopped, traced
+            ("log", text)                      something worth keeping in the crawl log
+            ("counts", {...})                  read, reading, queued, found, no_snmp, unreachable
+            ("map", NetworkMap)                a copy of the map so far (devices and links), every LIVE_INTERVAL
+            ("phase", text)                    hosts, traceroute
+        """
         self.settings = settings
+        self.events = events
+        self.counts = {"read": 0, "reading": 0, "queued": 0, "found": 0, "no_snmp": 0, "unreachable": 0}
+        self.limit_logged = False
         self.client_factory = client_factory
         self.pinger = pinger or _ping
         self.echo = echo or l3.icmp_echo
@@ -101,6 +116,8 @@ class Crawler:
                 self.asked.add(seed)
                 queue.append((seed, 0, None))
         done = 0
+        last_snapshot, changed = 0.0, False
+        self.events("log", f"Starting from {', '.join(self.settings.seeds)}")
         with ThreadPoolExecutor(max_workers=self.settings.workers) as executor:
             running = {}
             while (queue or running) and not self.should_stop():
@@ -111,6 +128,8 @@ class Crawler:
                     if key is not None and self.map.devices[key].source == SNMP:
                         continue  # Reached at another address meanwhile
                     running[executor.submit(self.visit, address)] = (address, hops, key)
+                    self.events("started", address, key)
+                self.report_counts(len(running), len(queue))
                 finished, _ = wait(running, timeout=0.2, return_when=FIRST_COMPLETED)
                 for future in finished:
                     address, hops, key = running.pop(future)
@@ -123,17 +142,42 @@ class Crawler:
                         log.exception("Reading %s failed", address)
                         tables, error = None, f"Couldn't read it: {crash}"
                     queue.extend(self.record(address, hops, key, tables, error))
+                    changed = True
+                    self.report_counts(len(running), len(queue))
                     self.progress(f"Read {done} of {done + len(queue) + len(running)} devices "
                                   f"({len(self.map.devices)} found so far): {address}")
+                if changed and time.monotonic() - last_snapshot >= LIVE_INTERVAL:
+                    self.events("map", self.snapshot())
+                    last_snapshot, changed = time.monotonic(), False
             self.map.stopped = self.should_stop()
             if self.map.stopped:
+                self.events("log", f"Stopped, with {len(running)} being read and {len(queue)} still to read")
                 for future in running:
                     future.cancel()
+        self.report_counts(0, 0)
+        self.events("map", self.snapshot())
+        if self.settings.collect_hosts:
+            self.events("phase", "Placing hosts on switch ports")
         self.place_hosts()
+        if self.settings.collect_hosts:
+            self.events("log", f"Placed {len(self.map.hosts)} hosts on switch ports")
         if self.settings.trace and not self.map.stopped:
             self.trace_paths()
         self.map.finished = _now()
         return self.map
+
+    def report_counts(self, reading, queued):
+        self.counts.update(reading=reading, queued=queued, found=len(self.map.devices))
+        self.events("counts", dict(self.counts))
+
+    def snapshot(self):
+        """A copy of the devices and links found so far, for drawing while the crawl goes on."""
+        snapshot = NetworkMap(seeds=list(self.map.seeds), started=self.map.started)
+        snapshot.devices = {key: copy.copy(device) for key, device in self.map.devices.items()}
+        snapshot.links = [copy.copy(link) for link in self.map.links]
+        for link in snapshot.links:
+            link.protocols = list(link.protocols)
+        return snapshot
 
     def trace_paths(self):
         """Traceroute from this computer to devices that didn't answer SNMP, unknown next hops and static routes'
@@ -142,18 +186,31 @@ class Crawler:
         if not targets:
             return
         self.progress(f"Tracing the way to {len(targets)} addresses SNMP couldn't show...")
+        self.events("phase", f"Traceroute to {len(targets)} addresses SNMP couldn't show")
+
+        def echo(address, ttl):
+            self.events("step", address, f"Traceroute, hop {ttl}")
+            return self.echo(address, ttl)
+
         traces = []
         with ThreadPoolExecutor(max_workers=self.settings.workers) as executor:
-            futures = {executor.submit(l3.trace, address, self.echo, should_stop=self.should_stop): (address, reason)
-                       for address, reason in targets}
+            futures = {}
+            for address, reason in targets:
+                futures[executor.submit(l3.trace, address, echo, should_stop=self.should_stop)] = (address, reason)
+                self.events("started", address, None)
             for number, future in enumerate(as_completed(futures), start=1):
                 address, reason = futures[future]
                 try:
                     hops, reached = future.result()
                 except OSError as error:  # No ICMP (a locked-down laptop): the map is still worth having
                     log.warning("Couldn't trace %s: %s", address, error)
+                    self.events("finished", address, "traced")
+                    self.events("log", f"Traceroute to {address} failed: {error}")
                     continue
                 traces.append(Trace(address, hops, reached, reason))
+                self.events("finished", address, "traced")
+                self.events("log", f"Traced {address} ({reason}): " + " > ".join(hop or "*" for hop in hops)
+                            + ("" if reached else " (not reached)"))
                 self.progress(f"Traced {number} of {len(targets)}: {address}")
         self.map.traces = sorted(traces, key=lambda item: ipaddress.ip_address(item.target))
         self.map.stopped = self.should_stop()
@@ -161,9 +218,11 @@ class Crawler:
     def visit(self, address):
         """Read one device. Returns (DeviceTables or None, error). Runs on a worker thread."""
         client = info = None
-        for community in self.communities_for(address):
+        communities = self.communities_for(address)
+        for number, community in enumerate(communities, start=1):
             if self.should_stop():
                 return None, STOPPED
+            self.events("step", address, f"Trying community {number} of {len(communities)}")
             try:
                 client = self.client_factory(address, community, self.settings.version,
                                              timeout=self.settings.timeout, retries=self.settings.retries)
@@ -172,8 +231,10 @@ class Crawler:
                 break
             except (SnmpError, OSError) as problem:
                 log.debug("SNMP to %s: %s", address, problem)
+                self.events("log", f"{address}: no answer with community {number} of {len(communities)}")
                 client = None
         if client is None:
+            self.events("step", address, "Pinging")
             if self.pinger(address):
                 return None, "Answers ping but not SNMP: check the community string and the device's SNMP ACL."
             return None, "No answer to SNMP or ping."
@@ -182,6 +243,7 @@ class Crawler:
         return tables, ""
 
     def walk(self, client, root, tables, what, limit=None):
+        self.events("step", client.host, what)
         try:
             if limit:
                 return list(client.walk(parse_oid(root), should_stop=self.should_stop, limit=limit))
@@ -222,9 +284,10 @@ class Crawler:
             if info.object_id.startswith(collect.CISCO + ".") else []
         if vlan_list and "nx-os" not in info.descr.lower():
             # Catalyst IOS keeps a MAC table per VLAN, read with community@vlan
-            for vlan in vlan_list:
+            for number, vlan in enumerate(vlan_list, start=1):
                 if self.should_stop():
                     return
+                self.events("step", client.host, f"MAC table, VLAN {vlan} ({number} of {len(vlan_list)})")
                 try:
                     vlan_client = self.client_factory(client.host, f"{community}@{vlan}", self.settings.version,
                                                       timeout=self.settings.timeout, retries=self.settings.retries)
@@ -234,8 +297,12 @@ class Crawler:
                     continue  # A VLAN with no ports here doesn't answer on some models
                 tables.fdb += collect.fdb(entries, ports, vlan)
         else:
-            tables.fdb = collect.fdb(self.walk(client, collect.FDB_ENTRY, tables, "MAC table"),
-                                     self.walk(client, collect.BASE_PORT_IFINDEX, tables, "MAC table"))
+            base_ports = self.walk(client, collect.BASE_PORT_IFINDEX, tables, "MAC table")
+            q_rows = []
+            for column in (2, 3):  # Port and status: the index holds the VLAN and the MAC
+                q_rows += self.walk(client, f"{collect.Q_FDB_ENTRY}.{column}", tables, "MAC table by VLAN")
+            tables.fdb = collect.fdb_by_vlan(q_rows, base_ports) or \
+                collect.fdb(self.walk(client, collect.FDB_ENTRY, tables, "MAC table"), base_ports)
 
     # ----------------------------------------------------------------- Putting results on the map
 
@@ -277,16 +344,23 @@ class Crawler:
         if tables is None:
             key = key or self.find(address) or f"ip:{address}"
             device = self.add_device(key, mgmt_ip=address)
-            if device.source != SNMP and error != STOPPED:
+            if error == STOPPED:
+                self.events("finished", address, "stopped")
+            elif device.source != SNMP:
                 device.source = NO_SNMP if error.startswith("Answers ping") else UNREACHABLE
                 device.error = error
                 device.hops = hops
+                self.counts["no_snmp" if device.source == NO_SNMP else "unreachable"] += 1
+                self.events("finished", address, device.source)
+                self.events("log", f"{device.label}: {error}")
             return []
 
         info = tables.info
         existing = self.find(address, info.name)
         if existing and self.map.devices[existing].source == SNMP:
             self.aliases[address] = existing
+            self.events("finished", address, "again")
+            self.events("log", f"{address} is {self.map.devices[existing].label} again (another of its addresses)")
             return []  # Reached the same device at a second address
         if key is None:
             key = existing or normalize_name(info.name) or f"ip:{address}"
@@ -310,7 +384,14 @@ class Crawler:
                                        device.platform)
         if tables.warnings:
             log.info("%s: %s", device.label, "; ".join(tables.warnings))
+            for warning in tables.warnings:
+                self.events("log", f"{device.label}: couldn't read {warning}")
+        if device.routes_truncated:
+            self.events("log", f"{device.label}: only the first {len(device.routes):,} routes were kept")
         self.tables[key] = tables
+        self.counts["read"] += 1
+        self.events("finished", address, SNMP)
+        self.events("log", f"Read {device.label} ({address}): {collect_summary(device, tables)}")
 
         next_visits = []
         for neighbor in tables.neighbors:
@@ -328,12 +409,30 @@ class Crawler:
             self.capabilities.setdefault(other, set()).update(neighbor.capabilities)
             self.map.add_link(Link(key, short_port(neighbor.local_port), other, short_port(neighbor.port),
                                    [neighbor.protocol]))
-            address_ok = neighbor.address and neighbor.address not in self.asked and self.in_scope(neighbor.address)
-            if other_device.source == SNMP or not address_ok or hops + 1 > self.settings.max_hops:
+            if other_device.source == SNMP or (neighbor.address and neighbor.address in self.asked):
                 continue
-            if kind not in NETWORK_KINDS | {UNKNOWN}:
-                continue  # Access points and the like: shown, not asked
-            if len(self.asked) >= self.settings.max_devices:
+            name = f"{other_device.label} ({neighbor.address})" if neighbor.address else other_device.label
+            if not known:
+                self.events("log", f"Found {name} through {neighbor.protocol.upper()} on {device.label} "
+                                   f"{short_port(neighbor.local_port)}")
+            why_not = ""
+            if not neighbor.address:
+                why_not = "it didn't announce a management address"
+            elif not self.in_scope(neighbor.address):
+                why_not = "it's outside the scope"
+            elif hops + 1 > self.settings.max_hops:
+                why_not = f"it's more than {self.settings.max_hops} hops from the start"
+            elif kind not in NETWORK_KINDS | {UNKNOWN}:
+                why_not = f"it's {'an access point' if kind == AP else 'not a network device'}: shown, not asked"
+            elif len(self.asked) >= self.settings.max_devices:
+                if not self.limit_logged:
+                    self.events("log", f"Reached the limit of {self.settings.max_devices} devices: no more will "
+                                       "be asked (change it under Scope)")
+                    self.limit_logged = True
+                continue
+            if why_not:
+                if not known:
+                    self.events("log", f"Not asking {name}: {why_not}")
                 continue
             self.asked.add(neighbor.address)
             next_visits.append((neighbor.address, hops + 1, other))
@@ -407,6 +506,16 @@ class Crawler:
                 port = tables.interfaces.get(tables.lag_parents.get(if_index, if_index), str(if_index))
                 uplinks.add(port_key(port))
         return uplinks
+
+
+def collect_summary(device, tables):
+    """What was read from a device, for the crawl log."""
+    parts = [KIND_NAMES.get(device.kind, device.kind).lower(), f"{len(tables.neighbors)} neighbors"]
+    if tables.fdb:
+        parts.append(f"{len(tables.fdb)} MAC table entries")
+    if tables.routes:
+        parts.append(f"{len(tables.routes)} routes")
+    return ", ".join(parts)
 
 
 def prefix_length(mask):

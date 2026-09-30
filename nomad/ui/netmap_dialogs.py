@@ -4,11 +4,13 @@ import ipaddress
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, \
-    QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QTableWidget, \
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QTableWidget, \
     QTableWidgetItem, QVBoxLayout
 
 from ..netmap import diff
 from ..netmap.crawl import parse_networks
+from ..netmap.model import Host, port_sort_key, short_port
+from ..oui import format_mac, vendor
 from ..snmp import VERSIONS, community_is_valid
 from .theme import COLORS
 
@@ -225,3 +227,102 @@ class CompareDialog(QDialog):
         change = self.shown[item.row()]
         if change.device or change.mac:
             self.show_change.emit(change)
+
+
+class HostDialog(QDialog):
+    """Add a host by hand (one that's off or unplugged while mapping), or edit one."""
+
+    def __init__(self, network_map, host=None, device=None, port="", parent=None):
+        super().__init__(parent)
+        self.network_map, self.host = network_map, host
+        self.setWindowTitle("Edit Host" if host else "Add Host")
+        self.resize(420, 0)
+        layout = QVBoxLayout(self)
+        if host is None:
+            note = QLabel("For a device that's turned off or unplugged: it's kept on the map, marked as added by "
+                          "hand, and carried over when you map again.")
+            note.setWordWrap(True)
+            layout.addWidget(note)
+        form = QFormLayout()
+        self.device_combo = QComboBox()
+        for item in sorted(network_map.devices.values(), key=lambda item: item.label.lower()):
+            self.device_combo.addItem(item.label, item.key)
+        chosen = host.device if host else device
+        if chosen:
+            self.device_combo.setCurrentIndex(max(0, self.device_combo.findData(chosen)))
+        self.port_combo = QComboBox()
+        self.port_combo.setEditable(True)
+        self.device_combo.currentIndexChanged.connect(self.fill_ports)
+        self.fill_ports()
+        self.port_combo.setEditText(host.port if host else port)
+        self.name_input = QLineEdit(host.name if host else "")
+        self.ip_input = QLineEdit(host.ip if host else "")
+        self.mac_input = QLineEdit(host.mac if host else "")
+        self.mac_input.setPlaceholderText("Such as 00-1A-2B-3C-4D-5E")
+        self.vlan_input = QSpinBox()
+        self.vlan_input.setRange(0, 4094)
+        self.vlan_input.setSpecialValueText("None")
+        self.vlan_input.setValue(host.vlan if host else 0)
+        self.note_input = QLineEdit(host.note if host else "")
+        form.addRow("Switch:", self.device_combo)
+        form.addRow("Port:", self.port_combo)
+        form.addRow("Name:", self.name_input)
+        form.addRow("IP address:", self.ip_input)
+        form.addRow("MAC address:", self.mac_input)
+        form.addRow("VLAN:", self.vlan_input)
+        form.addRow("Note:", self.note_input)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def fill_ports(self):
+        """The ports the chosen switch is known to have: its links and the ports hosts are on."""
+        key = self.device_combo.currentData()
+        text = self.port_combo.currentText()
+        ports = {link.port_on(key) for link in self.network_map.links_of(key)}
+        ports |= set(self.network_map.hosts_by_port(key))
+        self.port_combo.clear()
+        self.port_combo.addItems(sorted((port for port in ports if port), key=port_sort_key))
+        self.port_combo.setEditText(text)
+
+    def values(self):
+        """The host as entered. Raises ValueError for anything that isn't valid."""
+        key = self.device_combo.currentData()
+        if not key:
+            raise ValueError("Choose the switch it's plugged into.")
+        port = short_port(self.port_combo.currentText().strip())
+        if not port:
+            raise ValueError("Enter the port it's plugged into, such as Gi1/0/12.")
+        name, ip, mac_text = (self.name_input.text().strip(), self.ip_input.text().strip(),
+                              self.mac_input.text().strip())
+        if not (name or ip or mac_text):
+            raise ValueError("Enter at least a name, an IP address or a MAC address.")
+        if ip:
+            try:
+                ip = str(ipaddress.ip_address(ip))
+            except ValueError:
+                raise ValueError(f"'{ip}' isn't an IP address.") from None
+        mac = format_mac(mac_text)
+        if mac_text and not mac:
+            raise ValueError(f"'{mac_text}' isn't a MAC address.")
+        for other in self.network_map.hosts:
+            if other is not self.host and mac and other.mac == mac:
+                device = self.network_map.devices.get(other.device)
+                raise ValueError(f"{mac} is already on the map, on {device.label if device else other.device} "
+                                 f"{other.port}.")
+        host = Host(mac=mac, device=key, port=port, ip=ip, vendor=vendor(mac) if mac else "",
+                    vlan=self.vlan_input.value(), name=name, note=self.note_input.text().strip(),
+                    manual=self.host.manual if self.host else True)
+        if self.host is not None:
+            host.platform = self.host.platform
+        return host
+
+    def accept(self):
+        try:
+            self.values()
+        except ValueError as error:
+            QMessageBox.warning(self, self.windowTitle(), str(error))
+            return
+        super().accept()
