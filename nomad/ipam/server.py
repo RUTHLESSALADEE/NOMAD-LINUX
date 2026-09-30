@@ -54,7 +54,8 @@ TEAM, ADMIN = "team", "admin"
 ADMIN_ONLY_ACTIONS = {"add_network", "delete_network"}
 CERTIFICATE_YEARS = 20
 MAX_WAIT_SECONDS = 55
-API_LEVEL = 4  # 2 added /api/wait (instant sync), 3 /api/log (history), 4 loopback subnets. Clients cope with servers below this
+API_LEVEL = 5  # 2 added /api/wait (instant sync), 3 /api/log (history), 4 loopback subnets, 5 sightings (last seen).
+# Clients cope with servers below this
 
 
 class ConflictError(IpamError):
@@ -201,6 +202,7 @@ class IpamServer:
         self.stop_event = threading.Event()
         self.changed = threading.Condition()  # Notified after every change, to answer waiting laptops
         self.latest = self.store.revision()
+        self.latest_sightings = self.store.sighting_seq()  # Sweeps' news, which laptops also wait for
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(self.directory / "cert.pem", self.directory / "key.pem")
@@ -239,18 +241,23 @@ class IpamServer:
             self.changed.notify_all()  # Let waiting requests finish
         self.httpd.shutdown()
 
-    def announce(self, revision):
-        """Tell every waiting laptop there's a new revision."""
+    def announce(self, revision=None, sightings=None):
+        """Tell every waiting laptop there's a new revision (or new sightings)."""
         with self.changed:
-            self.latest = max(self.latest, revision)
+            if revision is not None:
+                self.latest = max(self.latest, revision)
+            if sightings is not None:
+                self.latest_sightings = max(self.latest_sightings, sightings)
             self.changed.notify_all()
 
-    def wait(self, since, timeout):
-        """Block until there's a revision after `since`, the timeout passes, or the server stops."""
+    def wait(self, since, timeout, sightings_since=None):
+        """Block until there's a revision after `since` (or sightings after `sightings_since`, when given), the
+        timeout passes, or the server stops."""
         timeout = max(0.0, min(float(timeout), MAX_WAIT_SECONDS))
         with self.changed:
-            self.changed.wait_for(lambda: self.latest > since or self.stop_event.is_set(), timeout)
-            return {"revision": self.latest}
+            self.changed.wait_for(lambda: self.latest > since or self.stop_event.is_set() or
+                                  (sightings_since is not None and self.latest_sightings > sightings_since), timeout)
+            return {"revision": self.latest, "sightings": self.latest_sightings}
 
     # ----------------------------------------------------------------- Requests
 
@@ -269,7 +276,26 @@ class IpamServer:
         with self.store.lock:
             revision = self.store.revision()
         return {"server_id": self.config["server_id"], "name": socket.gethostname(), "version": __version__,
-                "api": API_LEVEL, "revision": revision, "role": role}
+                "api": API_LEVEL, "revision": revision, "sightings": self.latest_sightings, "role": role}
+
+    def sightings(self, since):
+        with self.store.lock:
+            payload, seq, more = self.store.sightings_since(since)
+        return dict(payload, seq=seq, more=more)
+
+    def record_sightings(self, user, request):
+        """A laptop's sweep results: kept (newest wins) and passed on to every laptop, but not in the history."""
+        network_id = request["network_id"]
+        # Who swept is who sent them, whatever the request says
+        hosts = [{name: value for name, value in host.items() if name != "seen_by"} for host in request.get("hosts", [])]
+        ranges = [{name: value for name, value in swept.items() if name != "swept_by"}
+                  for swept in request.get("ranges", [])]
+        with self.store.lock:
+            self.store.network(network_id)  # Raises if it was deleted
+            self.store.record_sightings(network_id, hosts, ranges, by=user)
+            seq = self.store.sighting_seq()
+        self.announce(sightings=seq)
+        return {"seq": seq}
 
     def log(self, since):
         with self.store.lock:
@@ -463,8 +489,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 return self._reply(200, app.status(role))
             if method == "GET" and url.path == "/api/wait":
                 query = parse_qs(url.query)
+                sightings_since = query.get("sightings_since")
                 return self._reply(200, app.wait(int(query.get("since", ["0"])[0]),
-                                                 float(query.get("timeout", ["25"])[0])))
+                                                 float(query.get("timeout", ["25"])[0]),
+                                                 int(sightings_since[0]) if sightings_since else None))
+            if method == "GET" and url.path == "/api/sightings":
+                return self._reply(200, app.sightings(int(parse_qs(url.query).get("since", ["0"])[0])))
+            if method == "POST" and url.path == "/api/sightings":
+                return self._reply(200, app.record_sightings(self._user(), self._body()))
             if method == "GET" and url.path == "/api/log":
                 return self._reply(200, app.log(int(parse_qs(url.query).get("since", ["0"])[0])))
             if method == "GET" and url.path == "/api/changes":

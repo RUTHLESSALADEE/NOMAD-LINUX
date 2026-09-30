@@ -209,14 +209,20 @@ def _subnet_text(subnet):
 class ImportDialog(QDialog):
     """Review each page of a spreadsheet: the network to import it as, a choice for every place the summary and
     the detailed info disagree, the gateway to use where the sheet's isn't in its subnet, and the rows that can't
-    be used. It can be maximized or shown full screen (F11) for room."""
+    be used. It can be maximized or shown full screen (F11) for room.
 
-    def __init__(self, parent, store, file_name, sheets, skipped=(), to_server=False, team_connected=False):
+    With compare_with (a network), it picks the one page to compare that network with instead of importing, and
+    leaves the page's plan in compare_plan as (page title, plan)."""
+
+    def __init__(self, parent, store, file_name, sheets, skipped=(), to_server=False, team_connected=False,
+                 compare_with=None):
         super().__init__(parent)
-        self.store, self.sheets = store, sheets
+        self.store, self.sheets, self.compare_with = store, sheets, compare_with
         self.imported = []
+        self.compare_plan = None
         self.gateway_errors = {}  # {id(GatewayFix): message} for gateways typed in that aren't usable
-        self.setWindowTitle(f"Import {file_name}")
+        self.setWindowTitle(f"Compare {compare_with.name} with {file_name}" if compare_with else
+                            f"Import {file_name}")
         self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint | Qt.WindowMinimizeButtonHint)
         self.resize(1280, 760)
         layout = QVBoxLayout(self)
@@ -226,7 +232,13 @@ class ImportDialog(QDialog):
         # Where the networks go, impossible to miss: only the IPAM server itself imports tribe networks
         destination = QLabel()
         destination.setWordWrap(True)
-        if to_server:
+        if compare_with is not None:
+            destination.setText(f"<b>Comparing {compare_with.name} with a page of this workbook.</b> Tick the page "
+                                "to compare it with, and settle its differences as you would to import it. Nothing "
+                                "changes until you choose what to bring in, next.")
+            colors = (COLORS["success_background"], COLORS["link"])
+            intro.setText("Tick one page. Where its summary and Detailed Info disagree, choose which to compare with.")
+        elif to_server:
             destination.setText("<b>Importing to the tribe's IPAM server.</b> Every connected laptop gets these "
                                 "networks as soon as the import finishes.")
             colors = (COLORS["success_background"], COLORS["success"])
@@ -254,12 +266,16 @@ class ImportDialog(QDialog):
         self.page_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.page_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.page_table.horizontalHeader().setStretchLastSection(True)
+        matching = compare_with.fields.get("Imported from", "") if compare_with is not None else ""
+        if compare_with is not None and not any(sheet.title == matching for sheet in sheets):
+            matching = sheets[0].title if len(sheets) == 1 else ""
         for row, sheet in enumerate(sheets):
             check = QTableWidgetItem(sheet.title)
             check.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            check.setCheckState(Qt.Checked)
+            check.setCheckState(Qt.Checked if compare_with is None or sheet.title == matching else Qt.Unchecked)
             self.page_table.setItem(row, 0, check)
-            self.page_table.setItem(row, 1, QTableWidgetItem(sheet.suggested_name))
+            self.page_table.setItem(row, 1, QTableWidgetItem(compare_with.name if compare_with is not None
+                                                             else sheet.suggested_name))
             for column, value in ((2, len(sheet.matched) + len(sheet.differences)), (3, len(sheet.addresses)),
                                   (PROBLEMS_COLUMN, len(sheet.problems))):
                 item = QTableWidgetItem(str(value))
@@ -323,7 +339,8 @@ class ImportDialog(QDialog):
         self.full_screen_button = buttons.addButton("Full Screen (F11)", QDialogButtonBox.ActionRole)
         self.full_screen_button.clicked.connect(self.toggle_full_screen)
         QShortcut(QKeySequence("F11"), self, self.toggle_full_screen)
-        self.import_button = buttons.addButton("Import to the Tribe Server" if to_server else
+        self.import_button = buttons.addButton("Compare..." if compare_with is not None else
+                                               "Import to the Tribe Server" if to_server else
                                                "Import to This Computer Only", QDialogButtonBox.AcceptRole)
         self.import_button.setProperty("accent", True)
         buttons.accepted.connect(self.run_import)
@@ -331,9 +348,18 @@ class ImportDialog(QDialog):
         layout.addWidget(buttons)
 
         self.page_table.itemSelectionChanged.connect(self.show_page)
-        self.page_table.itemChanged.connect(lambda _: self.update_state())
+        self.page_table.itemChanged.connect(self.on_page_ticked)
         self.gateway_table.itemChanged.connect(self.on_gateway_edited)
         self.page_table.selectRow(0)
+        self.update_state()
+
+    def on_page_ticked(self, item):
+        if self.compare_with is not None and item.column() == 0 and item.checkState() == Qt.Checked:
+            self.page_table.blockSignals(True)  # One page to compare with
+            for row in range(self.page_table.rowCount()):
+                if row != item.row():
+                    self.page_table.item(row, 0).setCheckState(Qt.Unchecked)
+            self.page_table.blockSignals(False)
         self.update_state()
 
     def toggle_full_screen(self):
@@ -520,7 +546,9 @@ class ImportDialog(QDialog):
             self.page_table.item(row, UNDECIDED_COLUMN).setForeground(
                 QColor(COLORS["warning" if undecided else "muted"]))
             result, kind = "", "muted"
-            if not ticked:
+            if self.compare_with is not None:
+                result = "Compare" if ticked else ""
+            elif not ticked:
                 result = "Not imported"
             elif not name:
                 result, kind = "Needs a network name", "error"
@@ -536,7 +564,15 @@ class ImportDialog(QDialog):
                 blockers.append(sheet.title)
         self.page_table.blockSignals(False)
         self.import_button.setEnabled(bool(chosen) and not blockers)
-        if not chosen:
+        if self.compare_with is not None:
+            if not chosen:
+                set_hint(self.status_label, "Tick the page to compare with.", "info")
+            elif blockers:
+                set_hint(self.status_label, "Still to sort out before comparing: choices under Differences, or "
+                                            "gateways under Gateways.", "warning")
+            else:
+                set_hint(self.status_label, f"Ready to compare with {chosen[0][0].title}.", "success")
+        elif not chosen:
             set_hint(self.status_label, "Tick at least one page to import.", "info")
         elif blockers:
             set_hint(self.status_label, "Still to sort out before importing: " + ", ".join(blockers) +
@@ -547,6 +583,11 @@ class ImportDialog(QDialog):
 
     def run_import(self):
         chosen = self.chosen_pages()
+        if self.compare_with is not None:
+            sheet = chosen[0][0]
+            self.compare_plan = (sheet.title, import_plan(sheet, self.compare_with.name))
+            self.accept()
+            return
         replacing = [name for _, name in chosen if self.store.network_named(name) is not None]
         if replacing and QMessageBox.question(
                 self, "Replace Networks",

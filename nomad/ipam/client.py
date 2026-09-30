@@ -5,6 +5,10 @@ Reads come from the local copy, so they work offline. Edits go straight to the s
 what the client last saw (raising ConflictError if someone else got there first) and replies with the changed rows,
 which are applied to the copy at once; other changes arrive with the next sync.
 
+Sweep results (when each address last answered) travel separately from changes: record_sightings keeps them in the
+copy at once and in an outbox, sent with the next sync (send_sightings), and the server passes everyone's on
+(fetch_sightings). They never go in the history.
+
 While the server can't be reached, changes to addresses (not subnets or networks) are still made: they're applied to
 the copy at once and queued as pending, several changes to one address becoming one. When the server is back they're
 sent in the order they were made (send_pending on a worker thread, then apply_sent); any the server refuses, because
@@ -44,6 +48,10 @@ CREATE TABLE IF NOT EXISTS pending (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, network_id TEXT NOT NULL, ip TEXT NOT NULL, sort_key TEXT NOT NULL,
     action TEXT NOT NULL, data TEXT NOT NULL DEFAULT '{}', expected_version INTEGER, original TEXT,
     made TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', error TEXT NOT NULL DEFAULT '');
+"""
+SIGHTINGS_OUT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS sightings_out (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT, network_id TEXT NOT NULL, payload TEXT NOT NULL);
 """
 SET, FREE = "set_address", "free_address"
 
@@ -207,9 +215,29 @@ class TeamClient:
     def changes(self, since):
         return self.request("GET", f"/api/changes?since={int(since)}")
 
-    def wait(self, since, timeout=25):
-        """Wait (up to `timeout` seconds) for a revision after `since`; returns the latest revision."""
-        return self.request("GET", f"/api/wait?since={int(since)}&timeout={timeout}")["revision"]
+    def wait(self, since, timeout=25, sightings_since=None):
+        """Wait (up to `timeout` seconds) for a revision after `since`, or sightings after `sightings_since`.
+        Returns (latest revision, latest sightings or None from a server that doesn't have them)."""
+        query = f"since={int(since)}&timeout={timeout}"
+        if sightings_since is not None:
+            query += f"&sightings_since={int(sightings_since)}"
+        reply = self.request("GET", f"/api/wait?{query}")
+        return reply["revision"], reply.get("sightings")
+
+    def fetch_sightings(self, since):
+        """Everyone's sweep results after `since` (safe on a worker thread). Returns (payload, seq), or None from a
+        server too old to keep them."""
+        payload, seq = {"hosts": [], "ranges": []}, since
+        while True:
+            try:
+                reply = self.request("GET", f"/api/sightings?since={int(seq)}")
+            except OldServerError:
+                return None
+            payload["hosts"] += reply["hosts"]
+            payload["ranges"] += reply["ranges"]
+            seq = reply["seq"]
+            if not reply.get("more"):
+                return payload, seq
 
     def fetch_log(self, since):
         """The server's change log after `since` (safe on a worker thread). Returns (entries, revision)."""
@@ -257,6 +285,7 @@ class TeamStore:
         self.key_rejected = False  # The server refused the tribe key (a new key file is needed)
         self.copy.db.executescript(PENDING_SCHEMA)
         self.copy.db.executescript(HISTORY_SCHEMA)
+        self.copy.db.executescript(SIGHTINGS_OUT_SCHEMA)
         if self.copy.get_meta("server_id") not in ("", key.server_id):
             self.reset_copy()
 
@@ -274,9 +303,11 @@ class TeamStore:
     def reset_copy(self):
         """Empty the copy (for a different server), so the next sync fetches everything."""
         with self.copy.transaction():
-            for table in ("networks", "subnets", "addresses", "changes", "pending", "history"):
+            for table in ("networks", "subnets", "addresses", "changes", "pending", "history", "sightings", "sweeps",
+                          "sightings_out"):
                 self.copy.db.execute(f"DELETE FROM {table}")
             self.copy.set_meta("revision", 0)
+            self.copy.set_meta("sighting_revision", 0)
             self.copy.set_meta("server_id", self.key.server_id)
 
     @property
@@ -346,6 +377,55 @@ class TeamStore:
         self.online = True
         self.copy.apply_rows(reply["items"])
         return reply
+
+    # ----------------------------------------------------------------- Sweep results (last seen)
+
+    @property
+    def sighting_revision(self):
+        """How far the copy has the server's sweep results."""
+        return int(self.copy.get_meta("sighting_revision", "0") or 0)
+
+    def record_sightings(self, network_id, hosts=(), ranges=()):
+        """Keep a sweep's results in the copy now, and queue them for the server (sent with the next sync)."""
+        hosts, ranges = list(hosts), list(ranges)
+        if not hosts and not ranges:
+            return 0
+        by = f"{self.client.user} ({self.client.computer})"
+        with self.copy.transaction():
+            changed = self.copy.record_sightings(network_id, hosts, ranges, by=by)
+            self.copy.db.execute("INSERT INTO sightings_out (network_id, payload) VALUES (?, ?)",
+                                 (network_id, json.dumps({"hosts": hosts, "ranges": ranges})))
+        return changed
+
+    def outgoing_sightings(self):
+        rows = self.copy.db.execute("SELECT * FROM sightings_out ORDER BY seq").fetchall()
+        return [dict(seq=row["seq"], network_id=row["network_id"], **json.loads(row["payload"])) for row in rows]
+
+    def send_sightings(self, entries):
+        """Send queued sweep results (safe on a worker thread). Returns the seqs done with: sent, or refused for
+        good (such as a network deleted since). Stops at the first that can't reach the server."""
+        done = []
+        for entry in entries:
+            try:
+                self.client.request("POST", "/api/sightings", {"network_id": entry["network_id"],
+                                                               "hosts": entry["hosts"], "ranges": entry["ranges"]})
+            except (ServerUnreachable, OldServerError, TeamKeyError):
+                break  # Kept for later (an older server keeps them until it's updated)
+            except IpamError as error:
+                log.info("The IPAM server didn't take sweep results for network %s: %s", entry["network_id"], error)
+            done.append(entry["seq"])
+        return done
+
+    def apply_sent_sightings(self, seqs):
+        if seqs:
+            with self.copy.transaction():
+                self.copy.db.executemany("DELETE FROM sightings_out WHERE seq = ?", [(seq,) for seq in seqs])
+
+    def apply_sightings(self, payload, seq):
+        """Take in everyone's sweep results from fetch_sightings (on the UI thread)."""
+        with self.copy.transaction():
+            self.copy.apply_sightings(payload)
+            self.copy.set_meta("sighting_revision", seq)
 
     # ----------------------------------------------------------------- Changes made offline
 
@@ -476,7 +556,8 @@ class TeamStore:
 
     def __getattr__(self, name):
         if name in ("networks", "network", "network_named", "subnets", "subnet", "subnet_for", "addresses",
-                    "address", "count_addresses", "next_free", "search"):
+                    "address", "count_addresses", "next_free", "search", "detail_names", "free_blocks",
+                    "deleted_since", "sightings"):
             return getattr(self.copy, name)
         raise AttributeError(name)
 

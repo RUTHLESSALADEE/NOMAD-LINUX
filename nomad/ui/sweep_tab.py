@@ -315,12 +315,16 @@ class SweepTab(QWidget):
         selection = self.ipam_bar.selection()
         if selection is not None:  # Show what answered on the IP Addresses page too
             source, _, network_id = selection
-            hosts = {}
+            hosts, names = {}, {}
             for row in range(self.table.rowCount()):
                 rtt = self.table.item(row, COL_RTT).sort_key
-                hosts[self.table.item(row, COL_ADDRESS).text()] = (None if rtt == ARP_ONLY_SORT_KEY else rtt,
-                                                                   self.table.item(row, COL_MAC).text())
-            self.window.ipam_tab.record_sweep(source, network_id, self.swept, hosts, complete)
+                address = self.table.item(row, COL_ADDRESS).text()
+                hosts[address] = (None if rtt == ARP_ONLY_SORT_KEY else rtt, self.table.item(row, COL_MAC).text())
+                name = self.table.item(row, COL_NAME)
+                name = name.text().replace(" (this computer)", "").replace("(this computer)", "") if name else ""
+                if name:
+                    names[address] = name
+            self.window.ipam_tab.record_sweep(source, network_id, self.swept, hosts, complete, names)
 
     def on_thread_finished(self):
         self.worker.deleteLater()

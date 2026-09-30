@@ -6,6 +6,10 @@ is 172.28.0.0/16). A loopback subnet is a pool of host routes (loopback addresse
 has no network, broadcast or gateway address. Subnets may nest (a /20 block holding /24s), and an address belongs to the most specific subnet
 containing it. Only addresses in use or reserved are stored; the rest of a subnet is free.
 
+Sweeps are remembered too (when each address last answered, and which ranges were swept when), in tables of their
+own: they aren't changes to the records, so they stay out of the change log and history, and sync by their own
+sequence numbers (sightings_since).
+
 Rows are never removed: deleting marks them deleted (a tombstone) and every change bumps the row's version and is
 written to the change log. On the NOMAD server, the change log's sequence numbers are the revisions clients sync by
 (changes_since); a client's copy of the team's data is an IpamStore filled by apply_rows, without a change log of
@@ -29,6 +33,7 @@ log = logging.getLogger(__name__)
 FILE_NAME = "ipam.db"
 SCHEMA_VERSION = 2  # 2 added subnets.loopbacks
 USED, RESERVED = "used", "reserved"
+ANYWHERE, VALUE, NAME, DESCRIPTION, MAC = "anywhere", "value", "name", "description", "mac"  # Where search looks
 STATUSES = {USED: "Used", RESERVED: "Reserved"}
 MAX_NEXT_FREE_SCAN = 1 << 20  # Stop looking for a free address after this many (a /12's worth)
 TABLES = ("networks", "subnets", "addresses")
@@ -54,6 +59,15 @@ CREATE TABLE IF NOT EXISTS changes (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, entity TEXT NOT NULL, entity_id TEXT NOT NULL, version INTEGER NOT NULL,
     op TEXT NOT NULL, data TEXT NOT NULL, modified TEXT NOT NULL, modified_by TEXT NOT NULL,
     pushed INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS sightings (
+    network_id TEXT NOT NULL, sort_key TEXT NOT NULL, ip TEXT NOT NULL, seen REAL NOT NULL, rtt INTEGER,
+    mac TEXT NOT NULL DEFAULT '', name TEXT NOT NULL DEFAULT '', seen_by TEXT NOT NULL DEFAULT '',
+    seq INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (network_id, sort_key));
+CREATE TABLE IF NOT EXISTS sweeps (
+    network_id TEXT NOT NULL, cidr TEXT NOT NULL, started REAL NOT NULL, finished REAL NOT NULL,
+    swept_by TEXT NOT NULL DEFAULT '', seq INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (network_id, cidr));
+CREATE INDEX IF NOT EXISTS sightings_seq ON sightings (seq);
+CREATE INDEX IF NOT EXISTS sweeps_seq ON sweeps (seq);
 """
 
 
@@ -131,6 +145,11 @@ def parse_subnet(text):
         return Block(ipaddress.ip_network(f"{address}/{mask or address.max_prefixlen}", strict=False))
     except ValueError:
         raise IpamError(f"{text!r} isn't a subnet (use CIDR like 10.1.2.0/24).") from None
+
+
+def _json_path(key):
+    """The JSON path of a detail (json_extract), quoted so any name works."""
+    return '$."' + key.replace('"', '\\"') + '"'
 
 
 def now():
@@ -588,16 +607,161 @@ class IpamStore:
             candidate += 1
         return None
 
+    def free_blocks(self, subnet, prefix=None, limit=500):
+        """Unused space in a subnet: blocks holding no other subnet, recorded address or the gateway.
+
+        With a prefix, every free aligned block of that size (such as each free /28); without, the free space as the
+        fewest blocks, largest first. Returns ([Block], free address count).
+        """
+        parent = subnet.network
+        first, last = int(parent.first), int(parent.last)
+        taken = []  # [(first, last)] as integers
+        for other in self.subnets(subnet.network_id):
+            block = other.network
+            if other.id != subnet.id and block.version == parent.version and block.subnet_of(parent) and \
+                    block != parent:
+                taken.append((int(block.first), int(block.last)))
+        for address in self.addresses(subnet.network_id, parent):
+            taken.append((int(address.address), int(address.address)))
+        if subnet.gateway:
+            with contextlib.suppress(ValueError):
+                gateway = ipaddress.ip_address(subnet.gateway)
+                if gateway in parent:
+                    taken.append((int(gateway), int(gateway)))
+        gaps, start = [], first
+        for low, high in sorted(taken):
+            if low > start:
+                gaps.append((start, low - 1))
+            start = max(start, high + 1)
+        if start <= last:
+            gaps.append((start, last))
+        free_count = sum(high - low + 1 for low, high in gaps)
+        blocks = []
+        if prefix is None:
+            for low, high in gaps:
+                blocks += ipaddress.summarize_address_range(_address(low, parent.version),
+                                                            _address(high, parent.version))
+            blocks.sort(key=lambda block: (block.prefixlen, int(block.network_address)))
+        else:
+            size = 1 << (parent.first.max_prefixlen - prefix)
+            for low, high in gaps:
+                aligned = -(-low // size) * size
+                while aligned + size - 1 <= high and len(blocks) < limit:
+                    blocks.append(ipaddress.ip_network(f"{_address(aligned, parent.version)}/{prefix}"))
+                    aligned += size
+        return [Block(block) for block in blocks[:limit]], free_count
+
+    def deleted_since(self, network_id):
+        """({subnet CIDR}, {address}) deleted in a network (and not recorded again): what someone removed on
+        purpose, so a comparison doesn't offer to put it back as though it were new."""
+        subnets = {row[0] for row in self.db.execute(
+            "SELECT cidr FROM subnets AS old WHERE network_id = ? AND deleted = 1 AND NOT EXISTS (SELECT 1 FROM "
+            "subnets WHERE network_id = old.network_id AND sort_key = old.sort_key AND deleted = 0)", (network_id,))}
+        addresses = {row[0] for row in self.db.execute(
+            "SELECT ip FROM addresses AS old WHERE network_id = ? AND deleted = 1 AND NOT EXISTS (SELECT 1 FROM "
+            "addresses WHERE network_id = old.network_id AND sort_key = old.sort_key AND deleted = 0)",
+            (network_id,))}
+        return subnets, addresses
+
+    # ----------------------------------------------------------------- Sweeps (last seen)
+
+    def record_sightings(self, network_id, hosts=(), ranges=(), by=None):
+        """Remember what a sweep found: hosts [{"ip", "seen", "rtt", "mac", "name"}] that answered, and ranges
+        [{"cidr", "started", "finished"}] swept in full. Only newer news replaces older (a MAC or name missing from
+        a newer sighting is kept from the older). Returns how many were new."""
+        by = by or self.user
+        changed = 0
+        with self.transaction():
+            seq = int(self.get_meta("sighting_seq", "0") or 0)
+            for host in hosts:
+                ip = parse_address(host["ip"])
+                seen = float(host["seen"])
+                old = self.db.execute("SELECT * FROM sightings WHERE network_id = ? AND sort_key = ?",
+                                      (network_id, ip_key(ip))).fetchone()
+                if old is not None and old["seen"] >= seen:
+                    continue
+                seq += 1
+                self.db.execute(
+                    "INSERT OR REPLACE INTO sightings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (network_id, ip_key(ip), str(ip), seen, host.get("rtt"),
+                     host.get("mac") or (old["mac"] if old else ""), host.get("name") or (old["name"] if old else ""),
+                     host.get("seen_by") or by, seq))
+                changed += 1
+            for swept in ranges:
+                block = parse_subnet(swept["cidr"])
+                old = self.db.execute("SELECT started FROM sweeps WHERE network_id = ? AND cidr = ?",
+                                      (network_id, str(block))).fetchone()
+                if old is not None and old["started"] >= float(swept["started"]):
+                    continue
+                seq += 1
+                self.db.execute("INSERT OR REPLACE INTO sweeps VALUES (?, ?, ?, ?, ?, ?)",
+                                (network_id, str(block), float(swept["started"]), float(swept["finished"]),
+                                 swept.get("swept_by") or by, seq))
+                changed += 1
+            self.set_meta("sighting_seq", seq)
+        return changed
+
+    def sighting_seq(self):
+        return int(self.get_meta("sighting_seq", "0") or 0)
+
+    def sightings_since(self, seq, limit=5000):
+        """Sightings and swept ranges recorded after `seq`, for copies: ({"hosts": [...], "ranges": [...]}, the
+        seq they reach, whether there's more)."""
+        hosts = [dict(row) for row in self.db.execute(
+            "SELECT network_id, ip, seen, rtt, mac, name, seen_by, seq FROM sightings WHERE seq > ? ORDER BY seq "
+            "LIMIT ?", (seq, limit + 1))]
+        ranges = [dict(row) for row in self.db.execute(
+            "SELECT network_id, cidr, started, finished, swept_by, seq FROM sweeps WHERE seq > ? ORDER BY seq "
+            "LIMIT ?", (seq, limit + 1))]
+        items = sorted([("hosts", row) for row in hosts] + [("ranges", row) for row in ranges],
+                       key=lambda item: item[1]["seq"])
+        more = len(items) > limit
+        items = items[:limit]
+        reached = items[-1][1]["seq"] if items else seq
+        return ({"hosts": [row for kind, row in items if kind == "hosts"],
+                 "ranges": [row for kind, row in items if kind == "ranges"]}, reached, more)
+
+    def apply_sightings(self, payload):
+        """Take in sightings_since's rows from the server (on a copy of its data)."""
+        networks = {row["network_id"] for row in payload.get("hosts", []) + payload.get("ranges", [])}
+        with self.transaction():
+            for network_id in networks:
+                self.record_sightings(
+                    network_id,
+                    [row for row in payload.get("hosts", []) if row["network_id"] == network_id],
+                    [row for row in payload.get("ranges", []) if row["network_id"] == network_id])
+
+    def sightings(self, network_id, within=None):
+        """What sweeps found in a network: ({address: row}, [(Block, started, finished, swept_by)]). `within` (a
+        Block) keeps to one subnet."""
+        query, arguments = "SELECT * FROM sightings WHERE network_id = ?", [network_id]
+        if within is not None:
+            query += " AND sort_key BETWEEN ? AND ?"
+            arguments += [ip_key(within.network_address), ip_key(within.broadcast_address)]
+        hosts = {ipaddress.ip_address(row["ip"]): dict(row) for row in self.db.execute(query, arguments)}
+        ranges = []
+        for row in self.db.execute("SELECT * FROM sweeps WHERE network_id = ?", (network_id,)):
+            block = parse_subnet(row["cidr"])
+            if within is None or block.version == within.version and \
+                    (block.first in within or within.first in block):
+                ranges.append((block, row["started"], row["finished"], row["swept_by"]))
+        return hosts, ranges
+
     # ----------------------------------------------------------------- Finding
 
-    def search(self, text, network_id=None, limit=500):
+    def search(self, text, network_id=None, limit=500, subnets=True, addresses=True, status=None, match=ANYWHERE):
         """Subnets and addresses matching text: an address (or subnet) by value, or any name or description.
 
+        network_id limits it to one network; subnets or addresses False leaves those out, and status (USED or
+        RESERVED) keeps only addresses recorded as that. match says where the text must be: ANYWHERE, or one of
+        VALUE (the address or subnet), NAME, DESCRIPTION, MAC, or a detail's name (such as "Telephony Rng").
         Returns [(network, subnet or None, address or None)]; a subnet match has address None.
         """
         text = text.strip()
         if not text:
             return []
+        if status is not None or match == MAC:
+            subnets = False  # Only addresses have a status or a MAC
         networks = {network.id: network for network in self.networks()}
         results = []
         like = f"%{text.lower()}%"
@@ -607,25 +771,46 @@ class IpamStore:
         address_value = None
         with contextlib.suppress(ValueError):
             address_value = ipaddress.ip_address(text)
-        if address_value is not None:  # Every subnet holding it, and the address itself if recorded
+        if address_value is not None and match in (ANYWHERE, VALUE):  # Every subnet holding it, and the address
             for current_id in ([network_id] if network_id else list(networks)):
                 subnet = self.subnet_for(current_id, address_value)
                 address = self.address(current_id, address_value)
-                if subnet is not None or address is not None:
+                if not addresses:
+                    if subnet is not None:
+                        results.append((networks[current_id], subnet, None))
+                elif status is not None:
+                    if address is not None and address.status == status:
+                        results.append((networks[current_id], subnet, address))
+                elif subnet is not None or address is not None:
                     results.append((networks[current_id], subnet, address or
                                     Address("", current_id, str(address_value), status="")))
             return results
 
-        rows = self.db.execute(f"SELECT * FROM subnets WHERE deleted = 0 {where_network} AND (cidr LIKE ? OR "
-                               "lower(name) LIKE ? OR lower(description) LIKE ? OR lower(fields) LIKE ?) "
-                               "ORDER BY sort_key LIMIT ?", extra + [f"{text}%", like, like, like, limit])
+        def matching(value_column, columns):
+            """The WHERE test for the match chosen, and its parameters."""
+            tests = {VALUE: (f"{value_column} LIKE ?", f"{text}%"), NAME: ("lower(name) LIKE ?", like),
+                     DESCRIPTION: ("lower(description) LIKE ?", like), MAC: ("lower(mac) LIKE ?", like)}
+            if match == ANYWHERE:
+                chosen = [tests[column] for column in columns] + [("lower(fields) LIKE ?", like)]
+            elif match in tests:
+                chosen = [tests[match]] if match in columns else []
+            else:  # One detail, by name
+                return "(lower(json_extract(fields, ?)) LIKE ?)", [_json_path(match), like]
+            if not chosen:
+                return None, []
+            return "(" + " OR ".join(test for test, _ in chosen) + ")", [value for _, value in chosen]
+
+        test, values = matching("cidr", (VALUE, NAME, DESCRIPTION))
+        rows = self.db.execute(f"SELECT * FROM subnets WHERE deleted = 0 {where_network} AND {test} "
+                               "ORDER BY sort_key LIMIT ?", extra + values + [limit]) if subnets and test else []
         for row in rows:
             subnet = _from_row(Subnet, row)
             results.append((networks[subnet.network_id], subnet, None))
-        rows = self.db.execute(f"SELECT * FROM addresses WHERE deleted = 0 {where_network} AND (ip LIKE ? OR "
-                               "lower(name) LIKE ? OR lower(mac) LIKE ? OR lower(description) LIKE ? OR "
-                               "lower(fields) LIKE ?) ORDER BY network_id, sort_key LIMIT ?",
-                               extra + [f"{text}%", like, like, like, like, limit])
+        where_status = "" if status is None else "AND status = ?"
+        test, values = matching("ip", (VALUE, NAME, MAC, DESCRIPTION))
+        rows = self.db.execute(f"SELECT * FROM addresses WHERE deleted = 0 {where_network} {where_status} AND "
+                               f"{test} ORDER BY network_id, sort_key LIMIT ?",
+                               extra + ([] if status is None else [status]) + values + [limit])             if addresses and test else []
         subnet_cache = {}
         for row in rows:
             address = _from_row(Address, row)
@@ -634,3 +819,9 @@ class IpamStore:
             subnet = max(holding, key=lambda subnet: (subnet.network.prefixlen, subnet.network.first), default=None)
             results.append((networks[address.network_id], subnet, address))
         return results[:limit]
+
+    def detail_names(self):
+        """The names of the details subnets and addresses have (such as "Telephony Rng"), for searching by."""
+        rows = self.db.execute("SELECT DISTINCT key FROM subnets, json_each(subnets.fields) WHERE deleted = 0 UNION "
+                               "SELECT DISTINCT key FROM addresses, json_each(addresses.fields) WHERE deleted = 0")
+        return sorted((row[0] for row in rows), key=str.casefold)

@@ -3,7 +3,7 @@ import json
 import pytest
 
 from nomad.ipam.spreadsheet import DETAIL, SKIP, SUMMARY, SpreadsheetError, import_page, parse_page, read_pages
-from nomad.ipam.store import RESERVED, USED, IpamError, IpamStore, parse_subnet
+from nomad.ipam.store import DESCRIPTION, MAC, NAME, RESERVED, USED, VALUE, IpamError, IpamStore, parse_subnet
 
 
 @pytest.fixture
@@ -100,6 +100,34 @@ def test_search(store):
            == [("Core switches", None), ("Core switches", "10.0.0.7")]
     free = store.search("10.0.0.9")
     assert len(free) == 1 and free[0][2].status == ""  # In a subnet but not recorded
+
+
+def test_search_by_network_and_kind(store):
+    first = store.add_network("A")
+    second = store.add_network("B")
+    store.add_subnet(first.id, "10.0.0.0/24", "68890 HSM IN-CT", fields={"Telephony Rng": "68890"})
+    store.set_address(first.id, "10.0.0.7", USED, "HSM-68890-SW1")
+    store.set_address(first.id, "10.0.0.8", RESERVED, "68890 spare")
+    store.add_subnet(second.id, "10.0.0.0/24", "68890 other")
+    store.set_address(second.id, "10.0.0.7", USED, "68890-host")
+
+    def found(text, **options):
+        return {(network.name, subnet.cidr if subnet else None, address.ip if address else None)
+                for network, subnet, address in store.search(text, **options)}
+
+    assert len(found("68890")) == 5
+    assert found("68890", network_id=first.id) == {("A", "10.0.0.0/24", None), ("A", "10.0.0.0/24", "10.0.0.7"),
+                                                   ("A", "10.0.0.0/24", "10.0.0.8")}
+    assert found("68890", addresses=False) == {("A", "10.0.0.0/24", None), ("B", "10.0.0.0/24", None)}
+    assert found("68890", subnets=False, network_id=second.id) == {("B", "10.0.0.0/24", "10.0.0.7")}
+    assert found("68890", subnets=False, status=RESERVED) == {("A", "10.0.0.0/24", "10.0.0.8")}
+    assert found("68890", subnets=False, status=USED) == {("A", "10.0.0.0/24", "10.0.0.7"),
+                                                         ("B", "10.0.0.0/24", "10.0.0.7")}
+    # Searching for an address by value keeps to the same choices
+    assert found("10.0.0.7", addresses=False, network_id=first.id) == {("A", "10.0.0.0/24", None)}
+    assert found("10.0.0.8", subnets=False, status=USED) == set()
+    assert found("10.0.0.9", subnets=False, status=RESERVED) == set()  # Free, so neither used nor reserved
+    assert found("10.0.0.9", subnets=False) == {("A", "10.0.0.0/24", "10.0.0.9"), ("B", "10.0.0.0/24", "10.0.0.9")}
 
 
 HEADER = ["", "Network Name", "Telephony Rng", "Subnet", "Mask", "Gateway", "Reserved", "Assignment"]
@@ -416,3 +444,25 @@ def test_loopback_rows_outside_one_block_keep_their_name():
     assert found == [("10.0.0.2/31", "POP Loopback", True), ("10.0.0.4/31", "POP Loopback", True)]
     assert not sheet.problems
     assert [address.ip for address in sheet.addresses] == ["10.0.0.2", "10.0.0.3"]
+
+
+def test_search_in_one_field(store):
+    network = store.add_network("A")
+    store.add_subnet(network.id, "10.0.0.0/24", "68890 HSM IN-CT", fields={"Telephony Rng": "68900"})
+    store.add_subnet(network.id, "10.0.1.0/24", "MAIN IN-CT", "", "for 68890", fields={"Telephony Rng": "68890"})
+    store.set_address(network.id, "10.0.1.7", USED, "sw-68890", mac="00-68-89-00-00-01", fields={"Rack": "68890"})
+
+    def found(text, match):
+        return {(subnet.cidr if subnet else None, address.ip if address else None)
+                for _, subnet, address in store.search(text, match=match)}
+
+    assert len(found("68890", "anywhere")) == 3
+    assert found("68890", "Telephony Rng") == {("10.0.1.0/24", None)}  # Not the subnet with 68890 in its name
+    assert found("68890", NAME) == {("10.0.0.0/24", None), ("10.0.1.0/24", "10.0.1.7")}
+    assert found("68890", DESCRIPTION) == {("10.0.1.0/24", None)}
+    assert found("00-68-89", MAC) == {("10.0.1.0/24", "10.0.1.7")}
+    assert found("68890", "Rack") == {("10.0.1.0/24", "10.0.1.7")}
+    assert found("10.0.1", VALUE) == {("10.0.1.0/24", None), ("10.0.1.0/24", "10.0.1.7")}
+    assert found("10.0.1.7", NAME) == set()  # An address typed in, but only names are searched
+    assert found("68890", "No such detail") == set()
+    assert store.detail_names() == ["Rack", "Telephony Rng"]

@@ -24,6 +24,7 @@ class AdapterTab(QWidget):
         self.form_adapter_index = None  # Adapter whose settings are loaded in the form
         self.form_dirty = False  # The user has edited the form since it was loaded
         self.form_config = None  # Validated IPConfig from the form, or None
+        self.ipam_pick = None  # The address picked from IPAM for the form, recorded there once the change is kept
         self.init_ui()
         window.snapshot_changed.connect(self.on_snapshot_changed)
         window.adapter_changed.connect(self.on_adapter_changed)
@@ -128,8 +129,12 @@ class AdapterTab(QWidget):
         self.apply_button = accent_button("Apply Settings")
         self.undo_edits_button = QPushButton("Undo Edits")
         self.undo_edits_button.setToolTip("Reload the adapter's current settings into the form.")
+        self.ipam_button = QPushButton("Free Address from IPAM...")
+        self.ipam_button.setToolTip("Fill in a free address from IPAM (the next free one in a subnet you pick), with "
+                                    "its mask and gateway. It's recorded in IPAM once you keep the new settings.")
         settings_buttons.addWidget(self.apply_button)
         settings_buttons.addWidget(self.undo_edits_button)
+        settings_buttons.addWidget(self.ipam_button)
         settings_layout.addLayout(settings_buttons)
         right.addWidget(self.settings_group)
 
@@ -179,7 +184,8 @@ class AdapterTab(QWidget):
             line_edit.textChanged.connect(self.on_form_changed)
             line_edit.textEdited.connect(self.mark_dirty)
         self.apply_button.clicked.connect(lambda: self.apply_settings())
-        self.undo_edits_button.clicked.connect(self.reload_form)
+        self.undo_edits_button.clicked.connect(self.undo_edits)
+        self.ipam_button.clicked.connect(self.pick_from_ipam)
         self.profile_combo.currentIndexChanged.connect(self.on_profile_selected)
         self.apply_profile_button.clicked.connect(self.apply_profile)
         self.load_profile_button.clicked.connect(self.load_profile_into_form)
@@ -285,6 +291,10 @@ class AdapterTab(QWidget):
                 line_edit.clear()
             self.mtu_input.clear()
         self.form_dirty = False
+
+    def undo_edits(self):
+        self.ipam_pick = None
+        self.reload_form()
 
     def load_config_into_form(self, config):
         (self.dhcp_radio if config.dhcp else self.static_radio).setChecked(True)
@@ -397,8 +407,58 @@ class AdapterTab(QWidget):
         dialog = KeepChangesDialog(self, f"{adapter.name}: {config.describe()}\n\nPrevious: {old.describe()}")
         if dialog.exec_() == KeepChangesDialog.Accepted:
             self.window.show_status(f"Kept the new settings on {adapter.name}.")
+            self.record_ipam_pick(adapter, config)
         else:
+            self.ipam_pick = None
             self.revert(adapter, old, config)
+
+    # ----------------------------------------------------------------- An address from IPAM
+
+    def pick_from_ipam(self):
+        from .ipam_tab import TEAM
+        from .ipam_tools import AddressPickerDialog
+        adapter = self.configurable_adapter()
+        ipam = getattr(self.window, "ipam_tab", None)
+        if adapter is None or ipam is None:
+            return
+        stores = [("Tribe" if source == TEAM else "Local", store) for source, store in ipam.ipam_stores()]
+        if not any(store.networks() for _, store in stores):
+            QMessageBox.information(self, "Free Address from IPAM", "IPAM has no networks yet. Import your "
+                                                                    "addressing workbook on the IP Addresses page.")
+            return
+        dialog = AddressPickerDialog(self, stores, adapter)
+        if not dialog.exec_() or dialog.choice() is None:
+            return
+        store, network, subnet, address = dialog.choice()
+        self.static_radio.setChecked(True)
+        self.ip_input.setText(f"{address}/{subnet.network.prefixlen}")
+        self.gateway_input.setText(subnet.gateway)
+        self.form_dirty = True
+        self.ipam_pick = {"store": store, "network": network, "address": str(address),
+                          "name": dialog.name_input.text().strip(), "record": dialog.record_check.isChecked(),
+                          "adapter": adapter.index} if dialog.record_check.isChecked() else None
+        self.update_field_states()
+        self.window.show_status(f"Filled in {address} from {network.name} ({subnet.cidr}). Apply Settings to use it" +
+                                ("; it's recorded in IPAM when you keep the new settings." if self.ipam_pick
+                                 else "."))
+
+    def record_ipam_pick(self, adapter, config):
+        """The new settings were kept: record the address picked from IPAM, if it's the one applied."""
+        pick, self.ipam_pick = self.ipam_pick, None
+        if pick is None or pick["adapter"] != adapter.index or config.dhcp or config.address != pick["address"]:
+            return
+        from ..ipam.store import USED
+        try:
+            pick["store"].set_address(pick["network"].id, pick["address"], USED, pick["name"], adapter.mac or "",
+                                      f"{adapter.name} (set by NOMAD)")
+        except Exception as error:  # Refused by the server, or the store was closed since (reconnected)
+            log.warning("Couldn't record %s in IPAM: %s", pick["address"], error)
+            QMessageBox.warning(self, "Not Recorded in IPAM", f"The new settings were kept, but {pick['address']} "
+                                                             f"couldn't be recorded in IPAM: {error}")
+            return
+        self.window.ipam_tab.refresh_after_external_change()
+        self.window.show_status(f"Kept the new settings on {adapter.name}, and recorded {pick['address']} in "
+                                f"{pick['network'].name}.")
 
     def revert(self, adapter, old, current):
         def failed(error):
