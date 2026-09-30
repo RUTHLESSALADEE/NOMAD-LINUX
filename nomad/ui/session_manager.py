@@ -229,16 +229,18 @@ class SessionManager(QWidget):
         pairs = ((entry, self.store.recent_session(entry)) for entry in self.store.recent)
         return [(entry, session) for entry, session in pairs if self.shows(session)]
 
-    def fill_menu(self, menu):
-        """The session list as a menu, for when it's hidden: folders become submenus."""
+    def fill_menu(self, menu, into=None):
+        """The session list as a menu, for when it's hidden: folders become submenus. into: the tabs to open
+        sessions in (a pop-out window's, or a pane's), instead of the page's."""
         menu.clear()
-        menu.addAction("Quick Connect...", self.quick_connect_dialog)
-        menu.addAction("New Session...", lambda: self.new_session(""))
+        menu.addAction("Quick Connect...", lambda: self.quick_connect_dialog(into))
+        if into is None:
+            menu.addAction("New Session...", lambda: self.new_session(""))
         recent = self.visible_recent()
         if recent:
             recent_menu = menu.addMenu("Recent")
             for entry, session in recent:
-                action = recent_menu.addAction(session.name, lambda entry=entry: self.open_recent(entry))
+                action = recent_menu.addAction(session.name, lambda entry=entry: self.open_recent(entry, into=into))
                 action.setToolTip(f"{session.target()} ({session.protocol})")
         menu.addSeparator()
         submenus = {"": menu}
@@ -254,18 +256,19 @@ class SessionManager(QWidget):
             folder_menu(path)
         for session in sorted(self.visible_sessions(), key=lambda item: item.name.lower()):
             action = folder_menu(session.folder).addAction(session.name, lambda session=session:
-                                                           self.page.open_session(session))
+                                                           self.page.open_session(session, into=into))
             action.setToolTip(f"{session.target()} ({session.protocol})")
         if not self.visible_sessions():
             menu.addAction("No saved sessions").setEnabled(False)
         menu.addSeparator()
 
-    def quick_connect_dialog(self):
+    def quick_connect_dialog(self, into=None):
         examples = "admin@10.0.0.1, telnet 10.0.0.5, COM3:115200" if self.quick_protocol.count() > 1 else             "admin@10.0.0.1, admin@host:2222"
-        text, ok = QInputDialog.getText(self, "Quick Connect", f"Connect to ({examples}):", text=self.quick_input.text())
+        text, ok = QInputDialog.getText(into or self, "Quick Connect", f"Connect to ({examples}):",
+                                        text=self.quick_input.text())
         if ok and text.strip():
             self.quick_input.setText(text.strip())
-            self.quick_connect()
+            self.quick_connect(into)
 
     def lock_now(self):
         self.store.vault.lock()
@@ -302,16 +305,19 @@ class SessionManager(QWidget):
         SecurityDialog(self, self.store).exec_()
         self.update_protection()
 
-    def quick_connect(self):
+    def quick_connect(self, into=None):
         try:
             session = parse_quick_connect(self.quick_input.text(), self.quick_protocol.currentText())
             if not self.shows(session):
                 raise ValueError(f"This page only opens {' and '.join(sorted(self.protocols))} sessions.")
         except ValueError as error:
+            if into is not None:  # From a menu, perhaps in a pop-out window: the sidebar may not be in sight
+                QMessageBox.warning(into, "Quick Connect", str(error))
+                return
             set_hint(self.quick_status, str(error), "error")
             self.quick_status.setVisible(True)
             return
-        self.page.open_session(session, saved=True)
+        self.page.open_session(session, saved=True, into=into)
 
     # ----------------------------------------------------------------- The session tree
 
@@ -663,8 +669,8 @@ class SessionManager(QWidget):
 
     # ----------------------------------------------------------------- Recent connections
 
-    def open_recent(self, entry, window=False):
-        self.page.open_session(self.store.recent_session(entry), window=window)
+    def open_recent(self, entry, window=False, into=None):
+        self.page.open_session(self.store.recent_session(entry), window=window, into=into)
 
     def save_recent(self, entry):
         session = entry.session.copy(name=self.store.unique_name(entry.session.name, entry.session.folder))

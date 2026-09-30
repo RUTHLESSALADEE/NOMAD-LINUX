@@ -33,7 +33,10 @@ from .ports_tab import PortsTab
 from .report_dialog import ReportDialog
 from .routing_tab import RoutingTab
 from .scp_tab import ScpTab
+from .highlight_dialog import HighlightDialog
+from .session_tabs import LAYOUTS
 from .snmp_tab import SnmpTab
+from .subnet_tab import SubnetTab
 from .sweep_tab import SweepTab
 from .switch_tab import SwitchTab
 from .syslog_tab import SyslogTab
@@ -41,7 +44,7 @@ from .tftp_tab import TftpTab
 from .theme import COLORS, DEFAULT_TEXT_SCALE, TEXT_SCALES, set_text_scale
 from .traceroute_tab import TracerouteTab
 from .terminal_tab import TerminalTab
-from .utilities_tab import UtilitiesTab
+from .wake_tab import WakeTab
 from .web_check_tab import WebCheckTab
 
 log = logging.getLogger(__name__)
@@ -148,7 +151,8 @@ class MainWindow(QMainWindow):
         self.capture_tab = CaptureTab(self)
         self.syslog_tab = SyslogTab(self)
         self.tftp_tab = TftpTab(self)
-        self.utilities_tab = UtilitiesTab(self)
+        self.subnet_tab = SubnetTab(self)
+        self.wake_tab = WakeTab(self)
         self.session_store = SessionStore()  # Shared by the Terminal and SCP pages
         self.terminal_tab = TerminalTab(self, self.session_store)
         self.scp_tab = ScpTab(self, self.session_store)
@@ -166,7 +170,7 @@ class MainWindow(QMainWindow):
             ("DNS & Web", [(self.lookup_tab, "DNS Lookup"), (self.dns_servers_tab, "DNS Servers"),
                            (self.web_check_tab, "Web Check")]),
             ("Tools", [(self.capture_tab, "Packet Capture"), (self.syslog_tab, "Syslog"), (self.tftp_tab, "TFTP"),
-                       (self.utilities_tab, "Utilities")]),
+                       (self.subnet_tab, "Subnet Calculator"), (self.wake_tab, "Wake-on-LAN")]),
         ]
         self.all_tabs = []
         for section, pages in sections:
@@ -231,6 +235,24 @@ class MainWindow(QMainWindow):
         self.focus_action.triggered.connect(self.set_focus_mode)
         view_menu.addAction(self.focus_action)
         self.addAction(self.focus_action)
+        # Also beside the Terminal page's tabs; here too so it can always be reached
+        layout_menu = view_menu.addMenu("Terminal &Layout")
+        layout_group = QActionGroup(self)
+        for key, label, _, _ in LAYOUTS:
+            action = layout_menu.addAction(label, lambda key=key: self.set_terminal_layout(key))
+            action.setCheckable(True)
+            action.setData(key)
+            layout_group.addAction(action)
+        layout_menu.aboutToShow.connect(lambda: [action.setChecked(action.data() == self.terminal_tab.tabs.layout_key)
+                                                 for action in layout_group.actions()])
+        self.buttons_action = view_menu.addAction("Terminal Command &Buttons", self.toggle_command_buttons)
+        self.buttons_action.setCheckable(True)
+        self.highlight_action = view_menu.addAction(
+            "&Highlight Terminal Keywords", lambda checked: self.terminal_tab.highlights.set_enabled(checked))
+        self.highlight_action.setCheckable(True)
+        view_menu.addAction("Terminal &Keyword Highlighting...",
+                            lambda: HighlightDialog(self, self.terminal_tab.highlights).exec_())
+        view_menu.aboutToShow.connect(self.update_terminal_actions)
         view_menu.addSeparator()
         text_menu = view_menu.addMenu("&Text Size")
         self.text_scale_group = QActionGroup(self)
@@ -355,6 +377,19 @@ class MainWindow(QMainWindow):
                 page.show_page(page.stack.currentIndex())
         if on:
             self.show_status("Focus mode: press F11 to bring everything back.", "info")
+
+    def update_terminal_actions(self):
+        tabs = self.terminal_tab.tabs
+        self.buttons_action.setChecked(tabs.command_bar is not None and tabs.command_bar.isVisibleTo(tabs))
+        self.highlight_action.setChecked(self.terminal_tab.highlights.enabled)
+
+    def toggle_command_buttons(self, visible):
+        self.terminal_tab.tabs.show_command_bar(visible)
+        self.navigator.setCurrentWidget(self.terminal_tab)
+
+    def set_terminal_layout(self, key):
+        self.terminal_tab.tabs.set_layout(key)
+        self.navigator.setCurrentWidget(self.terminal_tab)
 
     def on_sidebar_toggled(self, visible):
         self.sidebar_action.setChecked(visible)
@@ -546,9 +581,9 @@ class MainWindow(QMainWindow):
         ReportDialog(self, adapter).exec_()
 
     def wake_device(self, mac, name=""):
-        """Open Wake-on-LAN on the Utilities tab with a device filled in (from the Sweep and ARP tabs)."""
-        self.navigator.setCurrentWidget(self.utilities_tab)
-        self.utilities_tab.wake_device(mac, name)
+        """Open the Wake-on-LAN tab with a device filled in (from the Sweep and ARP tabs)."""
+        self.navigator.setCurrentWidget(self.wake_tab)
+        self.wake_tab.wake_device(mac, name)
 
     def focus_route_filter(self):
         self.navigator.setCurrentWidget(self.routing_tab)

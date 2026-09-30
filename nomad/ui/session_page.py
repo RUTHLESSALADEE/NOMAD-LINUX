@@ -7,7 +7,7 @@ from ..terminal.sessions import SSH, parse_quick_connect
 from .session_dialog import SessionDialog
 from .session_manager import SessionManager
 from .session_tabs import SessionTabs, SessionWindow
-from .terminal_view import DISCONNECTED
+from .terminal_view import CONNECTED, DISCONNECTED
 from .theme import COLORS
 
 
@@ -19,6 +19,9 @@ class SessionPage(QWidget):
     window_title = "NOMAD Terminal"
     placeholder_text = ""
     kind = "terminal session"  # For "3 terminal sessions are still connected"
+    tiling = False  # Offer the Layout menu, to show several sessions at once, and Send to All
+    broadcast_scope = "all"  # Send to All: "all" connected sessions, those on "screen", or the "window"'s
+    mirror_typing = False  # Send to All's Type in All: typing in one session goes to the others too
 
     def __init__(self, window, store):
         super().__init__(window)
@@ -130,6 +133,10 @@ class SessionPage(QWidget):
         prefix = self.settings_prefix
         settings.setValue(f"{prefix}/splitter", self.splitter.saveState())
         settings.setValue(f"{prefix}/manager", self.manager_shown)
+        if self.tiling:
+            settings.setValue(f"{prefix}/layout", self.tabs.layout_key)
+            if self.tabs.command_bar is not None:
+                settings.setValue(f"{prefix}/buttons", self.tabs.command_bar.isVisibleTo(self.tabs))
         self.manager.save_settings(settings)
 
     def restore_settings(self, settings):
@@ -138,6 +145,9 @@ class SessionPage(QWidget):
         if state is not None:
             self.splitter.restoreState(state)
         self.manager_shown = settings.value(f"{prefix}/manager", True, bool)
+        if self.tiling:
+            self.tabs.set_layout(settings.value(f"{prefix}/layout", "tabs", str))
+            self.tabs.show_command_bar(settings.value(f"{prefix}/buttons", False, bool))
         self.show_page(self.stack.currentIndex())
         self.manager.restore_settings(settings)
 
@@ -147,6 +157,58 @@ class SessionPage(QWidget):
             window.close()
         for view in self.tabs.views():
             self.tabs.close_view(view, ask=False)
+
+    # ----------------------------------------------------------------- Send to All
+
+    def all_tabs(self):
+        return [self.tabs] + [window.tabs for window in self.windows]
+
+    def broadcast_targets(self, scope, origin=None):
+        """The connected sessions Send to All reaches: all, those on screen (the one showing in each pane of the
+        windows in view), or those in the `origin` tabs' window. Sessions left out never are."""
+        if scope == "window" and origin is not None:
+            views = origin.views()
+        elif scope == "screen":
+            views = [pane.current() for tabs in self.all_tabs() if tabs.isVisible() for pane in tabs.panes
+                     if pane.current() is not None]
+        else:
+            views = self.all_views()
+        return [view for view in views if view.state == CONNECTED and hasattr(view, "send_line") and
+                not view.left_out]
+
+    def send_to_all(self, command, scope, origin=None):
+        """Send a command line to the sessions; returns how many it went to."""
+        return sum(bool(view.send_line(command)) for view in self.broadcast_targets(scope, origin))
+
+    def set_broadcast(self, scope=None, mirror=None):
+        if scope is not None:
+            self.broadcast_scope = scope
+        if mirror is not None:
+            self.mirror_typing = mirror
+        self.refresh_send_bars()
+
+    def refresh_send_bars(self):
+        for tabs in self.all_tabs():
+            if tabs.send_bar is not None:
+                tabs.send_bar.refresh()
+
+    def mirror_typed(self, source, text, block=False):
+        """Type in All: what was typed in one session goes to the others Send to All reaches. block: a paste
+        sent line by line, which each session sends with its own line delay."""
+        if not self.mirror_typing or source.left_out:
+            return
+        origin = next((tabs for tabs in self.all_tabs() if tabs.pane_of(source) is not None), None)
+        for target in self.broadcast_targets(self.broadcast_scope, origin):
+            if target is source:
+                continue
+            if block:
+                target.send_block(text, final_enter=False)
+            else:  # Each session's own Enter (\r, or \r\n for some Telnet devices)
+                target.send_text(target.view.enter if text == source.view.enter else text)
+
+    def send_keys_to_all(self, text, scope, origin=None):
+        """Send keys as typed (Ctrl+C and the like) to the sessions; returns how many they went to."""
+        return sum(bool(view.send_text(text)) for view in self.broadcast_targets(scope, origin))
 
     def all_views(self):
         views = self.tabs.views()
@@ -168,8 +230,9 @@ class SessionPage(QWidget):
 
     # ----------------------------------------------------------------- Opening sessions
 
-    def open_session(self, session, saved=True, window=False):
-        """Open a tab for a session and connect. saved=False opens a copy that isn't tied to the saved one."""
+    def open_session(self, session, saved=True, window=False, into=None):
+        """Open a tab for a session and connect. saved=False opens a copy that isn't tied to the saved one.
+        into: the tabs to open it in (a pop-out window's), instead of this page's."""
         if not saved:
             session = session.copy()
         view = self.make_view(session)
@@ -179,6 +242,9 @@ class SessionPage(QWidget):
             new_window.tabs.add_view(view)
             new_window.update_title()
             new_window.show()
+        elif into is not None and into is not self.tabs:
+            into.add_view(view)
+            into.window().activateWindow()
         else:
             self.show_page(1)
             self.tabs.add_view(view)
@@ -197,6 +263,8 @@ class SessionPage(QWidget):
 
     def new_window(self):
         new_window = SessionWindow(self)
+        if self.tabs.command_bar is not None:  # Command buttons as in the main window
+            new_window.tabs.show_command_bar(self.tabs.command_bar.isVisibleTo(self.tabs))
         self.windows.append(new_window)
         return new_window
 

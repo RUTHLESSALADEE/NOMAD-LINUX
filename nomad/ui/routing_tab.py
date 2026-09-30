@@ -8,7 +8,8 @@ from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QComboBo
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QShortcut, QTableWidget, \
     QVBoxLayout, QWidget
 
-from ..routes import add_route, build_route_copy_command, delete_route, validate_route_input
+from ..routes import add_route, build_route_copy_command, delete_route, matching_routes, parse_route_lookup, \
+    validate_route_input
 from ..snapshot import Route
 from ..system import CommandError
 from .common import SortableTableItem, set_hint, set_invalid
@@ -24,6 +25,7 @@ DEFAULT_ROUTE_COLOR = COLORS["warning_background"]
 ADDED_ROUTE_COLOR = COLORS["success_background"]
 PERSISTENT_ROUTE_COLOR = COLORS["link"]
 INACTIVE_ROUTE_COLOR = COLORS["disabled"]
+BEST_ROUTE_MARKER = "► "
 
 
 class RoutingTab(QWidget):
@@ -52,7 +54,7 @@ class RoutingTab(QWidget):
         toolbar_layout.addWidget(self.route_family_combo)
 
         self.route_filter_input = QLineEdit(self)
-        self.route_filter_input.setPlaceholderText("Filter by destination, gateway, interface... (Ctrl+F)")
+        self.route_filter_input.setPlaceholderText("Look up an address, e.g. 10.1.2.3, or filter by gateway, interface... (Ctrl+F)")
         self.route_filter_input.setClearButtonEnabled(True)
         toolbar_layout.addWidget(self.route_filter_input, 1)
 
@@ -285,21 +287,50 @@ class RoutingTab(QWidget):
         table = self.routing_table_widget
         filter_text = self.route_filter_input.text().strip().lower()
         hide_system = self.hide_system_routes_check.isChecked()
+        family = self.current_route_family()
 
-        visible_count = 0
+        # An address or network is looked up like a router would, showing every route that covers it (system
+        # routes included, since a host or on-link route may be the one that wins)
+        lookup = parse_route_lookup(family, filter_text)
+        best = None
+        if lookup is not None:
+            routes = [table.item(row, 0).data_object for row in range(table.rowCount())]
+            matches, best = matching_routes(routes, lookup)
+            match_ids = {id(route) for route in matches}
+
+        visible_count, best_row = 0, None
         for row in range(table.rowCount()):
             route = table.item(row, 0).data_object
-            hidden = (hide_system and route.is_system and not route.persistent
-                      and route.match_key not in self.session_added_routes)
-            if not hidden and filter_text:
-                row_text = " ".join(table.item(row, column).text().lower() for column in range(COL_DELETE))
-                hidden = filter_text not in row_text
+            if lookup is not None and route is best:
+                best_row = row
+            self.mark_best_route_row(row, row == best_row)
+            if lookup is not None:
+                hidden = id(route) not in match_ids
+            else:
+                hidden = (hide_system and route.is_system and not route.persistent
+                          and route.match_key not in self.session_added_routes)
+                if not hidden and filter_text:
+                    row_text = " ".join(table.item(row, column).text().lower() for column in range(COL_DELETE))
+                    hidden = filter_text not in row_text
             table.setRowHidden(row, hidden)
             if not hidden:
                 visible_count += 1
 
-        self.route_count_label.setText(
-            f"Showing {visible_count} of {table.rowCount()} IPv{self.current_route_family()} routes")
+        count_text = f"Showing {visible_count} of {table.rowCount()} IPv{family} routes"
+        if lookup is not None:
+            if best is not None:
+                count_text += f"  ·  {lookup} goes to {self.describe_route(best)} (marked ►)"
+            else:
+                count_text += f"  ·  No active route to {lookup}"
+        self.route_count_label.setText(count_text)
+        if best_row is not None:
+            table.scrollToItem(table.item(best_row, 0))
+
+    def mark_best_route_row(self, row, best):
+        """Put a marker in front of the destination of the route an address lookup chose."""
+        item = self.routing_table_widget.item(row, 0)
+        text = item.text().removeprefix(BEST_ROUTE_MARKER)
+        item.setText(BEST_ROUTE_MARKER + text if best else text)
 
     # ----------------------------------------------------------------- Form
 
@@ -571,7 +602,8 @@ class RoutingTab(QWidget):
         elif chosen is copy_row_action:
             row = item.row()
             QApplication.clipboard().setText("\t".join(
-                self.routing_table_widget.item(row, column).text() for column in range(COL_DELETE)))
+                self.routing_table_widget.item(row, column).text().removeprefix(BEST_ROUTE_MARKER)
+                for column in range(COL_DELETE)))
             self.window.show_status("Copied row to the clipboard.", "info")
         elif chosen is copy_command_action:
             QApplication.clipboard().setText(build_route_copy_command(route))

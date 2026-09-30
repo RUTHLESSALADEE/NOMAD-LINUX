@@ -6,6 +6,27 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-09-29
+
+### Added
+
+- Command buttons on the Terminal page (Buttons, beside Send to All; also View > Terminal Command Buttons): saved commands, or whole blocks of configuration, sent with one click to the session you're in, or to every session while Type in All is on. Right-click a button to send it to all, edit, duplicate, move or delete it. Kept in %APPDATA%\NOMAD\commands.json, shared by every window.
+- Line delay (session settings > Sending and Staying Connected): pasting several lines, a command button or Send to All sends them one at a time, so consoles and older switches don't drop characters. The status line shows progress, and right-click the tab > Stop Sending drops the rest.
+- Keyword highlighting in terminal sessions: down, err-disabled, % Invalid, notconnect, up, IP and MAC addresses and more in colour, only where the device didn't colour the text itself. Change the words and colours in View > Terminal Keyword Highlighting, or switch it off in View > Highlight Terminal Keywords.
+- Reconnect automatically (session settings, or right-click the tab): when the connection drops, such as a device reloading, NOMAD tries again every 10 seconds (for up to half an hour) until it's back. Not after you type exit or logout, or disconnect it yourself; right-click the tab > Stop Reconnecting stops it.
+- Anti-idle (session settings): after a set time without typing, send a space and a backspace (or any text you choose), so the device's exec-timeout doesn't log you out.
+- Send to All on the Terminal page (beside Layout): type a command once and send it to every connected session, the sessions on screen, or this window's, each with its own Enter; Up and Down bring back earlier commands. Ctrl+C in its box interrupts every session (unless text in the box is selected, which it copies), Ctrl+Z with the box empty sends Ctrl+Z, and Ctrl+Shift+6 sends Cisco's abort; the Keys menu sends these and Tab, Space, q, Esc and Enter to all. Type in All mirrors your typing into all of them as you go (the bar turns amber while it's on, and closing the bar turns it off). Right-click a tab > Leave Out of Send to All to skip a session (its tab shows ⊘).
+- Tiling on the Terminal page: Layout (beside the tabs) shows several sessions at once: two or three side by side or stacked, or a 2 × 2 or 3 × 2 grid, with draggable splitters. Each pane has its own tabs: drag a tab onto another pane, or right-click it > Move to, to move the session there (it stays connected), even into a pane of another window. An empty pane has an Open Session menu (saved sessions, Recent and Quick Connect) that opens a session in that pane, and pop-out windows have a Sessions menu of their own, so sessions can be opened straight into them. Clicking in a pane makes it the active one (outlined in the accent color); new sessions open in an empty pane, or else the active one. Also in View > Terminal Layout. Pop-out windows can be tiled too, and the page remembers its layout.
+- Route lookup on the Routing Table page: type an address or network in the filter (such as 10.1.2.3, 10.1.0.0/16, or a partly typed 10.1.) to see every route that covers it, as a router's lookup would, system routes included. The route Windows would use (longest prefix, then lowest metric) is marked ► and named under the table.
+
+### Changed
+
+- The Utilities page is now two pages under Tools: Subnet Calculator and Wake-on-LAN. Saved devices and the last subnet carry over.
+
+### Fixed
+
+- Adding a persistent route failed, because New-NetRoute doesn't accept the persistent store directly. It's now added to both stores at once (replacing an active-only copy of the same route first), and deleting a route removes every matching copy.
+
 ## [1.7.0] - 2026-09-29
 
 ### Added

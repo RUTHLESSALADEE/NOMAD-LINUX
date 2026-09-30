@@ -6,10 +6,11 @@ import time
 from PyQt5.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPen
 from PyQt5.QtWidgets import QApplication, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollBar, \
-    QVBoxLayout, QWidget
+    QSizePolicy, QVBoxLayout, QWidget
 
 from ..terminal.model import LogCleaner, Position, TerminalModel, encode_key, encode_paste
-from ..terminal.sessions import SERIAL
+from ..terminal.highlight import COLORS as KEYWORD_COLORS
+from ..terminal.sessions import SERIAL, decode_escapes
 from ..terminal.transports import ConnectionFailed, make_transport
 from .common import StoppableThread
 from .prompts import PromptAnswers, UiPrompter
@@ -42,6 +43,9 @@ APP_SHORTCUTS = {(Qt.Key_Tab, Qt.ControlModifier), (Qt.Key_Backtab, Qt.ControlMo
                  (Qt.Key_Tab, Qt.ControlModifier | Qt.ShiftModifier),
                  (Qt.Key_F11, Qt.NoModifier)}  # Left to the window: switching tabs/pages, and focus mode
 REPAINT_MILLISECONDS = 15
+RECONNECT_SECONDS = 10
+RECONNECT_LIMIT = 180  # Tries (half an hour) before giving up: long enough for a big chassis to reload
+EXIT_COMMANDS = {"exit", "logout", "quit", "logoff", "bye"}  # Closing with one isn't a drop to reconnect
 WHEEL_LINES = 3
 
 
@@ -66,6 +70,7 @@ class TerminalView(QWidget):
         self.selection = None  # (anchor, end) Positions
         self.selecting = False
         self.highlight = None  # (Position, length) of a find match
+        self.highlighter = None  # Keyword highlighting (terminal.highlight.Highlighter), or None when it's off
         self.application_keys = False
         self.backspace_delete = True
         self.enter = "\r"
@@ -184,13 +189,15 @@ class TerminalView(QWidget):
             if index >= model.line_count:
                 break
             line = model.line(index)
+            keywords = self.keyword_colors(line, columns)
             y = row * height
             column = 0
             while column < columns:
                 char = line[column]
                 selected = selection is not None and selection[0] <= Position(index, column) <= selection[1]
+                keyword = keywords[column] if keywords else None
                 key = (char.fg, char.bg, char.bold, char.italics, char.underscore, char.strikethrough, char.reverse,
-                       selected)
+                       selected, keyword)
                 texts = [char.data or " "]
                 start = column
                 column += 1
@@ -200,13 +207,14 @@ class TerminalView(QWidget):
                         data = following.data or " "
                         following_selected = selection is not None and \
                             selection[0] <= Position(index, column) <= selection[1]
+                        following_keyword = keywords[column] if keywords else None
                         if not is_simple(data) or (following.fg, following.bg, following.bold, following.italics,
                                                    following.underscore, following.strikethrough, following.reverse,
-                                                   following_selected) != key:
+                                                   following_selected, following_keyword) != key:
                             break
                         texts.append(data)
                         column += 1
-                self.draw_run(painter, "".join(texts), start, y, char, selected)
+                self.draw_run(painter, "".join(texts), start, y, char, selected, keyword)
 
             if self.highlight is not None and self.highlight[0].line == index:
                 position, length = self.highlight
@@ -227,11 +235,30 @@ class TerminalView(QWidget):
                 painter.setBrush(Qt.NoBrush)
                 painter.drawRect(rect.adjusted(0.5, 0.5, -1, -1))
 
-    def draw_run(self, painter, text, column, y, char, selected):
+    def keyword_colors(self, line, columns):
+        """The keyword colour of each column of a line (None for most), or None if nothing matches. Only text
+        in the default colour is coloured: the device's own colours are left alone."""
+        if self.highlighter is None:
+            return None
+        text = "".join(line[column].data or " " for column in range(columns))  # One character per column
+        spans = self.highlighter.spans(text.rstrip())
+        if not spans:
+            return None
+        colors = [None] * columns
+        for start, end, color in spans:
+            for column in range(start, min(end, columns)):
+                char = line[column]
+                if char.fg == "default" and not char.reverse:
+                    colors[column] = color
+        return colors if any(colors) else None
+
+    def draw_run(self, painter, text, column, y, char, selected, keyword=None):
         foreground_name = char.fg
         if char.bold and foreground_name in BASE_COLORS:
             foreground_name = "bright" + foreground_name  # Bold shows as the bright colour, as most terminals do
         foreground = self.color(foreground_name, FOREGROUND)
+        if keyword is not None:
+            foreground = self.color(KEYWORD_COLORS[keyword][1:], foreground)
         background = self.color(char.bg, BACKGROUND)
         if char.reverse:
             foreground, background = background, foreground
@@ -467,6 +494,24 @@ class SessionView(PromptAnswers, QWidget):
         self.last_history = 0
         self.last_scrolled_out = 0
         self.model = TerminalModel(80, 24, session.scrollback, session.encoding, respond=self.respond)
+        self.mirror = None  # Called with (this view, text, block) after typing: Send to All's Type in All
+        self.left_out = False  # Left out of Send to All
+        self.status_text = ""
+        self.outbox = []  # Lines still to send, line_delay apart (a paste or a command button)
+        self.outbox_total = 0
+        self.outbox_timer = QTimer(self)
+        self.outbox_timer.setSingleShot(True)
+        self.outbox_timer.timeout.connect(self.send_next_line)
+        self.auto_reconnect = session.auto_reconnect
+        self.reconnect_attempts = 0  # While reconnecting after a drop
+        self.reconnect_timer = QTimer(self)
+        self.reconnect_timer.setSingleShot(True)
+        self.reconnect_timer.timeout.connect(self.connect_session)
+        self.typed_line = ""
+        self.last_command = ("", 0.0)  # The last line sent, and when: an "exit" means the drop was wanted
+        self.idle_timer = QTimer(self)
+        self.idle_timer.setSingleShot(True)
+        self.idle_timer.timeout.connect(self.send_anti_idle)
         self.question.connect(self.answer, Qt.QueuedConnection)
 
         layout = QVBoxLayout(self)
@@ -500,6 +545,9 @@ class SessionView(PromptAnswers, QWidget):
         status.setContentsMargins(6, 2, 6, 2)
         self.status_label = QLabel()
         self.status_label.setStyleSheet(f"color: {COLORS['muted']};")
+        # A long message is cut off (it's in the tooltip) rather than widening the session, which in a tiled
+        # layout could push the window wider than the screen
+        self.status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.log_label = QLabel()
         self.log_label.setStyleSheet(f"color: {COLORS['accent']};")
         status.addWidget(self.status_label, 1)
@@ -527,6 +575,7 @@ class SessionView(PromptAnswers, QWidget):
     def connect_session(self):
         if self.state != DISCONNECTED:
             return
+        self.reconnect_timer.stop()
         self.set_state(CONNECTING)
         target = self.session.target()
         self.note(f"Connecting to {target} ({self.session.protocol})...", NOTE_COLOR)
@@ -541,6 +590,7 @@ class SessionView(PromptAnswers, QWidget):
         self.thread.start()
 
     def on_connected(self, description, notice):
+        self.reconnect_attempts = 0
         self.set_state(CONNECTED, description)
         if notice:
             self.note(notice, WARNING_COLOR)
@@ -551,21 +601,59 @@ class SessionView(PromptAnswers, QWidget):
 
     def on_failed(self, message):
         self.note(message, ERROR_COLOR)
-        self.note("Press Enter to try again.", NOTE_COLOR)
         self.transport = None
         self.set_state(DISCONNECTED, message)
+        if self.reconnect_attempts and self.auto_reconnect:  # Still coming back up: keep trying
+            self.schedule_reconnect()
+        else:
+            self.reconnect_attempts = 0
+            self.note("Press Enter to try again.", NOTE_COLOR)
 
     def on_closed(self, reason):
         self.note(reason, NOTE_COLOR)
-        self.note("Press Enter to reconnect.", NOTE_COLOR)
         self.close_transport()
         self.set_state(DISCONNECTED, reason)
+        if self.should_reconnect():
+            self.schedule_reconnect()
+        else:
+            self.note("Press Enter to reconnect.", NOTE_COLOR)
+
+    def should_reconnect(self):
+        """After a drop, with Reconnect Automatically on, unless it closed because "exit" was just typed."""
+        command, when = self.last_command
+        words = command.split()
+        exited = bool(words) and words[0].lower() in EXIT_COMMANDS and time.time() - when < 10
+        return self.auto_reconnect and not exited
+
+    def schedule_reconnect(self):
+        if self.reconnect_attempts >= RECONNECT_LIMIT:
+            self.note(f"Gave up reconnecting after {RECONNECT_LIMIT} tries. Press Enter to try again.", NOTE_COLOR)
+            self.reconnect_attempts = 0
+            return
+        self.reconnect_attempts += 1
+        self.note(f"Reconnecting in {RECONNECT_SECONDS} s (try {self.reconnect_attempts}). Press Enter to try now, "
+                  "or right-click the tab > Stop Reconnecting.", NOTE_COLOR)
+        self.set_state(DISCONNECTED, f"Reconnecting in {RECONNECT_SECONDS} s (try {self.reconnect_attempts})...")
+        self.reconnect_timer.start(RECONNECT_SECONDS * 1000)
+
+    def stop_reconnecting(self):
+        if self.reconnect_timer.isActive():
+            self.reconnect_timer.stop()
+            self.note("Stopped reconnecting. Press Enter to connect.", NOTE_COLOR)
+            self.set_state(DISCONNECTED, "Not connected.")
+        self.reconnect_attempts = 0
+
+    def toggle_auto_reconnect(self):
+        self.auto_reconnect = not self.auto_reconnect
+        if not self.auto_reconnect:
+            self.stop_reconnecting()
 
     def reconnect(self):
         self.disconnect_session()
         self.connect_session()
 
     def disconnect_session(self):
+        self.stop_reconnecting()  # Disconnecting on purpose: don't come back
         if self.state == DISCONNECTED:
             return
         self.close_transport()
@@ -585,6 +673,8 @@ class SessionView(PromptAnswers, QWidget):
 
     def shutdown(self):
         """Close the connection and the log (the view is going away)."""
+        for timer in (self.reconnect_timer, self.outbox_timer, self.idle_timer):
+            timer.stop()
         self.close_transport()
         self.stop_logging()
         self.state = DISCONNECTED
@@ -606,12 +696,41 @@ class SessionView(PromptAnswers, QWidget):
         actions[menu.addAction("Stop Logging" if self.log_file is not None else "Log to File")] = self.toggle_logging
         actions[menu.addAction("Find...")] = self.show_find
         actions[menu.addAction("Clear Scrollback")] = self.clear_scrollback
+        if self.outbox:
+            actions[menu.addAction(f"Stop Sending ({len(self.outbox)} lines left)")] = self.stop_sending
+        if self.reconnect_timer.isActive():
+            actions[menu.addAction("Stop Reconnecting")] = self.stop_reconnecting
+        auto = menu.addAction("Reconnect Automatically")
+        auto.setCheckable(True)
+        auto.setChecked(self.auto_reconnect)
+        auto.setToolTip("When the connection drops (such as a device reloading), keep trying until it's back")
+        actions[auto] = self.toggle_auto_reconnect
+        if self.mirror is not None:
+            leave_out = menu.addAction("Leave Out of Send to All")
+            leave_out.setCheckable(True)
+            leave_out.setChecked(self.left_out)
+            actions[leave_out] = self.toggle_left_out
+
+    def toggle_left_out(self):
+        self.left_out = not self.left_out
+        self.state_changed.emit(self)  # Updates the tab
 
     def set_state(self, state, detail=""):
         self.state = state
-        text = {CONNECTING: "Connecting...", CONNECTED: detail, DISCONNECTED: detail or "Not connected."}[state]
-        self.status_label.setText(f"{text}   ·   {self.model.columns}×{self.model.rows}")
+        self.status_text = {CONNECTING: "Connecting...", CONNECTED: detail,
+                            DISCONNECTED: detail or "Not connected."}[state]
+        if state != CONNECTED:
+            self.stop_sending()
+        self.restart_idle_timer()
+        self.update_status()
         self.state_changed.emit(self)
+
+    def update_status(self):
+        parts = [self.status_text, f"{self.model.columns}×{self.model.rows}"]
+        if self.outbox:
+            parts.append(f"Sending line {self.outbox_total - len(self.outbox) + 1} of {self.outbox_total}")
+        self.status_label.setText("   ·   ".join(parts))
+        self.status_label.setToolTip(self.status_text)
 
     # ----------------------------------------------------------------- Data
 
@@ -653,13 +772,89 @@ class SessionView(PromptAnswers, QWidget):
             if text in ("\r", "\r\n", "\n", self.view.enter):
                 self.connect_session()
             return
+        if self.send_text(text) and self.mirror is not None:
+            self.mirror(self, text, False)
+
+    def send_text(self, text):
+        """Send text as if typed here (without mirroring it). Returns whether it was sent."""
         if self.state != CONNECTED or self.transport is None:
-            return
+            return False
         data = text.encode(self.session.encoding, "replace")
         self.transport.send(data)
         if self.transport.local_echo:
             self.model.feed(data.replace(b"\r", b"\r\n") if data.endswith(b"\r") else data)
             self.after_output()
+        self.track_command(text)
+        self.restart_idle_timer()
+        return True
+
+    def track_command(self, text):
+        """Keep the line being typed, so a drop right after "exit" isn't taken for one to reconnect after."""
+        for char in text:
+            if char in "\r\n":
+                if self.typed_line.strip():
+                    self.last_command = (self.typed_line.strip(), time.time())
+                self.typed_line = ""
+            elif char in "\x7f\b":
+                self.typed_line = self.typed_line[:-1]
+            elif char.isprintable():
+                self.typed_line = (self.typed_line + char)[-200:]
+
+    def send_line(self, command):
+        """Send a command and this session's Enter (Send to All)."""
+        return self.send_block(command)
+
+    def send_block(self, text, final_enter=True):
+        """Send lines of text (a paste, a command button, Send to All), each with this session's Enter; the
+        last one too if final_enter (or the text ends with a line break). With a line delay set, one line at a
+        time, so slow consoles don't drop characters. Returns whether it's being sent."""
+        if self.state != CONNECTED or self.transport is None:
+            return False
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        lines = normalized.split("\n")
+        if normalized.endswith("\n"):
+            lines.pop()
+            final_enter = True
+        chunks = [line + self.view.enter for line in lines[:-1]]
+        if lines:
+            chunks.append(lines[-1] + (self.view.enter if final_enter else ""))
+        chunks = [chunk for chunk in chunks if chunk]
+        if self.session.line_delay <= 0 or len(chunks) + len(self.outbox) <= 1:
+            return self.send_text("".join(chunks)) or not chunks
+        self.outbox += chunks
+        self.outbox_total += len(chunks)
+        if not self.outbox_timer.isActive():
+            self.send_next_line()
+        return True
+
+    def send_next_line(self):
+        if not self.outbox or self.state != CONNECTED:
+            self.stop_sending()
+            return
+        self.send_text(self.outbox.pop(0))
+        if self.outbox:
+            self.outbox_timer.start(self.session.line_delay)
+            self.update_status()
+        else:
+            self.stop_sending()
+
+    def stop_sending(self):
+        """Drop the lines not sent yet."""
+        self.outbox_timer.stop()
+        self.outbox = []
+        self.outbox_total = 0
+        self.update_status()
+
+    def restart_idle_timer(self):
+        """Anti-idle: after this long without sending anything, send the anti-idle text."""
+        if self.session.anti_idle > 0 and self.state == CONNECTED and decode_escapes(self.session.anti_idle_text):
+            self.idle_timer.start(self.session.anti_idle * 1000)
+        else:
+            self.idle_timer.stop()
+
+    def send_anti_idle(self):
+        if self.state == CONNECTED:
+            self.send_text(decode_escapes(self.session.anti_idle_text))  # Which starts the timer again
 
     def paste(self):
         text = QApplication.clipboard().text()
@@ -672,13 +867,18 @@ class SessionView(PromptAnswers, QWidget):
             if reply != QMessageBox.Yes:
                 return
         self.view.set_offset(0)
+        if self.session.line_delay > 0 and self.state == CONNECTED and "\n" in text.strip("\r\n"):
+            self.send_block(text, final_enter=False)
+            if self.mirror is not None:
+                self.mirror(self, text, True)
+            return
         self.type_text(encode_paste(text, self.model.bracketed_paste))
 
     def resize_grid(self, columns, rows):
         self.model.resize(columns, rows)
         if self.transport is not None:
             self.transport.resize(columns, rows)
-        self.set_state(self.state, self.status_label.text().split("   ·   ")[0] if self.state != CONNECTING else "")
+        self.update_status()
         self.after_output()
 
     def sync_scrollbar(self):
