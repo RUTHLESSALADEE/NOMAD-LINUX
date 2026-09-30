@@ -109,6 +109,14 @@ class Host:
     vlan: int = 0
     name: str = ""  # From CDP/LLDP for phones and other end devices that announce themselves
     platform: str = ""
+    manual: bool = False  # Added by hand (a device that's off or unplugged while mapping), kept when mapping again
+    note: str = ""
+
+    def same_as(self, other):
+        """The same machine: by MAC, or by IP when either has no MAC."""
+        if self.mac and other.mac:
+            return self.mac == other.mac
+        return bool(self.ip) and self.ip == other.ip
 
 
 @dataclass
@@ -144,6 +152,23 @@ class NetworkMap:
                 return existing
         self.links.append(link)
         return link
+
+    def carry_manual_hosts(self, older):
+        """Bring the hosts added by hand to an earlier map of the network over to this one. One that has since
+        been found for real is left to the crawl, which gets its name and note. Returns the ones left out because
+        their switch isn't on this map."""
+        dropped = []
+        for manual in (host for host in older.hosts if host.manual):
+            found = next((host for host in self.hosts if not host.manual and host.same_as(manual)), None)
+            if found is not None:
+                found.name = found.name or manual.name
+                found.note = found.note or manual.note
+            elif manual.device in self.devices:
+                self.hosts.append(manual)
+            else:
+                dropped.append(manual)
+        self.hosts.sort(key=lambda host: (self.devices[host.device].label.lower(), port_key(host.port), host.mac))
+        return dropped
 
     def links_of(self, key):
         return [link for link in self.links if key in (link.a, link.b)]

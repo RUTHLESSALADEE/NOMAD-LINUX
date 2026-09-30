@@ -19,6 +19,7 @@ LAG_ATTACHED = "1.2.840.10006.300.43.1.2.1.1.13"  # dot3adAggPortAttachedAggID: 
 IP_ADDR_ENTRY = "1.3.6.1.2.1.4.20.1"
 ARP_PHYS_ADDRESS = "1.3.6.1.2.1.4.22.1.2"
 FDB_ENTRY = "1.3.6.1.2.1.17.4.3.1"
+Q_FDB_ENTRY = "1.3.6.1.2.1.17.7.1.2.2.1"  # Q-BRIDGE-MIB dot1qTpFdbTable: index is VLAN then MAC, so VLANs are known
 BASE_PORT_IFINDEX = "1.3.6.1.2.1.17.1.4.1.2"
 CDP_CACHE_ENTRY = "1.3.6.1.4.1.9.9.23.1.2.1.1"
 VTP_VLAN_STATE = "1.3.6.1.4.1.9.9.46.1.3.1.1.2"
@@ -257,6 +258,22 @@ def fdb(entry_rows, base_port_rows, vlan=0):
         if_index = base_ports.get(row[2].value)
         if if_index:
             entries.append((format_mac(bytes(index).hex()), if_index, vlan))
+    return entries
+
+
+def fdb_by_vlan(entry_rows, base_port_rows):
+    """Learned MACs from Q-BRIDGE-MIB's dot1qTpFdbTable as [(MAC, ifIndex, vlan)], for switches that keep one table
+    for every VLAN (NX-OS and most non-Cisco switches). The VLAN is the table's FDB ID, which is the VLAN number on
+    the switches that have it."""
+    base_ports = {index[0]: value.value for index, value in column(base_port_rows, BASE_PORT_IFINDEX).items()
+                  if len(index) == 1}
+    entries = []
+    for index, row in columns(entry_rows, Q_FDB_ENTRY).items():
+        if len(index) != 7 or 2 not in row or (3 in row and row[3].value != FDB_LEARNED):
+            continue
+        if_index = base_ports.get(row[2].value)
+        if if_index:
+            entries.append((format_mac(bytes(index[1:]).hex()), if_index, index[0]))
     return entries
 
 

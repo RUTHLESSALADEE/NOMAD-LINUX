@@ -108,14 +108,15 @@ def layout_component(group, adjacent, root=None, weight=lambda node: 0):
             block_width, block_height = leaf_block(len(children))
             tallest = max(tallest, block_height)
             columns = min(len(children), LEAF_COLUMNS) or 1
-            above = level is levels[0]  # Off the top layer (a WAN router, a firewall): above it, clear of its links
+            # Off the top layer (a WAN router, a firewall): above it, clear of the links to the layers below
+            above = level is levels[0] and len(levels) > 1
             for number, child in enumerate(children):
                 row, column = divmod(number, columns)
                 offset = (NODE_HEIGHT + LEAF_GAP) * (row + 1)
                 positions[child] = (center - block_width / 2 + NODE_WIDTH / 2 + column * (NODE_WIDTH + H_GAP),
                                     y - offset if above else y + offset)
             x += slot + H_GAP
-        if level is levels[0]:
+        if level is levels[0] and len(levels) > 1:
             tallest = 0
         y += NODE_HEIGHT + (tallest + LEAF_GAP if tallest else 0) + V_GAP
     return positions, width

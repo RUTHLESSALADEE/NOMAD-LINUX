@@ -106,3 +106,9 @@ def test_core_pair_shares_the_top_layer():
     assert positions["core1"][1] == positions["core2"][1] < positions["acc0"][1]
     assert positions["wan"][1] < positions["core1"][1]  # Hanging off the top layer: drawn above it
     no_overlaps(positions)
+
+
+def test_star_of_single_link_devices_hangs_below():
+    positions = layout(["core", "a", "b", "c"], [("core", "a"), ("core", "b"), ("core", "c")])
+    assert all(positions[node][1] > positions["core"][1] for node in "abc")
+    no_overlaps(positions)

@@ -3,7 +3,7 @@ switch's hosts behind a badge that opens into one box per port."""
 import math
 
 from PyQt5.QtCore import QLineF, QPointF, QRectF, QSize, QSizeF, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPainterPath, QPen
+from PyQt5.QtGui import QColor, QFont, QFontMetrics, QImage, QKeySequence, QPainter, QPainterPath, QPen
 from PyQt5.QtWidgets import QGraphicsItem, QGraphicsScene, QGraphicsView, QStyleOptionGraphicsItem
 
 from ..netmap.l3 import HOP, STAR, SUBNET
@@ -16,7 +16,10 @@ KIND_COLORS = {SWITCH: COLORS["link"], ROUTER: COLORS["accent"], FIREWALL: "#ff9
 KIND_TAGS = {SWITCH: "SW", ROUTER: "RTR", FIREWALL: "FW", AP: "AP"}
 STRIP_WIDTH = 34
 BADGE_HEIGHT = 20
-PORT_WIDTH, PORT_HEIGHT = 150, 44
+PORT_WIDTH = 210
+PORT_HEADER = 18
+LINE_HEIGHT = 14
+HOST_LINES = 6  # Hosts listed in a port's box; the rest are counted (and in its tooltip and the Hosts tab)
 PORT_COLUMNS = 4
 PORT_GAP = 12
 PROTOCOL_NAMES = {"cdp": "CDP", "lldp": "LLDP", "l3": "address on the subnet", "icmp": "traceroute"}
@@ -36,20 +39,23 @@ def elided(text, font, width):
     return QFontMetrics(font).elidedText(text, Qt.ElideRight, int(width))
 
 
-def host_summary(hosts):
-    """How a port's hosts are described in its box: the one host, or how many."""
-    if len(hosts) == 1:
-        host = hosts[0]
-        return host.name or host.ip or host.mac, host.vendor or host.platform
-    if len(hosts) > SHARED_PORT_HOSTS:
-        return f"{len(hosts)} hosts", "unmanaged switch or hypervisor?"
-    return f"{len(hosts)} hosts", ", ".join(host.name or host.ip or host.mac for host in hosts)
+def host_line(host):
+    """A host in its port's box: its name and address (or MAC), then its VLAN."""
+    names = [part for part in (host.name, host.ip) if part] or [host.mac or "?"]
+    return "  ".join(names), f"VLAN {host.vlan}" if host.vlan else "VLAN ?"
+
+
+def port_height(hosts):
+    """A port box's height: a header, a line per host (up to HOST_LINES), and a "more" line."""
+    lines = min(len(hosts), HOST_LINES) + (1 if len(hosts) > HOST_LINES else 0)
+    return PORT_HEADER + lines * LINE_HEIGHT + 6
 
 
 def host_tooltip(port, hosts):
     lines = [f"{port}:"]
     for host in hosts[:40]:
-        parts = [host.mac, host.ip, host.name, host.vendor, f"VLAN {host.vlan}" if host.vlan else ""]
+        parts = [host.mac, host.ip, host.name, host.vendor, f"VLAN {host.vlan}" if host.vlan else "",
+                 "(added by hand)" if host.manual else "", host.note]
         lines.append("  " + "  ".join(part for part in parts if part))
     if len(hosts) > 40:
         lines.append(f"  ...and {len(hosts) - 40} more (see the Hosts tab)")
@@ -190,29 +196,33 @@ class DeviceItem(NodeItem):
         if expanded:
             ports = list(self.host_ports.items())
             columns = min(len(ports), PORT_COLUMNS)
-            rows = math.ceil(len(ports) / columns)
+            rows = [ports[start:start + columns] for start in range(0, len(ports), columns)]
+            row_heights = [max(port_height(hosts) for _, hosts in row) for row in rows]
             width = columns * (PORT_WIDTH + PORT_GAP) - PORT_GAP
-            top = self.clear_space(width, rows * (PORT_HEIGHT + PORT_GAP))
-            for number, (port, hosts) in enumerate(ports):
-                row, column = divmod(number, columns)
-                item = HostPortItem(self, port, hosts)
-                item.setPos(-width / 2 + PORT_WIDTH / 2 + column * (PORT_WIDTH + PORT_GAP),
-                            top + PORT_HEIGHT / 2 + row * (PORT_HEIGHT + PORT_GAP))
-                item.set_anchor()
-                self.port_items.append(item)
+            top = self.clear_space(width, sum(row_heights) + PORT_GAP * len(rows))
+            for row, row_height in zip(rows, row_heights):
+                for column, (port, hosts) in enumerate(row):
+                    item = HostPortItem(self, port, hosts)
+                    item.setPos(-width / 2 + PORT_WIDTH / 2 + column * (PORT_WIDTH + PORT_GAP), top)
+                    item.set_anchor()
+                    self.port_items.append(item)
+                top += row_height + PORT_GAP
         self.update()
 
     def clear_space(self, width, height):
         """How far below the device (in its coordinates) a block of port boxes fits without covering other
-        devices, such as the access points under a switch."""
+        devices (such as the access points under a switch) or other switches' port boxes."""
         top = NODE_HEIGHT / 2 + BADGE_HEIGHT + 24
         others = [item.sceneBoundingRect() for item in self.scene().items()
                   if isinstance(item, DeviceItem) and item is not self]
+        others += [item.mapRectToScene(item.rect).adjusted(-PORT_GAP, -PORT_GAP, PORT_GAP, PORT_GAP)
+                   for item in self.scene().items()  # Other switches' hosts, when several are open
+                   if isinstance(item, HostPortItem) and item.parentItem() is not self]
         for _ in range(40):
             block = QRectF(self.pos().x() - width / 2, self.pos().y() + top, width, height)
             if not any(block.intersects(other) for other in others):
                 break
-            top += PORT_HEIGHT + PORT_GAP
+            top += NODE_HEIGHT / 2
         return top
 
 
@@ -222,7 +232,7 @@ class HostPortItem(QGraphicsItem):
     def __init__(self, parent, port, hosts):
         super().__init__(parent)
         self.port, self.hosts = port, hosts
-        self.rect = QRectF(-PORT_WIDTH / 2, -PORT_HEIGHT / 2, PORT_WIDTH, PORT_HEIGHT)
+        self.rect = QRectF(-PORT_WIDTH / 2, 0, PORT_WIDTH, port_height(hosts))  # Hangs from its top middle
         self.anchor = QPointF()
         self.setFlag(QGraphicsItem.ItemIsSelectable)
         self.setToolTip(host_tooltip(port, hosts))
@@ -242,25 +252,45 @@ class HostPortItem(QGraphicsItem):
         shared = len(self.hosts) > SHARED_PORT_HOSTS
         pen = QPen(QColor(COLORS["accent_hover"] if self.isSelected() else
                           COLORS["warning"] if shared else COLORS["border"]), 2 if self.isSelected() else 1)
+        if all(host.manual for host in self.hosts):
+            pen.setStyle(Qt.DashLine)  # Only hosts added by hand: not seen by the crawl
         path = QPainterPath()
         path.addRoundedRect(self.rect, 5, 5)
         painter.fillPath(path, QColor(COLORS["panel_alt"]))
         painter.setPen(pen)
         painter.drawPath(path)
-        title, note = host_summary(self.hosts)
-        width = PORT_WIDTH - 10
+        left, width = self.rect.left() + 6, PORT_WIDTH - 12
         bold = small_font(0.78, bold=True)
         painter.setFont(bold)
         painter.setPen(QColor(COLORS["text"]))
-        painter.drawText(QRectF(self.rect.left() + 5, self.rect.top() + 2, width, 14), Qt.AlignLeft | Qt.AlignVCenter,
-                         elided(f"{self.port}  {title}", bold, width))
-        regular = small_font(0.74)
-        painter.setFont(regular)
-        painter.setPen(QColor(COLORS["warning"] if shared else COLORS["muted"]))
-        if len(self.hosts) == 1 and self.hosts[0].ip and title != self.hosts[0].ip:
-            note = f"{self.hosts[0].ip}  {note}"
-        painter.drawText(QRectF(self.rect.left() + 5, self.rect.top() + 17, width, 24), Qt.AlignLeft | Qt.TextWordWrap,
-                         note)
+        header = QRectF(left, self.rect.top() + 2, width, PORT_HEADER - 2)
+        painter.drawText(header, Qt.AlignLeft | Qt.AlignVCenter, self.port)
+        if len(self.hosts) > 1:
+            painter.setFont(small_font(0.72))
+            painter.setPen(QColor(COLORS["warning"] if shared else COLORS["muted"]))
+            painter.drawText(header, Qt.AlignRight | Qt.AlignVCenter,
+                             f"{len(self.hosts)} hosts" + (": unmanaged switch?" if shared else ""))
+        regular, vlan_font = small_font(0.74), small_font(0.7, bold=True)
+        vlan_width = QFontMetrics(vlan_font).horizontalAdvance("VLAN 4094") + 4
+        top = self.rect.top() + PORT_HEADER
+        for host in self.hosts[:HOST_LINES]:
+            name, vlan = host_line(host)
+            font = QFont(regular)
+            font.setItalic(host.manual)  # Added by hand
+            painter.setFont(font)
+            painter.setPen(QColor(COLORS["muted"] if host.manual else COLORS["text"]))
+            painter.drawText(QRectF(left, top, width - vlan_width, LINE_HEIGHT), Qt.AlignLeft | Qt.AlignVCenter,
+                             elided(name, font, width - vlan_width - 4))
+            painter.setFont(vlan_font)
+            painter.setPen(QColor(COLORS["link"] if host.vlan else COLORS["muted"]))
+            painter.drawText(QRectF(left + width - vlan_width, top, vlan_width, LINE_HEIGHT),
+                             Qt.AlignRight | Qt.AlignVCenter, vlan)
+            top += LINE_HEIGHT
+        if len(self.hosts) > HOST_LINES:
+            painter.setFont(regular)
+            painter.setPen(QColor(COLORS["muted"]))
+            painter.drawText(QRectF(left, top, width, LINE_HEIGHT), Qt.AlignLeft | Qt.AlignVCenter,
+                             f"+ {len(self.hosts) - HOST_LINES} more (see the tooltip or the Hosts tab)")
 
 
 class SimpleNodeItem(NodeItem):
@@ -386,12 +416,17 @@ class MapView(QGraphicsView):
     selection_changed = pyqtSignal(object)  # ("device", key), ("node", key), ("port", key, port) or None
     positions_changed = pyqtSignal()
     context_requested = pyqtSignal(str, object)  # Node key, global position
+    port_context_requested = pyqtSignal(str, str, object)  # Switch key, port, global position
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setScene(QGraphicsScene(self))
         self.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
-        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        # Drag the background to select several devices; pan with the middle button, or Space and drag
+        self.setDragMode(QGraphicsView.RubberBandDrag)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.space_down = False
+        self.pan_from = None
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setViewportUpdateMode(QGraphicsView.BoundingRectViewportUpdate)
         self.setBackgroundBrush(QColor(COLORS["background"]))
@@ -476,7 +511,55 @@ class MapView(QGraphicsView):
 
     def mousePressEvent(self, event):
         self.auto_fit = False
+        if event.button() == Qt.MiddleButton or (event.button() == Qt.LeftButton and self.space_down):
+            self.pan_from = event.pos()
+            self.viewport().setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.pan_from is not None:
+            delta = event.pos() - self.pan_from
+            self.pan_from = event.pos()
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self.pan_from is not None:
+            self.pan_from = None
+            self.viewport().setCursor(Qt.OpenHandCursor if self.space_down else Qt.ArrowCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Space and not event.isAutoRepeat():
+            self.space_down = True
+            self.viewport().setCursor(Qt.OpenHandCursor)
+            event.accept()
+        elif event.matches(QKeySequence.SelectAll):
+            for item in self.items_by_key.values():
+                item.setSelected(True)
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() == Qt.Key_Space and not event.isAutoRepeat():
+            self.space_down = False
+            self.viewport().setCursor(Qt.ArrowCursor)
+            event.accept()
+        else:
+            super().keyReleaseEvent(event)
+
+    def focusOutEvent(self, event):
+        self.space_down = False
+        self.viewport().setCursor(Qt.ArrowCursor)
+        super().focusOutEvent(event)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -503,6 +586,24 @@ class MapView(QGraphicsView):
         self.scene().clearSelection()
         item.setSelected(True)
         self.centerOn(item)
+        return True
+
+    def show_devices(self, keys):
+        """Select these devices (a link's two ends, say) and bring them into view."""
+        items = [self.items_by_key[key] for key in keys if key in self.items_by_key]
+        if not items:
+            return False
+        self.auto_fit = False
+        self.scene().clearSelection()
+        area = QRectF()
+        for item in items:
+            item.setSelected(True)
+            area = area.united(item.sceneBoundingRect())
+        if len(items) == 1:
+            self.centerOn(items[0])
+        else:
+            self.ensureVisible(area, 40, 40)
+            self.centerOn(area.center())
         return True
 
     def show_host(self, host):
@@ -542,6 +643,13 @@ class MapView(QGraphicsView):
 
     # ----------------------------------------------------------------- Items talking back
 
+    def set_all_hosts_shown(self, shown):
+        """Open (or close) every switch's hosts."""
+        for item in self.items_by_key.values():
+            if item.host_count:
+                item.set_expanded(shown)
+        self.update_scene_rect()
+
     def toggle_hosts(self, item):
         if item.host_count:
             item.set_expanded(not item.expanded)
@@ -556,8 +664,11 @@ class MapView(QGraphicsView):
             selected = self.scene().selectedItems()
         except RuntimeError:  # Scene being torn down
             return
+        nodes = [item for item in selected if isinstance(item, NodeItem)]
         if not selected:
             self.selection_changed.emit(None)
+        elif len(nodes) > 1:
+            self.selection_changed.emit(("many", len(nodes)))
         elif isinstance(selected[0], DeviceItem):
             self.selection_changed.emit(("device", selected[0].key))
         elif isinstance(selected[0], SimpleNodeItem):
@@ -567,13 +678,20 @@ class MapView(QGraphicsView):
 
     def contextMenuEvent(self, event):
         item = self.itemAt(event.pos())
+        if isinstance(item, HostPortItem):
+            if not item.isSelected():
+                self.scene().clearSelection()
+                item.setSelected(True)
+            self.port_context_requested.emit(item.parentItem().key, item.port, event.globalPos())
+            return
         while item is not None and not isinstance(item, NodeItem):
             item = item.parentItem()
         if item is None:
             super().contextMenuEvent(event)
             return
-        self.scene().clearSelection()
-        item.setSelected(True)
+        if not item.isSelected():  # Keep a selection of several when right-clicking one of them
+            self.scene().clearSelection()
+            item.setSelected(True)
         self.context_requested.emit(item.key, event.globalPos())
 
     # ----------------------------------------------------------------- Pictures

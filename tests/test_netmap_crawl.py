@@ -42,6 +42,7 @@ def test_hosts_on_edge_ports_only():
     assert hosts[PHONE_MAC].name == "SEP00AABBCCDDEE" and hosts[PHONE_MAC].port == "Gi1/0/5"
     assert hosts[PRINTER_MAC].port == "Gi1/0/7"
     assert all(hosts[mac].port == "Eth1/10" for mac in LAB_MACS)
+    assert {hosts[mac].vlan for mac in LAB_MACS} == {30, 31}  # From the NX-OS switch's Q-BRIDGE table
     for mac in (CORE_MAC, ACC1_MAC, FW_MAC):  # Network devices' own MACs, and anything on an uplink
         assert mac not in hosts
     assert "SEP00AABBCCDDEE" not in network_map.devices  # Phones are hosts, not map devices
@@ -117,3 +118,46 @@ def test_crawl_over_real_udp():
     core = network_map.devices["core"]
     assert core.source == SNMP and core.kind == SWITCH
     assert len(network_map.links) == 4
+
+
+def crawl_with_events(**options):
+    network = build_network()
+    events = []
+    settings = CrawlSettings(seeds=["10.0.0.1"], overrides=[("10.0.0.12/32", "secret")], **options)
+    network_map = Crawler(settings, client_factory=network.client, pinger=network.ping, echo=network.echo,
+                          events=lambda kind, *details: events.append((kind, *details))).run()
+    return network_map, events
+
+
+def test_progress_events():
+    network_map, events = crawl_with_events()
+    started = [event[1] for event in events if event[0] == "started"]
+    finished = {}
+    for event in events:
+        if event[0] == "finished":
+            finished.setdefault(event[1], event[2])  # rtr1 finishes again after its traceroute
+    assert set(started) == set(finished)  # Everything started also finished
+    assert finished["10.0.0.1"] == SNMP and finished["10.0.0.254"] == NO_SNMP
+    assert finished["10.50.0.1"] == "traced"
+    assert ("finished", "10.0.0.254", "traced") in events
+    counts = [event[1] for event in events if event[0] == "counts"][-1]
+    assert counts["read"] == 4 and counts["no_snmp"] == 1 and counts["reading"] == 0 and counts["queued"] == 0
+    steps = {event[2] for event in events if event[0] == "step" and event[1] == "10.0.0.11"}
+    assert {"Trying community 1 of 1", "CDP", "MAC table, VLAN 10 (2 of 2)"} <= steps
+    log_lines = [event[1] for event in events if event[0] == "log"]
+    assert any(line.startswith("Found acc1.corp.example (10.0.0.11) through CDP on core.corp.example Te1/0/1")
+               for line in log_lines)
+    assert any(line.startswith("Read core.corp.example (10.0.0.1): switch, 4 neighbors") for line in log_lines)
+    assert any("no answer with community 1 of 1" in line for line in log_lines)  # rtr1
+    assert not any("secret" in line or "public" in line for line in log_lines)  # Communities stay out of the log
+    snapshots = [event[1] for event in events if event[0] == "map"]
+    assert snapshots and set(snapshots[-1].devices) == set(network_map.devices)
+    assert snapshots[-1].devices["core"] is not network_map.devices["core"]  # A copy, safe to draw meanwhile
+
+
+def test_log_says_why_devices_are_not_asked():
+    _, events = crawl_with_events(scope=["10.0.0.0/30"])
+    log_lines = [event[1] for event in events if event[0] == "log"]
+    assert "Not asking acc2 (10.0.0.12): it's outside the scope" in log_lines
+    _, events = crawl_with_events(max_devices=2)
+    assert any(event[1].startswith("Reached the limit of 2 devices") for event in events if event[0] == "log")

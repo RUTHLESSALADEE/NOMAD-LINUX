@@ -8,7 +8,7 @@ from .model import KIND_NAMES, SOURCE_NAMES
 DEVICE_COLUMNS = ["Name", "Management IP", "Kind", "Platform", "Found by", "Links", "Hosts", "Addresses",
                   "Description", "Problem"]
 LINK_COLUMNS = ["Device", "Port", "Neighbor", "Neighbor Port", "Seen by"]
-HOST_COLUMNS = ["MAC Address", "IP Address", "Vendor", "Name", "Switch", "Port", "VLAN"]
+HOST_COLUMNS = ["MAC Address", "IP Address", "Vendor", "Name", "Switch", "Port", "VLAN", "Found by", "Note"]
 
 DRAWIO_STYLES = {
     "switch": "fillColor=#dae8fc;strokeColor=#6c8ebf;",
@@ -32,17 +32,23 @@ def device_rows(network_map):
     return rows
 
 
+def sorted_links(network_map):
+    """Links in the order the Links table and its CSV list them."""
+    devices = network_map.devices
+    return sorted(network_map.links, key=lambda link: (devices[link.a].label.lower(), link.a_port))
+
+
 def link_rows(network_map):
     devices = network_map.devices
-    rows = [[devices[link.a].label, link.a_port, devices[link.b].label, link.b_port,
-             " + ".join(protocol.upper() for protocol in link.protocols)] for link in network_map.links]
-    return sorted(rows, key=lambda row: (row[0].lower(), row[1]))
+    return [[devices[link.a].label, link.a_port, devices[link.b].label, link.b_port,
+             " + ".join(protocol.upper() for protocol in link.protocols)] for link in sorted_links(network_map)]
 
 
 def host_rows(network_map):
     devices = network_map.devices
     return [[host.mac, host.ip, host.vendor, host.name, devices[host.device].label, host.port,
-             str(host.vlan or "")] for host in network_map.hosts]
+             str(host.vlan or ""), "Added by hand" if host.manual else "Crawl", host.note]
+            for host in network_map.hosts]
 
 
 def write_csv(path, columns, rows):
