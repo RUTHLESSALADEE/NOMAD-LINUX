@@ -93,6 +93,12 @@ def test_laptop_edits_reach_everyone_and_record_who(server, tmp_path):
     assert [subnet.name for subnet in bob.subnets(network.id)] == ["LAN renamed"]
     assert bob.address(network.id, "10.0.0.9") is None
 
+    # Making an imported subnet a loopback subnet later drops its gateway, for everyone
+    alice.update_subnet(subnet.id, loopbacks=True)
+    bob.sync()
+    assert bob.subnet(subnet.id).loopbacks and bob.subnet(subnet.id).gateway == ""
+    assert bob.subnet(subnet.id).special_addresses() == {}
+
 
 def test_conflicts_between_laptops(server, tmp_path):
     admin = team_store(server, tmp_path, "admin", ADMIN)

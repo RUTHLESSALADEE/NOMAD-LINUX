@@ -6,6 +6,12 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-09-29
+
+### Fixed
+
+- Selecting a loopback subnet on the IP Addresses page showed "Something went wrong: 'Block' object has no attribute 'max_prefixlen'" instead of the subnet.
+
 ## [1.8.1] - 2026-09-29
 
 ### Added
