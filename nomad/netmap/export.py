@@ -1,0 +1,75 @@
+"""Exporting a map: tables as CSV, and the drawing as a draw.io file (which draw.io and Visio can open)."""
+import csv
+from xml.sax.saxutils import quoteattr
+
+from .layout import NODE_HEIGHT, NODE_WIDTH
+from .model import KIND_NAMES, SOURCE_NAMES
+
+DEVICE_COLUMNS = ["Name", "Management IP", "Kind", "Platform", "Found by", "Links", "Hosts", "Addresses",
+                  "Description", "Problem"]
+LINK_COLUMNS = ["Device", "Port", "Neighbor", "Neighbor Port", "Seen by"]
+HOST_COLUMNS = ["MAC Address", "IP Address", "Vendor", "Name", "Switch", "Port", "VLAN"]
+
+DRAWIO_STYLES = {
+    "switch": "fillColor=#dae8fc;strokeColor=#6c8ebf;",
+    "router": "fillColor=#d5e8d4;strokeColor=#82b366;",
+    "firewall": "fillColor=#ffe6cc;strokeColor=#d79b00;",
+    "ap": "fillColor=#e1d5e7;strokeColor=#9673a6;",
+}
+
+
+def device_rows(network_map):
+    hosts = {}
+    for host in network_map.hosts:
+        hosts[host.device] = hosts.get(host.device, 0) + 1
+    rows = []
+    for device in sorted(network_map.devices.values(), key=lambda device: device.label.lower()):
+        rows.append([device.label, device.mgmt_ip, KIND_NAMES.get(device.kind, device.kind), device.platform,
+                     SOURCE_NAMES.get(device.source, device.source), str(len(network_map.links_of(device.key))),
+                     str(hosts.get(device.key, "")), ", ".join(device.addresses),
+                     device.sys_descr.splitlines()[0] if device.sys_descr else "", device.error])
+    return rows
+
+
+def link_rows(network_map):
+    devices = network_map.devices
+    rows = [[devices[link.a].label, link.a_port, devices[link.b].label, link.b_port,
+             " + ".join(protocol.upper() for protocol in link.protocols)] for link in network_map.links]
+    return sorted(rows, key=lambda row: (row[0].lower(), row[1]))
+
+
+def host_rows(network_map):
+    devices = network_map.devices
+    return [[host.mac, host.ip, host.vendor, host.name, devices[host.device].label, host.port,
+             str(host.vlan or "")] for host in network_map.hosts]
+
+
+def write_csv(path, columns, rows):
+    with open(path, "w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.writer(file)
+        writer.writerow(columns)
+        writer.writerows(rows)
+
+
+def drawio(network_map, positions):
+    """An uncompressed draw.io (mxGraph) file with each device where it is on the map and a labelled edge per
+    link."""
+    cells = ['<mxCell id="0"/>', '<mxCell id="1" parent="0"/>']
+    ids = {}
+    for number, device in enumerate(sorted(network_map.devices.values(), key=lambda device: device.key)):
+        ids[device.key] = f"d{number}"
+        x, y = positions.get(device.key, (0, 0))
+        label = device.label + (f"\n{device.mgmt_ip}" if device.mgmt_ip and device.mgmt_ip != device.label else "")
+        style = "rounded=1;whiteSpace=wrap;html=0;" + DRAWIO_STYLES.get(device.kind, "")
+        if device.source != "snmp":
+            style += "dashed=1;"
+        cells.append(f'<mxCell id="{ids[device.key]}" value={quoteattr(label)} style={quoteattr(style)} vertex="1" '
+                     f'parent="1"><mxGeometry x="{x - NODE_WIDTH / 2:.0f}" y="{y - NODE_HEIGHT / 2:.0f}" '
+                     f'width="{NODE_WIDTH}" height="{NODE_HEIGHT}" as="geometry"/></mxCell>')
+    for number, link in enumerate(network_map.links):
+        label = f"{link.a_port} - {link.b_port}"
+        cells.append(f'<mxCell id="l{number}" value={quoteattr(label)} style="endArrow=none;html=0;fontSize=9;" '
+                     f'edge="1" parent="1" source="{ids[link.a]}" target="{ids[link.b]}">'
+                     '<mxGeometry relative="1" as="geometry"/></mxCell>')
+    return ('<mxfile host="NOMAD"><diagram name="Network map"><mxGraphModel><root>\n'
+            + "\n".join(cells) + "\n</root></mxGraphModel></diagram></mxfile>\n")
