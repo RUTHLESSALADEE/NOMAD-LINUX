@@ -6,6 +6,15 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.10.1] - 2026-09-30
+
+### Added
+
+- Network Map: a Logical (L3) view. Routers, L3 switches and firewalls are joined through the subnets they have addresses in (read over SNMP with their routing tables), with the next hops their routes point to. Select a router for its IP interfaces and routes, or a subnet for the devices and hosts on it; right-click a subnet to sweep it.
+- Network Map: after the crawl, traceroute from this computer to what SNMP couldn't show (devices that didn't answer SNMP, next hops that aren't on the map, and static routes' destinations), drawn dashed on the logical view with `*` for hops that didn't answer. It can be turned off under Scope.
+- Network Map: Compare with an earlier map lists devices and links that appeared or went away, devices that changed (such as one that stopped answering SNMP), and hosts that moved to another port (and, if you ask, hosts that appeared or went away). New and changed devices are ringed on the map; double-click a difference to go to it.
+- Export on the Network Map page saves the view showing, so the logical view can be saved as a picture or a draw.io file too.
+
 ## [1.10.0] - 2026-09-30
 
 ### Added

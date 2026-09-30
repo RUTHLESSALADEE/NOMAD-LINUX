@@ -11,23 +11,25 @@ from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import QApplication, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, \
     QPushButton, QSplitter, QTabWidget, QTextBrowser, QToolButton, QVBoxLayout, QWidget
 
-from ..netmap import export, store
+from ..netmap import diff, export, l3, store
 from ..netmap.crawl import CrawlSettings, Crawler
 from ..netmap.layout import merge_positions
-from ..netmap.model import FIREWALL, KIND_NAMES, NO_SNMP, ROUTER, SNMP, SOURCE_NAMES, SWITCH, UNREACHABLE
+from ..netmap.model import FIREWALL, KIND_NAMES, NO_SNMP, ROUTER, SNMP, SOURCE_NAMES, SWITCH, UNREACHABLE, \
+    short_port
 from ..snmp import V2C
 from ..terminal.credentials import CredentialError, protect, unprotect
 from .common import SortableTableItem, StoppableThread, read_only_table, set_hint
 from .host_menu import HostActions
-from .netmap_dialogs import CommunitiesDialog, ScopeDialog
+from .netmap_dialogs import CommunitiesDialog, CompareDialog, ScopeDialog
 from .netmap_view import MapView
-from .theme import accent_button
+from .theme import COLORS, accent_button
 
 log = logging.getLogger(__name__)
 
 MAP_FILTER = f"Network maps (*{store.EXTENSION})"
 KIND_WEIGHTS = {FIREWALL: 3, ROUTER: 2, SWITCH: 1}  # Breaks ties when choosing the top device
 SAVE_DELAY_MS = 1000
+ROUTES_SHOWN = 50
 DEFAULTS = {"max_hops": 6, "max_devices": 500, "timeout": 2000}
 
 
@@ -84,6 +86,9 @@ class NetworkMapTab(QWidget):
         self.version, self.timeout = V2C, DEFAULTS["timeout"]
         self.scope, self.max_hops, self.max_devices = [], DEFAULTS["max_hops"], DEFAULTS["max_devices"]
         self.collect_hosts = True
+        self.trace = True
+        self.l3_nodes = {}
+        self.compare_dialog = None
         self.host_actions = HostActions(window, self)
         self.save_timer = QTimer(self)
         self.save_timer.setSingleShot(True)
@@ -105,7 +110,7 @@ class NetworkMapTab(QWidget):
         self.communities_button.setToolTip("The SNMP community strings to try, including ones for particular subnets.")
         self.scope_button = QPushButton("Scope...")
         self.scope_button.setToolTip("Which subnets the crawl may go into, how many hops, and whether to read "
-                                     "MAC tables for hosts.")
+                                     "MAC tables for hosts and traceroute for the logical view.")
         self.start_button = accent_button("Start")
         self.start_button.setToolTip("Read each device's CDP/LLDP neighbors over SNMP, then theirs, and so on.")
         self.stop_button = QPushButton("Stop")
@@ -141,14 +146,23 @@ class NetworkMapTab(QWidget):
         export_menu.addAction("Links (CSV)...", lambda: self.export_csv("links"))
         export_menu.addAction("Hosts (CSV)...", lambda: self.export_csv("hosts"))
         self.export_button.setMenu(export_menu)
+        self.compare_button = QToolButton()
+        self.compare_button.setText("Compare")
+        self.compare_button.setToolTip("Compare this map with an earlier one: devices and links that appeared or "
+                                       "went away, and hosts that moved port.")
+        self.compare_button.setPopupMode(QToolButton.InstantPopup)
+        self.compare_menu = QMenu(self.compare_button)
+        self.compare_menu.aboutToShow.connect(self.fill_compare_menu)
+        self.compare_button.setMenu(self.compare_menu)
         self.find_input = QLineEdit()
-        self.find_input.setPlaceholderText("Find a device or host: name, IP, MAC or vendor")
+        self.find_input.setPlaceholderText("Find a device, subnet or host: name, IP, MAC or vendor")
         self.find_input.setClearButtonEnabled(True)
         self.fit_button = QPushButton("Fit")
         self.fit_button.setToolTip("Zoom to show the whole map. Scroll to zoom, drag the background to move around.")
         self.arrange_button = QPushButton("Re-arrange")
         self.arrange_button.setToolTip("Lay the map out again, forgetting where devices were dragged to.")
-        for widget in (self.open_button, self.recent_button, self.save_button, self.export_button):
+        for widget in (self.open_button, self.recent_button, self.save_button, self.export_button,
+                       self.compare_button):
             tools.addWidget(widget)
         tools.addSpacing(16)
         tools.addWidget(self.find_input, 1)
@@ -158,10 +172,12 @@ class NetworkMapTab(QWidget):
 
         self.tabs = QTabWidget()
         self.view = MapView()
+        self.l3_view = MapView()
         self.devices_table = read_only_table(export.DEVICE_COLUMNS)
         self.links_table = read_only_table(export.LINK_COLUMNS)
         self.hosts_table = read_only_table(export.HOST_COLUMNS)
         self.tabs.addTab(self.view, "Physical (L2)")
+        self.tabs.addTab(self.l3_view, "Logical (L3)")
         self.tabs.addTab(self.devices_table, "Devices")
         self.tabs.addTab(self.links_table, "Links")
         self.tabs.addTab(self.hosts_table, "Hosts")
@@ -185,11 +201,12 @@ class NetworkMapTab(QWidget):
         self.open_button.clicked.connect(self.open_map)
         self.save_button.clicked.connect(self.save_map_as)
         self.find_input.returnPressed.connect(self.find)
-        self.fit_button.clicked.connect(self.view.fit)
+        self.fit_button.clicked.connect(lambda: self.current_view().fit())
         self.arrange_button.clicked.connect(self.rearrange)
-        self.view.selection_changed.connect(self.show_details)
-        self.view.positions_changed.connect(self.save_timer.start)
-        self.view.context_requested.connect(self.show_device_menu)
+        for view in (self.view, self.l3_view):
+            view.selection_changed.connect(self.show_details)
+            view.positions_changed.connect(self.save_timer.start)
+            view.context_requested.connect(self.show_device_menu)
         self.devices_table.itemDoubleClicked.connect(lambda item: self.show_on_map("device", item.row()))
         self.hosts_table.itemDoubleClicked.connect(lambda item: self.show_on_map("host", item.row()))
 
@@ -208,6 +225,7 @@ class NetworkMapTab(QWidget):
         settings.setValue("netmap/max_hops", self.max_hops)
         settings.setValue("netmap/max_devices", self.max_devices)
         settings.setValue("netmap/collect_hosts", self.collect_hosts)
+        settings.setValue("netmap/trace", self.trace)
         settings.setValue("netmap/last_map", str(self.map_path) if self.map_path else "")
         settings.setValue("netmap/splitter", self.splitter.saveState())
 
@@ -228,6 +246,7 @@ class NetworkMapTab(QWidget):
         self.max_hops = settings.value("netmap/max_hops", DEFAULTS["max_hops"], int)
         self.max_devices = settings.value("netmap/max_devices", DEFAULTS["max_devices"], int)
         self.collect_hosts = settings.value("netmap/collect_hosts", True, bool)
+        self.trace = settings.value("netmap/trace", True, bool)
         splitter = settings.value("netmap/splitter")
         if splitter is not None:
             self.splitter.restoreState(splitter)
@@ -267,9 +286,9 @@ class NetworkMapTab(QWidget):
             self.communities, self.overrides, self.version, self.timeout = dialog.values()
 
     def edit_scope(self):
-        dialog = ScopeDialog(self.scope, self.max_hops, self.max_devices, self.collect_hosts, self)
+        dialog = ScopeDialog(self.scope, self.max_hops, self.max_devices, self.collect_hosts, self.trace, self)
         if dialog.exec_() == QDialog.Accepted:
-            self.scope, self.max_hops, self.max_devices, self.collect_hosts = dialog.values()
+            self.scope, self.max_hops, self.max_devices, self.collect_hosts, self.trace = dialog.values()
 
     # ----------------------------------------------------------------- Crawling
 
@@ -291,7 +310,8 @@ class NetworkMapTab(QWidget):
                 return
         settings = CrawlSettings(seeds=seeds, communities=list(self.communities), overrides=list(self.overrides),
                                  scope=list(self.scope), max_hops=self.max_hops, max_devices=self.max_devices,
-                                 version=self.version, timeout=self.timeout, collect_hosts=self.collect_hosts)
+                                 version=self.version, timeout=self.timeout, collect_hosts=self.collect_hosts,
+                                 trace=self.trace)
         self.worker = CrawlThread(settings, self)
         self.worker.progress.connect(lambda message: set_hint(self.status_label, message, "info"))
         self.worker.crawled.connect(self.on_crawled)
@@ -326,7 +346,8 @@ class NetworkMapTab(QWidget):
         snmp_count = sum(1 for device in network_map.devices.values() if device.source == SNMP)
         problems = sum(1 for device in network_map.devices.values() if device.source in (NO_SNMP, UNREACHABLE))
         message = (f"{'Stopped' if network_map.stopped else 'Done'}: {len(network_map.devices)} devices "
-                   f"({snmp_count} read over SNMP), {len(network_map.links)} links, {len(network_map.hosts)} hosts.")
+                   f"({snmp_count} read over SNMP), {len(network_map.links)} links, {len(network_map.hosts)} hosts"
+                   + (f", {len(network_map.traces)} traceroutes" if network_map.traces else "") + ".")
         if problems:
             message += f" {problems} didn't answer SNMP (dashed or red; select one to see why)."
         if path:
@@ -335,31 +356,47 @@ class NetworkMapTab(QWidget):
 
     # ----------------------------------------------------------------- Showing a map
 
-    def show_map(self, network_map, path=None, fit=False, relayout=False):
+    def show_map(self, network_map, path=None, fit=False):
         self.network_map, self.map_path = network_map, path
-        if relayout:
-            network_map.positions = {}
         nodes = list(network_map.devices)
         edges = [(link.a, link.b) for link in network_map.links]
         positions = merge_positions(nodes, edges, network_map.positions, root=network_map.root or None,
                                     weight=lambda key: KIND_WEIGHTS.get(network_map.devices[key].kind, 0))
         network_map.positions = positions
         self.view.set_map(network_map, positions)
+        self.l3_nodes, l3_links = l3.l3_graph(network_map)
+        l3_positions = merge_positions(list(self.l3_nodes), [(link.a, link.b) for link in l3_links],
+                                       network_map.l3_positions,
+                                       weight=lambda key: 1 if self.l3_nodes[key].kind == l3.DEVICE else 0)
+        network_map.l3_positions = l3_positions
+        self.l3_view.set_graph(self.l3_nodes, l3_links, l3_positions)
         self.fill_tables()
         self.show_details(None)
-        if fit or relayout:
+        if fit:
             self.view.request_fit()
+            self.l3_view.request_fit()
         self.update_buttons()
 
+    def current_view(self):
+        """The drawing showing (or the physical one while a table is)."""
+        return self.l3_view if self.tabs.currentWidget() is self.l3_view else self.view
+
     def rearrange(self):
-        if self.network_map is not None:
-            self.show_map(self.network_map, self.map_path, relayout=True)
-            self.save_positions()
+        """Lay out the view showing again, forgetting where things were dragged to."""
+        if self.network_map is None:
+            return
+        if self.current_view() is self.l3_view:
+            self.network_map.l3_positions = {}
+        else:
+            self.network_map.positions = {}
+        self.show_map(self.network_map, self.map_path, fit=True)
+        self.save_positions()
 
     def save_positions(self):
         if self.network_map is None or self.map_path is None:
             return
         self.network_map.positions = self.view.positions()
+        self.network_map.l3_positions = self.l3_view.positions()
         try:
             store.save(self.network_map, self.map_path)
         except OSError as error:
@@ -388,8 +425,9 @@ class NetworkMapTab(QWidget):
         text = self.find_input.text().strip()
         if not text:
             return
-        self.tabs.setCurrentWidget(self.view)
-        if not self.view.find(text):
+        view = self.current_view()
+        self.tabs.setCurrentWidget(view)
+        if not view.find(text):
             set_hint(self.status_label, f"Nothing on the map matches '{text}'.", "warning")
 
     def show_details(self, selection):
@@ -406,12 +444,18 @@ class NetworkMapTab(QWidget):
             return
         if selection[0] == "device":
             self.details.setHtml(device_html(network_map, selection[1]))
+        elif selection[0] == "node":
+            node = self.l3_nodes.get(selection[1])
+            if node is not None:
+                self.details.setHtml(subnet_html(network_map, node.label) if node.kind == l3.SUBNET
+                                     else node_html(network_map, node))
         else:
             self.details.setHtml(port_html(network_map, selection[1], selection[2]))
 
     def show_device_menu(self, key, position):
         device = self.network_map.devices.get(key) if self.network_map else None
         if device is None:
+            self.show_node_menu(key, position)
             return
         menu = QMenu(self)
         actions = self.host_actions.add_to(menu, device.mgmt_ip) if device.mgmt_ip else {}
@@ -431,9 +475,89 @@ class NetworkMapTab(QWidget):
         if chosen in actions:
             actions[chosen]()
 
+    def show_node_menu(self, key, position):
+        """Right-click on the logical view's subnets and traceroute hops."""
+        node = self.l3_nodes.get(key)
+        if node is None:
+            return
+        menu = QMenu(self)
+        actions = {}
+        if node.kind == l3.SUBNET:
+            actions[menu.addAction("Sweep This Subnet")] = lambda: self.sweep_subnet(node.label)
+            actions[menu.addAction("Copy Subnet")] = lambda: QApplication.clipboard().setText(node.label)
+        elif node.kind == l3.HOP and key != l3.SELF:
+            actions = self.host_actions.add_to(menu, node.label)
+            menu.addSeparator()
+            actions[menu.addAction("Crawl from Here")] = lambda: self.crawl_from(node.label)
+            actions[menu.addAction("Copy Address")] = lambda: QApplication.clipboard().setText(node.label)
+        if not actions:
+            return
+        chosen = menu.exec_(position)
+        if chosen in actions:
+            actions[chosen]()
+
+    def sweep_subnet(self, subnet):
+        """Fill in the subnet on the Sweep page; sweeping needs a deliberate Sweep there."""
+        self.window.navigator.setCurrentWidget(self.window.sweep_tab)
+        self.window.sweep_tab.subnet_input.setText(subnet)
+
     def put_at_top(self, key):
         self.network_map.root = key
-        self.rearrange()
+        self.network_map.positions = {}
+        self.tabs.setCurrentWidget(self.view)
+        self.show_map(self.network_map, self.map_path, fit=True)
+        self.save_positions()
+
+    # ----------------------------------------------------------------- Comparing
+
+    def fill_compare_menu(self):
+        self.compare_menu.clear()
+        current = Path(self.map_path).resolve() if self.map_path else None
+        for path in store.recent(limit=store.RECENT_LIMIT + 1):
+            if path.resolve() != current:
+                self.compare_menu.addAction(f"With {path.stem}", lambda path=path: self.compare_with(path))
+        self.compare_menu.addSeparator()
+        self.compare_menu.addAction("With Another Map...", self.compare_with_file)
+
+    def compare_with_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Compare with Map", str(store.maps_dir()), MAP_FILTER)
+        if path:
+            self.compare_with(Path(path))
+
+    def compare_with(self, path):
+        if self.network_map is None:
+            return
+        try:
+            older = store.load(path)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "Compare Maps", f"Couldn't open {path.name}:\n\n{error}")
+            return
+        changes = diff.compare(older, self.network_map)
+        if self.compare_dialog is not None:
+            self.compare_dialog.close()
+        self.compare_dialog = CompareDialog(changes, path.stem, self)
+        self.compare_dialog.show_change.connect(self.show_change)
+        self.compare_dialog.finished.connect(lambda _: self.view.set_highlights({}))
+        colors = {}
+        for change in changes:
+            if change.what == diff.DEVICE and change.device:
+                colors[change.device] = COLORS["success"] if change.change == diff.ADDED else COLORS["warning"]
+        self.view.set_highlights(colors)
+        self.tabs.setCurrentWidget(self.view)
+        self.compare_dialog.show()
+        set_hint(self.status_label, f"Compared with {path.stem}: {len(changes)} difference"
+                 f"{'' if len(changes) == 1 else 's'}. New devices are ringed in green, changed ones in amber.",
+                 "info")
+
+    def show_change(self, change):
+        self.tabs.setCurrentWidget(self.view)
+        if change.mac:
+            host = next((host for host in self.network_map.hosts if host.mac == change.mac), None)
+            if host is not None:
+                self.view.show_host(host)
+                return
+        if change.device:
+            self.view.show_device(change.device)
 
     # ----------------------------------------------------------------- Files
 
@@ -481,7 +605,7 @@ class NetworkMapTab(QWidget):
 
     def export_png(self):
         path = self.export_path("Export Picture", ".png", "PNG pictures (*.png)")
-        if path and not self.view.render_image().save(str(path)):
+        if path and not self.current_view().render_image().save(str(path)):
             QMessageBox.critical(self, "Export Picture", f"Couldn't save {path}.")
         elif path:
             self.window.show_status(f"Saved the map as {path}.")
@@ -489,7 +613,7 @@ class NetworkMapTab(QWidget):
     def export_svg(self):
         path = self.export_path("Export Drawing", ".svg", "SVG drawings (*.svg)")
         if path:
-            self.view.render_svg(path)
+            self.current_view().render_svg(path)
             self.window.show_status(f"Saved the map as {path}.")
 
     def export_drawio(self):
@@ -497,7 +621,13 @@ class NetworkMapTab(QWidget):
         if not path:
             return
         try:
-            path.write_text(export.drawio(self.network_map, self.view.positions()), encoding="utf-8")
+            if self.current_view() is self.l3_view:
+                text = export.drawio_graph([(key, node.label, node.device.kind if node.device else node.kind,
+                                             node.kind in (l3.HOP, l3.STAR)) for key, node in self.l3_nodes.items()],
+                                           l3.l3_graph(self.network_map)[1], self.l3_view.positions(), "Logical map")
+            else:
+                text = export.drawio(self.network_map, self.view.positions())
+            path.write_text(text, encoding="utf-8")
         except OSError as error:
             QMessageBox.critical(self, "Export for draw.io", f"Couldn't save the file:\n\n{error}")
             return
@@ -522,7 +652,8 @@ class NetworkMapTab(QWidget):
         has_map = self.network_map is not None
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
-        for widget in (self.save_button, self.export_button, self.fit_button, self.arrange_button, self.find_input):
+        for widget in (self.save_button, self.export_button, self.compare_button, self.fit_button,
+                       self.arrange_button, self.find_input):
             widget.setEnabled(has_map)
 
 
@@ -569,8 +700,58 @@ def device_html(network_map, key):
                 else f"{len(hosts)} hosts"
             parts.append(f"<tr><td>{escape(port)}&nbsp;</td><td>{escape(what)}</td></tr>")
         parts.append("</table>")
+    if device.interfaces_l3:
+        parts.append("<h4>IP Interfaces</h4><table>")
+        for address, prefix, port in device.interfaces_l3:
+            parts.append(f"<tr><td>{escape(short_port(port))}&nbsp;</td><td>{escape(address)}/{prefix}</td></tr>")
+        parts.append("</table>")
+    routes = [route for route in device.routes if route[1]]  # Connected ones are the interfaces above
+    if routes:
+        parts.append(f"<h4>Routes ({len(routes)}{'+' if device.routes_truncated else ''})</h4><table>")
+        for destination, next_hop, port, protocol in routes[:ROUTES_SHOWN]:
+            parts.append(f"<tr><td>{escape(destination)}&nbsp;</td><td>via {escape(next_hop)} "
+                         f"({escape(protocol)})</td></tr>")
+        parts.append("</table>")
+        if len(routes) > ROUTES_SHOWN:
+            parts.append(f"<p>...and {len(routes) - ROUTES_SHOWN} more.</p>")
     if device.sys_descr:
         parts.append(f"<h4>Description</h4><p>{escape(device.sys_descr).replace(chr(10), '<br>')}</p>")
+    return "".join(parts)
+
+
+def subnet_html(network_map, subnet):
+    escape = html.escape
+    members, hosts = l3.subnet_details(network_map, subnet)
+    parts = [f"<h3>{escape(subnet)}</h3><h4>Devices with an address in it</h4><table>"]
+    for label, port, address in members:
+        parts.append(f"<tr><td>{escape(label)}&nbsp;</td><td>{escape(port)} {escape(address)}</td></tr>")
+    parts.append("</table>")
+    routed = [(device.label, route) for device in network_map.devices.values() for route in device.routes
+              if route[1] and route[0] == subnet]
+    for label, (destination, next_hop, port, protocol) in routed[:ROUTES_SHOWN]:
+        parts.append(f"<p>{escape(label)} routes it via {escape(next_hop)} ({escape(protocol)})</p>")
+    if hosts:
+        parts.append(f"<h4>Hosts on the map ({len(hosts)})</h4><table>")
+        for host in hosts[:ROUTES_SHOWN]:
+            device = network_map.devices.get(host.device)
+            parts.append(f"<tr><td>{escape(host.ip)}&nbsp;</td><td>{escape(host.name or host.mac)} on "
+                         f"{escape(device.label if device else host.device)} {escape(host.port)}</td></tr>")
+        parts.append("</table>")
+    return "".join(parts)
+
+
+def node_html(network_map, node):
+    """A hop traceroute found, an unanswered hop, or this computer: which traces went through it."""
+    escape = html.escape
+    parts = [f"<h3>{escape(node.label)}</h3>", f"<p>{escape(node.detail)}</p>" if node.detail else ""]
+    through = [item for item in network_map.traces
+               if node.key == l3.SELF or node.label in item.hops or node.key.startswith(f"star:{item.target}:")]
+    if through:
+        parts.append("<h4>Traceroutes</h4>")
+        for item in through:
+            path = " &rarr; ".join(escape(hop) or "*" for hop in item.hops)
+            parts.append(f"<p><b>{escape(item.target)}</b> ({escape(item.reason)}"
+                         f"{'' if item.reached else ', not reached'}): {path}</p>")
     return "".join(parts)
 
 

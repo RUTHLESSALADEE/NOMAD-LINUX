@@ -71,7 +71,7 @@ Screenshots use made-up demo data.
 | Page | Functions |
 | --- | --- |
 | **Sweep** | Finds every host on a subnet (ping, plus ARP on local subnets), with names, MACs and vendors. **Compare with IPAM** shows which hosts IPAM has, is missing or records with a different MAC. |
-| **Network Map** | Crawls switches, routers and firewalls over SNMP from a starting device and draws what's plugged into what (CDP/LLDP), with the hosts on each switch port. See [Network map](#network-map). |
+| **Network Map** | Crawls switches, routers and firewalls over SNMP from a starting device and draws what's plugged into what (CDP/LLDP), with the hosts on each switch port, and the subnets and routes between them. See [Network map](#network-map). |
 | **Switch Port** | Which switch, port and VLAN you're plugged into, from LLDP and CDP. |
 | **DHCP Servers** | Every DHCP server that answers, with each option it offers decoded, and warns about rogue servers. Nothing is leased. |
 | **SNMP** | Walk or get over SNMP v1/v2c, with presets and a per-port interface summary. |
@@ -106,8 +106,13 @@ Enter a core switch or your gateway (or use **Adapter's Gateway**) and click **S
 - **Scope:** **Scope...** limits the crawl to subnets (by default any private address), a number of hops and a number of devices. Devices outside it still appear as neighbors, just without their own neighbors.
 - **Hosts:** each switch's MAC table (per VLAN on Catalyst IOS, using `community@vlan`) and the routers' and firewalls' ARP tables put hosts on the edge ports they're plugged into. MACs learned on uplinks are left out, and phones get their names from CDP/LLDP. Double-click a switch to see its hosts by port. A port with many hosts and no neighbor is marked as a likely unmanaged switch or hypervisor.
 - **Reading the map:** colours show the kind of device (switch, router, firewall, access point). A dashed outline is a device NOMAD didn't read itself: one only seen as a neighbor, or one that **pings but doesn't answer SNMP** (usually the community string or an SNMP ACL). Red means it answered neither. Palo Alto firewalls are found through LLDP, so turn on an LLDP profile on the interfaces facing the switches.
+- **Logical (L3) view:** the routers, L3 switches and firewalls joined through the subnets they have addresses in, with the next hops their routes point to. After the crawl, NOMAD traceroutes from this computer to what SNMP couldn't show (devices that didn't answer, next hops that aren't on the map, and static routes' destinations) and draws the paths it found, dashed, with `*` where a hop didn't answer. Select a router to see its IP interfaces and routes, or a subnet to see what's on it (right-click it to sweep it). Traceroute can be turned off under **Scope...**.
+
+![The Logical (L3) view](docs/screenshots/network-map-l3.png)
+
 - **Working with it:** scroll to zoom, drag the background to move around, and drag devices where you want them (NOMAD remembers, even after mapping again). **Find** jumps to a device or host by name, IP, MAC or vendor. Right-click a device for SSH, ping, SNMP and the rest, **Crawl from Here**, or **Put at the Top**. The Devices, Links and Hosts tabs list everything, and double-clicking a row shows it on the map.
-- **Saving and exporting:** each map is saved automatically (reopen it with **Recent** or **Open**). **Export** saves a picture (PNG or SVG), a draw.io file (which Visio can import), or the devices, links or hosts as CSV.
+- **Saving and exporting:** each map is saved automatically (reopen it with **Recent** or **Open**). **Export** saves the view showing as a picture (PNG or SVG) or a draw.io file (which Visio can import), or the devices, links or hosts as CSV.
+- **What changed:** **Compare** lists the differences from an earlier map: devices and links that appeared or went away, devices that changed (such as one that stopped answering SNMP), and hosts that moved to another port. New devices are ringed in green and changed ones in amber; double-click a difference to see it on the map.
 
 ## Terminal and SCP
 

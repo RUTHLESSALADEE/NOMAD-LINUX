@@ -35,7 +35,8 @@ class Window(QWidget):
 def crawled():
     network = build_network()
     return Crawler(CrawlSettings(seeds=["10.0.0.1"], overrides=[("10.0.0.12/32", "secret")]),
-                   client_factory=network.client, pinger=network.ping).run()
+                   client_factory=network.client, pinger=network.ping,
+                   echo=network.echo).run()
 
 
 @pytest.fixture
@@ -94,7 +95,8 @@ def test_dragged_positions_are_saved_and_kept_after_recrawl(tab, crawled):
     assert reloaded.positions["core"] == (5000, 5000)
     network = build_network()
     again = Crawler(CrawlSettings(seeds=["10.0.0.1"], overrides=[("10.0.0.12/32", "secret")]),
-                    client_factory=network.client, pinger=network.ping).run()
+                    client_factory=network.client, pinger=network.ping,
+                   echo=network.echo).run()
     tab.on_crawled(again)
     assert tab.view.items_by_key["core"].pos().x() == 5000
 
@@ -127,3 +129,52 @@ def test_device_details_list_links_and_hosts(crawled):
     text = netmap_tab.device_html(crawled, "acc1")
     assert "Te1/1/1" in text and "core.corp.example" in text
     assert "SEP00AABBCCDDEE" in text
+
+
+def test_logical_view(tab, crawled):
+    tab.on_crawled(crawled)
+    keys = set(tab.l3_view.items_by_key)
+    assert {"core", "pa-fw1", "rtr1", "net:10.0.0.0/24", "net:10.10.0.0/24", "hop:10.0.0.253", "self"} <= keys
+    tab.tabs.setCurrentWidget(tab.l3_view)
+    tab.find_input.setText("10.10.0.0")
+    tab.find()
+    text = tab.details.toPlainText()
+    assert "Hosts on the map (3)" in text and "core.corp.example" in text
+    assert tab.l3_view.find("10.99.0.1")
+    assert "10.50.0.1" in tab.details.toPlainText()  # The trace that found it
+    assert "Routes" in netmap_tab.device_html(crawled, "core")
+
+
+def test_logical_drawio_export(tab, crawled, tmp_path, monkeypatch):
+    tab.on_crawled(crawled)
+    tab.tabs.setCurrentWidget(tab.l3_view)
+    target = tmp_path / "logical.drawio"
+    monkeypatch.setattr(tab, "export_path", lambda *args: target)
+    tab.export_drawio()
+    text = target.read_text(encoding="utf-8")
+    assert "10.10.0.0/24" in text and "dashed=1" in text
+
+
+def test_compare_with_an_older_map(tab, crawled, tmp_path):
+    import copy
+    older = copy.deepcopy(crawled)
+    del older.devices["acc2"]
+    older.links = [link for link in older.links if "acc2" not in (link.a, link.b)]
+    older.hosts = [host for host in older.hosts if host.device != "acc2"]
+    older_path = store.save(older, tmp_path / "older.nomadmap")
+    tab.on_crawled(crawled)
+    tab.compare_with(older_path)
+    dialog = tab.compare_dialog
+    assert dialog is not None and dialog.table.rowCount() >= 2  # The device and its link (hosts hidden)
+    assert tab.view.items_by_key["acc2"].highlight is not None
+    assert tab.view.items_by_key["core"].highlight is None
+    dialog.churn_check.setChecked(True)
+    assert dialog.table.rowCount() == 2 + len(LAB_MACS)
+    dialog.close()
+    assert tab.view.items_by_key["acc2"].highlight is None
+
+
+def test_scope_dialog_values(app):
+    from nomad.ui.netmap_dialogs import ScopeDialog
+    dialog = ScopeDialog(["10.0.0.0/8"], 4, 100, True, False)
+    assert dialog.values() == (["10.0.0.0/8"], 4, 100, True, False)

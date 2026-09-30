@@ -52,7 +52,8 @@ def test_saved_positions_are_kept_and_new_devices_placed_clear():
 def crawled():
     network = build_network()
     return Crawler(CrawlSettings(seeds=["10.0.0.1"], overrides=[("10.0.0.12/32", "secret")]),
-                   client_factory=network.client, pinger=network.ping).run()
+                   client_factory=network.client, pinger=network.ping,
+                   echo=network.echo).run()
 
 
 def test_map_round_trips_through_a_file(crawled, tmp_path):

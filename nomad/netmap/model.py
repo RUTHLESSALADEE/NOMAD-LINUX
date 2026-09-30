@@ -71,6 +71,9 @@ class Device:
     source: str = NEIGHBOR
     hops: int = 0
     error: str = ""
+    interfaces_l3: list = field(default_factory=list)  # [[ip, prefix length, port]]
+    routes: list = field(default_factory=list)  # [[destination, next hop ("" if connected), port, protocol]]
+    routes_truncated: bool = False
 
     @property
     def label(self):
@@ -109,6 +112,15 @@ class Host:
 
 
 @dataclass
+class Trace:
+    """A traceroute from this computer: the address that answered at each hop ("" where none did)."""
+    target: str
+    hops: list = field(default_factory=list)
+    reached: bool = False
+    reason: str = ""  # Why it was traced: an unreachable device, a next hop, a static route
+
+
+@dataclass
 class NetworkMap:
     devices: dict = field(default_factory=dict)  # key -> Device
     links: list = field(default_factory=list)
@@ -119,6 +131,8 @@ class NetworkMap:
     stopped: bool = False
     positions: dict = field(default_factory=dict)  # Device key -> [x, y] where the user left it
     root: str = ""  # Device laid out at the top, when the user chose one
+    traces: list = field(default_factory=list)  # [Trace]
+    l3_positions: dict = field(default_factory=dict)  # Node key -> [x, y] on the logical (L3) view
 
     def add_link(self, link):
         """Add a link, merging it with the same link seen from the other end (or by the other protocol)."""
@@ -162,6 +176,8 @@ class NetworkMap:
         network_map.hosts = [_build(Host, item) for item in data.get("hosts", [])]
         network_map.positions = {key: tuple(value) for key, value in data.get("positions", {}).items()
                                  if key in network_map.devices}
+        network_map.traces = [_build(Trace, item) for item in data.get("traces", [])]
+        network_map.l3_positions = {key: tuple(value) for key, value in data.get("l3_positions", {}).items()}
         return network_map
 
 
