@@ -15,6 +15,7 @@ DRAWIO_STYLES = {
     "router": "fillColor=#d5e8d4;strokeColor=#82b366;",
     "firewall": "fillColor=#ffe6cc;strokeColor=#d79b00;",
     "ap": "fillColor=#e1d5e7;strokeColor=#9673a6;",
+    "subnet": "fillColor=#f5f5f5;strokeColor=#6c8ebf;arcSize=50;",
 }
 
 
@@ -54,22 +55,31 @@ def write_csv(path, columns, rows):
 def drawio(network_map, positions):
     """An uncompressed draw.io (mxGraph) file with each device where it is on the map and a labelled edge per
     link."""
+    nodes = []
+    for device in sorted(network_map.devices.values(), key=lambda device: device.key):
+        label = device.label + (f"\n{device.mgmt_ip}" if device.mgmt_ip and device.mgmt_ip != device.label else "")
+        nodes.append((device.key, label, device.kind, device.source != "snmp"))
+    return drawio_graph(nodes, network_map.links, positions)
+
+
+def drawio_graph(nodes, links, positions, name="Network map"):
+    """draw.io XML for [(key, label, kind, dashed)] and Links, with nodes centred on positions."""
     cells = ['<mxCell id="0"/>', '<mxCell id="1" parent="0"/>']
     ids = {}
-    for number, device in enumerate(sorted(network_map.devices.values(), key=lambda device: device.key)):
-        ids[device.key] = f"d{number}"
-        x, y = positions.get(device.key, (0, 0))
-        label = device.label + (f"\n{device.mgmt_ip}" if device.mgmt_ip and device.mgmt_ip != device.label else "")
-        style = "rounded=1;whiteSpace=wrap;html=0;" + DRAWIO_STYLES.get(device.kind, "")
-        if device.source != "snmp":
-            style += "dashed=1;"
-        cells.append(f'<mxCell id="{ids[device.key]}" value={quoteattr(label)} style={quoteattr(style)} vertex="1" '
+    for number, (key, label, kind, dashed) in enumerate(nodes):
+        ids[key] = f"d{number}"
+        x, y = positions.get(key, (0, 0))
+        style = "rounded=1;whiteSpace=wrap;html=0;" + DRAWIO_STYLES.get(kind, "") + ("dashed=1;" if dashed else "")
+        cells.append(f'<mxCell id="{ids[key]}" value={quoteattr(label)} style={quoteattr(style)} vertex="1" '
                      f'parent="1"><mxGeometry x="{x - NODE_WIDTH / 2:.0f}" y="{y - NODE_HEIGHT / 2:.0f}" '
                      f'width="{NODE_WIDTH}" height="{NODE_HEIGHT}" as="geometry"/></mxCell>')
-    for number, link in enumerate(network_map.links):
-        label = f"{link.a_port} - {link.b_port}"
-        cells.append(f'<mxCell id="l{number}" value={quoteattr(label)} style="endArrow=none;html=0;fontSize=9;" '
+    for number, link in enumerate(links):
+        if link.a not in ids or link.b not in ids:
+            continue
+        label = " - ".join(port for port in (link.a_port, link.b_port) if port)
+        style = "endArrow=none;html=0;fontSize=9;" + ("dashed=1;" if link.protocols == ["icmp"] else "")
+        cells.append(f'<mxCell id="l{number}" value={quoteattr(label)} style={quoteattr(style)} '
                      f'edge="1" parent="1" source="{ids[link.a]}" target="{ids[link.b]}">'
                      '<mxGeometry relative="1" as="geometry"/></mxCell>')
-    return ('<mxfile host="NOMAD"><diagram name="Network map"><mxGraphModel><root>\n'
+    return (f'<mxfile host="NOMAD"><diagram name={quoteattr(name)}><mxGraphModel><root>\n'
             + "\n".join(cells) + "\n</root></mxGraphModel></diagram></mxfile>\n")

@@ -1,12 +1,18 @@
 """Network Map settings: the SNMP community strings to try, and how far the crawl may go."""
 import ipaddress
 
+from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, \
     QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QTableWidget, \
     QTableWidgetItem, QVBoxLayout
 
+from ..netmap import diff
 from ..netmap.crawl import parse_networks
 from ..snmp import VERSIONS, community_is_valid
+from .theme import COLORS
+
+CHANGE_COLORS = {diff.ADDED: "success", diff.REMOVED: "error", diff.CHANGED: "warning", diff.MOVED: "link"}
 
 
 class CommunitiesDialog(QDialog):
@@ -107,7 +113,7 @@ class CommunitiesDialog(QDialog):
 
 
 class ScopeDialog(QDialog):
-    def __init__(self, scope, max_hops, max_devices, collect_hosts, parent=None):
+    def __init__(self, scope, max_hops, max_devices, collect_hosts, trace, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Crawl Scope")
         self.resize(460, 380)
@@ -132,9 +138,14 @@ class ScopeDialog(QDialog):
         self.devices_input.setToolTip("Stop asking new devices after this many.")
         self.hosts_check = QCheckBox("Read MAC and ARP tables to show the hosts on each switch port")
         self.hosts_check.setChecked(collect_hosts)
+        self.trace_check = QCheckBox("Traceroute to what SNMP can't show (for the logical view)")
+        self.trace_check.setToolTip("After the crawl, trace from this computer to devices that didn't answer SNMP, "
+                                    "next hops that aren't on the map, and static routes' destinations.")
+        self.trace_check.setChecked(trace)
         form.addRow("Hops:", self.hops_input)
         form.addRow("Devices to ask, at most:", self.devices_input)
         form.addRow(self.hosts_check)
+        form.addRow(self.trace_check)
         layout.addLayout(form)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -142,10 +153,11 @@ class ScopeDialog(QDialog):
         layout.addWidget(buttons)
 
     def values(self):
-        """(scope lines, max hops, max devices, collect hosts). Raises ValueError for a bad subnet."""
+        """(scope lines, max hops, max devices, collect hosts, trace). Raises ValueError for a bad subnet."""
         lines = [line.strip() for line in self.scope_input.toPlainText().splitlines() if line.strip()]
         parse_networks(lines)
-        return lines, self.hops_input.value(), self.devices_input.value(), self.hosts_check.isChecked()
+        return (lines, self.hops_input.value(), self.devices_input.value(), self.hosts_check.isChecked(),
+                self.trace_check.isChecked())
 
     def accept(self):
         try:
@@ -154,3 +166,62 @@ class ScopeDialog(QDialog):
             QMessageBox.warning(self, "Crawl Scope", str(error))
             return
         super().accept()
+
+
+class CompareDialog(QDialog):
+    """What changed since an earlier map. Double-click a row to see it on the map; not modal, so the map can be
+    looked at alongside."""
+    show_change = pyqtSignal(object)  # diff.Change
+
+    def __init__(self, changes, older_name, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Compared with {older_name}")
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.resize(760, 480)
+        self.changes = changes
+        layout = QVBoxLayout(self)
+        counts = {}
+        for change in changes:
+            counts[(change.what, change.change)] = counts.get((change.what, change.change), 0) + 1
+        summary = ", ".join(f"{count} {what.lower()}{'' if count == 1 else 's'} {change.lower()}"
+                            for (what, change), count in sorted(counts.items())) or "No differences."
+        label = QLabel(f"Since {older_name}: {summary}")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        self.churn_check = QCheckBox("Show hosts that appeared or went away (computers are turned on and off, so "
+                                     "these are often not a real change)")
+        self.churn_check.toggled.connect(self.fill)
+        layout.addWidget(self.churn_check)
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Change", "What", "Name", "Details"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.itemDoubleClicked.connect(self.on_double_click)
+        layout.addWidget(self.table, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.fill()
+
+    def shown_changes(self):
+        churn = self.churn_check.isChecked()
+        return [change for change in self.changes if churn or change.what != diff.HOST
+                or change.change not in (diff.ADDED, diff.REMOVED)]
+
+    def fill(self):
+        self.shown = self.shown_changes()
+        self.table.setRowCount(len(self.shown))
+        for row, change in enumerate(self.shown):
+            for column, text in enumerate((change.change, change.what, change.name, change.detail)):
+                item = QTableWidgetItem(text)
+                if column == 0:
+                    item.setForeground(QColor(COLORS[CHANGE_COLORS.get(change.change, "text")]))
+                self.table.setItem(row, column, item)
+
+    def on_double_click(self, item):
+        change = self.shown[item.row()]
+        if change.device or change.mac:
+            self.show_change.emit(change)

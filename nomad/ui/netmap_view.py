@@ -6,6 +6,7 @@ from PyQt5.QtCore import QLineF, QPointF, QRectF, QSize, QSizeF, Qt, QTimer, pyq
 from PyQt5.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPainterPath, QPen
 from PyQt5.QtWidgets import QGraphicsItem, QGraphicsScene, QGraphicsView, QStyleOptionGraphicsItem
 
+from ..netmap.l3 import HOP, STAR, SUBNET
 from ..netmap.layout import NODE_HEIGHT, NODE_WIDTH
 from ..netmap.model import AP, FIREWALL, KIND_NAMES, NO_SNMP, ROUTER, SHARED_PORT_HOSTS, SNMP, SOURCE_NAMES, SWITCH, \
     UNREACHABLE
@@ -18,6 +19,7 @@ BADGE_HEIGHT = 20
 PORT_WIDTH, PORT_HEIGHT = 150, 44
 PORT_COLUMNS = 4
 PORT_GAP = 12
+PROTOCOL_NAMES = {"cdp": "CDP", "lldp": "LLDP", "l3": "address on the subnet", "icmp": "traceroute"}
 ZOOM_STEP = 1.15
 MIN_ZOOM, MAX_ZOOM = 0.05, 4.0
 LABEL_MIN_ZOOM = 0.5  # Port labels are left off below this zoom
@@ -54,20 +56,55 @@ def host_tooltip(port, hosts):
     return "\n".join(lines)
 
 
-class DeviceItem(QGraphicsItem):
-    def __init__(self, device, host_ports, view):
+class NodeItem(QGraphicsItem):
+    """Something on the map that links join and the user can drag: a device, or on the logical view a subnet or a
+    hop traceroute found."""
+
+    def __init__(self, key, label, view):
         super().__init__()
-        self.device, self.host_ports, self.view = device, host_ports, view
+        self.key, self.label, self.view = key, label, view
         self.links = []
         self.port_items = []
+        self.host_count = 0
         self.expanded = False
-        self.highlighted = False
-        self.rect = QRectF(-NODE_WIDTH / 2, -NODE_HEIGHT / 2, NODE_WIDTH, NODE_HEIGHT)
-        self.host_count = sum(len(hosts) for hosts in host_ports.values())
-        self.badge = QRectF(-45, NODE_HEIGHT / 2 + 4, 90, BADGE_HEIGHT) if self.host_count else QRectF()
+        self.highlight = None  # Colour of a ring drawn round it (Compare's added and changed devices)
         self.setFlags(QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemIsSelectable
                       | QGraphicsItem.ItemSendsGeometryChanges)
         self.setZValue(2)
+
+    def set_highlight(self, color):
+        self.highlight = color
+        self.update()
+
+    def draw_highlight(self, painter, rect, radius):
+        if self.highlight:
+            ring = QPainterPath()
+            ring.addRoundedRect(rect.adjusted(-6, -6, 6, 6), radius + 4, radius + 4)
+            color = QColor(self.highlight)
+            color.setAlpha(170)
+            painter.setPen(QPen(color, 4))
+            painter.drawPath(ring)
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.ItemPositionHasChanged:
+            for link in self.links:
+                link.update_position()
+        elif change == QGraphicsItem.ItemSelectedHasChanged:
+            self.update()
+        return super().itemChange(change, value)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        self.view.on_item_moved()
+
+
+class DeviceItem(NodeItem):
+    def __init__(self, device, host_ports, view):
+        super().__init__(device.key, device.label, view)
+        self.device, self.host_ports = device, host_ports
+        self.rect = QRectF(-NODE_WIDTH / 2, -NODE_HEIGHT / 2, NODE_WIDTH, NODE_HEIGHT)
+        self.host_count = sum(len(hosts) for hosts in host_ports.values())
+        self.badge = QRectF(-45, NODE_HEIGHT / 2 + 4, 90, BADGE_HEIGHT) if self.host_count else QRectF()
         tip = [device.label, KIND_NAMES.get(device.kind, device.kind), device.mgmt_ip, device.platform,
                SOURCE_NAMES.get(device.source, device.source), device.error]
         if self.host_count:
@@ -75,15 +112,16 @@ class DeviceItem(QGraphicsItem):
         self.setToolTip("\n".join(part for part in tip if part))
 
     def boundingRect(self):
-        return self.rect.adjusted(-3, -3, 3, 3).united(self.badge.adjusted(-2, -2, 2, 2))
+        return self.rect.adjusted(-9, -9, 9, 9).united(self.badge.adjusted(-2, -2, 2, 2))
 
     def paint(self, painter, option, widget=None):
         device = self.device
         color = QColor(KIND_COLORS.get(device.kind, COLORS["muted"]))
         painter.setRenderHint(QPainter.Antialiasing)
+        self.draw_highlight(painter, self.rect, 7)
         outline = QColor(COLORS["error"]) if device.source == UNREACHABLE else color
-        pen = QPen(outline, 3 if self.isSelected() or self.highlighted else 1.6)
-        if self.isSelected() or self.highlighted:
+        pen = QPen(outline, 3 if self.isSelected() else 1.6)
+        if self.isSelected():
             pen.setColor(QColor(COLORS["accent_hover"]))
         if device.source != SNMP:
             pen.setStyle(Qt.DashLine)
@@ -138,21 +176,9 @@ class DeviceItem(QGraphicsItem):
             painter.drawText(self.badge, Qt.AlignCenter, f"{arrow} {self.host_count} host"
                              f"{'' if self.host_count == 1 else 's'}")
 
-    def itemChange(self, change, value):
-        if change == QGraphicsItem.ItemPositionHasChanged:
-            for link in self.links:
-                link.update_position()
-        elif change == QGraphicsItem.ItemSelectedHasChanged:
-            self.view.on_item_selected(self, bool(value))
-        return super().itemChange(change, value)
-
     def mouseDoubleClickEvent(self, event):
         self.view.toggle_hosts(self)
         event.accept()
-
-    def mouseReleaseEvent(self, event):
-        super().mouseReleaseEvent(event)
-        self.view.on_item_moved()
 
     def set_expanded(self, expanded):
         if expanded == self.expanded:
@@ -237,6 +263,53 @@ class HostPortItem(QGraphicsItem):
                          note)
 
 
+class SimpleNodeItem(NodeItem):
+    """A subnet, a router only traceroute found, an unanswered hop (*) or this computer, on the logical view."""
+
+    def __init__(self, node, view):
+        super().__init__(node.key, node.label, view)
+        self.node = node
+        if node.kind == SUBNET:
+            self.rect = QRectF(-NODE_WIDTH / 2 + 10, -18, NODE_WIDTH - 20, 36)
+        elif node.kind == STAR:
+            self.rect = QRectF(-16, -16, 32, 32)
+        else:
+            self.rect = QRectF(-NODE_WIDTH / 2 + 20, -22, NODE_WIDTH - 40, 44)
+        self.setToolTip("\n".join(part for part in (node.label, node.detail) if part))
+
+    def boundingRect(self):
+        return self.rect.adjusted(-9, -9, 9, 9)
+
+    def paint(self, painter, option, widget=None):
+        node = self.node
+        painter.setRenderHint(QPainter.Antialiasing)
+        radius = self.rect.height() / 2 if node.kind in (SUBNET, STAR) else 6
+        self.draw_highlight(painter, self.rect, radius)
+        path = QPainterPath()
+        path.addRoundedRect(self.rect, radius, radius)
+        painter.fillPath(path, QColor(COLORS["panel_alt"] if node.kind == SUBNET else COLORS["panel"]))
+        color = QColor(COLORS["accent_hover"] if self.isSelected() else
+                       COLORS["link"] if node.kind == SUBNET else COLORS["muted"])
+        pen = QPen(color, 3 if self.isSelected() else 1.4)
+        if node.kind in (HOP, STAR):
+            pen.setStyle(Qt.DashLine)
+        painter.setPen(pen)
+        painter.drawPath(path)
+        bold = small_font(0.9, bold=True)
+        painter.setFont(bold)
+        painter.setPen(QColor(COLORS["text"]))
+        if node.kind == STAR or not node.detail:
+            painter.drawText(self.rect, Qt.AlignCenter, elided(node.label, bold, self.rect.width() - 10))
+            return
+        painter.drawText(self.rect.adjusted(5, 3, -5, -self.rect.height() / 2), Qt.AlignCenter,
+                         elided(node.label, bold, self.rect.width() - 10))
+        detail = small_font(0.75)
+        painter.setFont(detail)
+        painter.setPen(QColor(COLORS["muted"]))
+        painter.drawText(self.rect.adjusted(5, self.rect.height() / 2, -5, -3), Qt.AlignCenter,
+                         elided(node.detail, detail, self.rect.width() - 10))
+
+
 class LinkItem(QGraphicsItem):
     """The links between two devices: one line, with the ports at each end (and "×2" for a port-channel's
     members)."""
@@ -246,16 +319,17 @@ class LinkItem(QGraphicsItem):
         self.a_item, self.b_item, self.links = a_item, b_item, links
         self.line = QLineF()
         self.setZValue(0)
-        a, b = a_item.device.key, b_item.device.key
-        self.setToolTip("\n".join(f"{a_item.device.label} {link.port_on(a)}  —  {b_item.device.label} "
-                                  f"{link.port_on(b)}  ({' + '.join(protocol.upper() for protocol in link.protocols)})"
-                                  for link in links))
+        a, b = a_item.key, b_item.key
+        self.traced = all(link.protocols == ["icmp"] for link in links)
+        self.setToolTip("\n".join(
+            f"{a_item.label} {link.port_on(a)}  —  {b_item.label} {link.port_on(b)}  "
+            f"({' + '.join(PROTOCOL_NAMES.get(protocol, protocol) for protocol in link.protocols)})" for link in links))
         a_item.links.append(self)
         b_item.links.append(self)
         self.update_position()
 
     def ports_text(self, item):
-        ports = [link.port_on(item.device.key) for link in self.links]
+        ports = [port for port in (link.port_on(item.key) for link in self.links) if port]
         return ", ".join(ports) if len(ports) <= 2 else f"{len(ports)} ports"
 
     def update_position(self):
@@ -282,7 +356,10 @@ class LinkItem(QGraphicsItem):
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.Antialiasing)
         count = len(self.links)
-        painter.setPen(QPen(QColor(COLORS["muted"]), 3.2 if count > 1 else 1.5))
+        pen = QPen(QColor(COLORS["muted"]), 3.2 if count > 1 else 1.5)
+        if self.traced:
+            pen.setStyle(Qt.DashLine)
+        painter.setPen(pen)
         painter.drawLine(self.line)
         if QStyleOptionGraphicsItem.levelOfDetailFromTransform(painter.worldTransform()) < LABEL_MIN_ZOOM:
             return  # Too small to read: zoom in to see the ports
@@ -306,9 +383,9 @@ class LinkItem(QGraphicsItem):
 
 
 class MapView(QGraphicsView):
-    selection_changed = pyqtSignal(object)  # ("device", key), ("port", key, port) or None
+    selection_changed = pyqtSignal(object)  # ("device", key), ("node", key), ("port", key, port) or None
     positions_changed = pyqtSignal()
-    context_requested = pyqtSignal(str, object)  # Device key, global position
+    context_requested = pyqtSignal(str, object)  # Node key, global position
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -334,15 +411,36 @@ class MapView(QGraphicsView):
             item.setPos(*positions.get(key, (0, 0)))
             self.scene().addItem(item)
             self.items_by_key[key] = item
+        self.add_links(network_map.links)
+        self.update_scene_rect()
+
+    def set_graph(self, nodes, links, positions):
+        """Show the logical view: l3.L3Nodes (devices drawn as on the physical view) and the links between them."""
+        self.scene().clear()
+        self.items_by_key, self.link_items = {}, []
+        self.network_map = None
+        for key, node in nodes.items():
+            item = DeviceItem(node.device, {}, self) if node.device is not None else SimpleNodeItem(node, self)
+            item.setPos(*positions.get(key, (0, 0)))
+            self.scene().addItem(item)
+            self.items_by_key[key] = item
+        self.add_links(links)
+        self.update_scene_rect()
+
+    def add_links(self, links):
         pairs = {}
-        for link in network_map.links:
+        for link in links:
             if link.a in self.items_by_key and link.b in self.items_by_key:
                 pairs.setdefault(tuple(sorted((link.a, link.b))), []).append(link)
-        for (a, b), links in pairs.items():
-            item = LinkItem(self.items_by_key[a], self.items_by_key[b], links)
+        for (a, b), grouped in pairs.items():
+            item = LinkItem(self.items_by_key[a], self.items_by_key[b], grouped)
             self.scene().addItem(item)
             self.link_items.append(item)
-        self.update_scene_rect()
+
+    def set_highlights(self, colors):
+        """Ring the items in {key: colour}; clear the rest."""
+        for key, item in self.items_by_key.items():
+            item.set_highlight(colors.get(key))
 
     def update_scene_rect(self):
         rect = self.scene().itemsBoundingRect()
@@ -425,14 +523,16 @@ class MapView(QGraphicsView):
     def find(self, text):
         """Select the first device or host matching text (name, address, MAC, platform). Returns True if found."""
         text = text.strip().lower()
-        if not text or self.network_map is None:
+        if not text:
             return False
         compact = text.replace("-", "").replace(":", "").replace(".", "")
         for key, item in sorted(self.items_by_key.items()):
-            device = item.device
-            if any(text in value.lower() for value in [device.label, device.mgmt_ip, device.platform]
-                   + device.addresses if value):
+            device = getattr(item, "device", None)
+            values = [item.label] + ([device.mgmt_ip, device.platform] + device.addresses if device else [])
+            if any(text in value.lower() for value in values if value):
                 return self.show_device(key)
+        if self.network_map is None:
+            return False
         for host in self.network_map.hosts:
             mac = host.mac.replace("-", "").lower()
             if (len(compact) >= 4 and compact in mac) or any(text in value.lower() for value in (host.ip, host.name,
@@ -447,9 +547,6 @@ class MapView(QGraphicsView):
             item.set_expanded(not item.expanded)
             self.update_scene_rect()
 
-    def on_item_selected(self, item, selected):
-        item.update()
-
     def on_item_moved(self):
         self.update_scene_rect()
         self.positions_changed.emit()
@@ -462,20 +559,22 @@ class MapView(QGraphicsView):
         if not selected:
             self.selection_changed.emit(None)
         elif isinstance(selected[0], DeviceItem):
-            self.selection_changed.emit(("device", selected[0].device.key))
+            self.selection_changed.emit(("device", selected[0].key))
+        elif isinstance(selected[0], SimpleNodeItem):
+            self.selection_changed.emit(("node", selected[0].key))
         elif isinstance(selected[0], HostPortItem):
             self.selection_changed.emit(("port", selected[0].parentItem().device.key, selected[0].port))
 
     def contextMenuEvent(self, event):
         item = self.itemAt(event.pos())
-        while item is not None and not isinstance(item, DeviceItem):
+        while item is not None and not isinstance(item, NodeItem):
             item = item.parentItem()
         if item is None:
             super().contextMenuEvent(event)
             return
         self.scene().clearSelection()
         item.setSelected(True)
-        self.context_requested.emit(item.device.key, event.globalPos())
+        self.context_requested.emit(item.key, event.globalPos())
 
     # ----------------------------------------------------------------- Pictures
 

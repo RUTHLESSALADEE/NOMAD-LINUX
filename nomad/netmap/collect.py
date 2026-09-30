@@ -25,6 +25,10 @@ VTP_VLAN_STATE = "1.3.6.1.4.1.9.9.46.1.3.1.1.2"
 LLDP_LOC_PORT_ENTRY = "1.0.8802.1.1.2.1.3.7.1"
 LLDP_REM_ENTRY = "1.0.8802.1.1.2.1.4.1.1"
 LLDP_REM_MAN_ADDR_IF_SUBTYPE = "1.0.8802.1.1.2.1.4.2.1.3"
+CIDR_ROUTE_ENTRY = "1.3.6.1.2.1.4.24.4.1"  # ipCidrRouteTable: index destination, mask, TOS, next hop
+IP_ROUTE_ENTRY = "1.3.6.1.2.1.4.21.1"  # The older ipRouteTable, for devices without the one above
+ROUTE_PROTOCOLS = {1: "other", 2: "connected", 3: "static", 4: "icmp", 8: "rip", 9: "is-is", 11: "igrp", 13: "ospf",
+                   14: "bgp", 16: "eigrp"}
 
 CISCO = "1.3.6.1.4.1.9"
 PALO_ALTO = "1.3.6.1.4.1.25461"
@@ -72,6 +76,8 @@ class DeviceTables:
     fdb: list = field(default_factory=list)  # [(MAC, ifIndex, vlan)]
     own_macs: set = field(default_factory=set)
     lag_parents: dict = field(default_factory=dict)  # Member ifIndex -> aggregate ifIndex
+    routes: list = field(default_factory=list)  # [(destination, next hop, ifIndex, protocol)]
+    routes_truncated: bool = False
     warnings: list = field(default_factory=list)
 
 
@@ -315,3 +321,45 @@ def classify(object_id="", descr="", capabilities=frozenset(), platform=""):
     if object_id.startswith(CISCO + "."):
         return ROUTER  # A Cisco box that answers SNMP but said nothing clearer
     return UNKNOWN
+
+
+def _dotted(numbers):
+    return ".".join(str(number) for number in numbers)
+
+
+def _network(address, mask):
+    try:
+        return str(ipaddress.ip_network(f"{address}/{mask}", strict=False))
+    except ValueError:
+        return ""
+
+
+def routes(cidr_rows, old_rows=()):
+    """The routing table as [(destination, next hop, ifIndex, protocol)], from ipCidrRouteTable, or ipRouteTable
+    when a device doesn't have that. Next hop is "" for directly connected networks."""
+    found = []
+    for index, row in columns(cidr_rows, CIDR_ROUTE_ENTRY).items():
+        if len(index) != 13:
+            continue
+        destination = _network(_dotted(index[:4]), _dotted(index[4:8]))
+        next_hop = _dotted(index[9:13])
+        kind = row[6].value if 6 in row else 0
+        if not destination or kind == 2:  # Reject (null) routes lead nowhere
+            continue
+        protocol = ROUTE_PROTOCOLS.get(row[7].value, "other") if 7 in row else "other"
+        found.append((destination, "" if kind == 3 or next_hop == "0.0.0.0" else next_hop,
+                      row[5].value if 5 in row else 0, protocol))
+    if not found:
+        for index, row in columns(old_rows, IP_ROUTE_ENTRY).items():
+            if len(index) != 4 or 11 not in row:
+                continue
+            destination = _network(_dotted(index), row[11].value)
+            next_hop = row[7].value if 7 in row and isinstance(row[7].value, str) else ""
+            kind = row[8].value if 8 in row else 0
+            if not destination or kind == 2:
+                continue
+            protocol = ROUTE_PROTOCOLS.get(row[9].value, "other") if 9 in row else "other"
+            found.append((destination, "" if kind == 3 or next_hop == "0.0.0.0" else next_hop,
+                          row[2].value if 2 in row else 0, protocol))
+    return sorted(found, key=lambda route: (ipaddress.ip_network(route[0]).network_address,
+                                            ipaddress.ip_network(route[0]).prefixlen, route[1]))

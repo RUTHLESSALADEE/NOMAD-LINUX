@@ -9,19 +9,21 @@ import datetime
 import ipaddress
 import logging
 import re
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 
 from ..oui import format_mac, vendor
 from ..snmp import V2C, SnmpClient, SnmpError, parse_oid
-from . import collect
+from . import collect, l3
 from .model import AP, HOST, NETWORK_KINDS, NO_SNMP, PHONE, SNMP, UNKNOWN, UNREACHABLE, Device, Host, \
-    Link, NetworkMap, display_name, normalize_name, port_key, short_port
+    Link, NetworkMap, Trace, display_name, normalize_name, port_key, short_port
 
 log = logging.getLogger(__name__)
 
 WORKERS = 8
 STOPPED = "Stopped"
+ROUTE_ROWS = 20000  # Per column: a core with the full internet table shouldn't take all day
+MAX_ROUTES = 5000  # Kept per device in the map
 END_DEVICE_KINDS = {PHONE, HOST}  # Shown as hosts on their switch port, not as devices on the map
 
 
@@ -37,6 +39,8 @@ class CrawlSettings:
     timeout: int = 2000  # Milliseconds per SNMP request
     retries: int = 1
     collect_hosts: bool = True
+    trace: bool = True  # Traceroute to what SNMP couldn't show (for the logical view)
+    max_traces: int = l3.MAX_TRACES
     workers: int = WORKERS
 
 
@@ -53,10 +57,11 @@ def parse_networks(lines):
 
 class Crawler:
     def __init__(self, settings, client_factory=SnmpClient, pinger=None, should_stop=lambda: False,
-                 progress=lambda message: None):
+                 progress=lambda message: None, echo=None):
         self.settings = settings
         self.client_factory = client_factory
         self.pinger = pinger or _ping
+        self.echo = echo or l3.icmp_echo
         self.should_stop = should_stop
         self.progress = progress
         self.scope = parse_networks(settings.scope)
@@ -125,8 +130,33 @@ class Crawler:
                 for future in running:
                     future.cancel()
         self.place_hosts()
+        if self.settings.trace and not self.map.stopped:
+            self.trace_paths()
         self.map.finished = _now()
         return self.map
+
+    def trace_paths(self):
+        """Traceroute from this computer to devices that didn't answer SNMP, unknown next hops and static routes'
+        destinations."""
+        targets = l3.trace_targets(self.map, self.in_scope, self.settings.max_traces)
+        if not targets:
+            return
+        self.progress(f"Tracing the way to {len(targets)} addresses SNMP couldn't show...")
+        traces = []
+        with ThreadPoolExecutor(max_workers=self.settings.workers) as executor:
+            futures = {executor.submit(l3.trace, address, self.echo, should_stop=self.should_stop): (address, reason)
+                       for address, reason in targets}
+            for number, future in enumerate(as_completed(futures), start=1):
+                address, reason = futures[future]
+                try:
+                    hops, reached = future.result()
+                except OSError as error:  # No ICMP (a locked-down laptop): the map is still worth having
+                    log.warning("Couldn't trace %s: %s", address, error)
+                    continue
+                traces.append(Trace(address, hops, reached, reason))
+                self.progress(f"Traced {number} of {len(targets)}: {address}")
+        self.map.traces = sorted(traces, key=lambda item: ipaddress.ip_address(item.target))
+        self.map.stopped = self.should_stop()
 
     def visit(self, address):
         """Read one device. Returns (DeviceTables or None, error). Runs on a worker thread."""
@@ -151,8 +181,10 @@ class Crawler:
         self.read_tables(client, tables, community)
         return tables, ""
 
-    def walk(self, client, root, tables, what):
+    def walk(self, client, root, tables, what, limit=None):
         try:
+            if limit:
+                return list(client.walk(parse_oid(root), should_stop=self.should_stop, limit=limit))
             return list(client.walk(parse_oid(root), should_stop=self.should_stop))
         except (SnmpError, OSError) as problem:
             tables.warnings.append(f"{what}: {problem}")
@@ -171,6 +203,15 @@ class Crawler:
                 self.walk(client, collect.LLDP_REM_MAN_ADDR_IF_SUBTYPE, tables, "LLDP"))
             tables.neighbors += collect.lldp_neighbors(lldp_rows, local_ports, tables.interfaces, addresses)
         tables.arp = collect.arp(self.walk(client, collect.ARP_PHYS_ADDRESS, tables, "ARP"))
+        route_rows = []
+        for column in (5, 6, 7):  # ifIndex, type, protocol: the index holds destination, mask and next hop
+            route_rows += self.walk(client, f"{collect.CIDR_ROUTE_ENTRY}.{column}", tables, "Routes", ROUTE_ROWS)
+        old_rows = []
+        if not route_rows:
+            for column in (2, 7, 8, 9, 11):
+                old_rows += self.walk(client, f"{collect.IP_ROUTE_ENTRY}.{column}", tables, "Routes", ROUTE_ROWS)
+        tables.routes = collect.routes(route_rows, old_rows)
+        tables.routes_truncated = len(route_rows) >= 3 * ROUTE_ROWS or len(old_rows) >= 5 * ROUTE_ROWS
         if not self.settings.collect_hosts:
             return
         tables.own_macs = collect.own_macs(self.walk(client, collect.IF_PHYS_ADDRESS, tables, "Interfaces"))
@@ -257,6 +298,12 @@ class Crawler:
         device.source, device.error, device.hops = SNMP, "", hops
         device.sys_descr, device.sys_object_id = info.descr, info.object_id
         device.addresses = [ip for ip, _, _ in tables.addresses] or [address]
+        device.interfaces_l3 = [[ip, prefix_length(mask), tables.interfaces.get(if_index, "")]
+                                for ip, if_index, mask in tables.addresses]
+        routes = [[destination, next_hop, tables.interfaces.get(if_index, ""), protocol]
+                  for destination, next_hop, if_index, protocol in tables.routes]
+        device.routes = routes[:MAX_ROUTES]
+        device.routes_truncated = len(routes) > MAX_ROUTES or tables.routes_truncated
         for ip in device.addresses:
             self.aliases.setdefault(ip, key)
         device.kind = collect.classify(info.object_id, info.descr, frozenset(self.capabilities.get(key, ())),
@@ -360,6 +407,13 @@ class Crawler:
                 port = tables.interfaces.get(tables.lag_parents.get(if_index, if_index), str(if_index))
                 uplinks.add(port_key(port))
         return uplinks
+
+
+def prefix_length(mask):
+    try:
+        return ipaddress.ip_network(f"0.0.0.0/{mask}").prefixlen
+    except ValueError:
+        return 32
 
 
 def end_device_mac(neighbor):

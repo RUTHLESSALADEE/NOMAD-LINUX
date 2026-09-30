@@ -2,6 +2,7 @@
 answering SNMP from a dict the way the real devices would."""
 import socket
 
+from nomad.icmp import IP_REQ_TIMED_OUT, IP_SUCCESS, IP_TTL_EXPIRED_TRANSIT, EchoReply
 from nomad.netmap import collect
 from nomad.snmp import IP_ADDRESS, INTEGER, OBJECT_ID, OCTET_STRING, SnmpClient, SnmpError, Value, parse_oid
 
@@ -87,6 +88,13 @@ class Device:
             numbers = tuple(int(part) for part in address.split("."))
             self.set(collect.LLDP_REM_MAN_ADDR_IF_SUBTYPE, index, 1, 4, numbers, number(2))
 
+    def route(self, destination, mask, next_hop, if_index, kind=4, protocol=3):
+        """An ipCidrRouteTable row: kind 3 is connected, 4 remote; protocol 2 is connected, 3 static, 13 OSPF."""
+        index = tuple(int(part) for part in f"{destination}.{mask}".split(".")) + (0,) +             tuple(int(part) for part in next_hop.split("."))
+        self.set(collect.CIDR_ROUTE_ENTRY, 5, index, number(if_index))
+        self.set(collect.CIDR_ROUTE_ENTRY, 6, index, number(kind))
+        self.set(collect.CIDR_ROUTE_ENTRY, 7, index, number(protocol))
+
     def arp(self, if_index, ip, mac):
         numbers = tuple(int(part) for part in ip.split("."))
         self.set(collect.ARP_PHYS_ADDRESS, if_index, numbers, string(mac_bytes(mac)))
@@ -127,6 +135,8 @@ class FakeNetwork:
         self.devices = {}
         self.pingable = set()
         self.requests = []
+        self.paths = {}
+        self.traced = []
 
     def add(self, address, device):
         self.devices[address] = device
@@ -138,6 +148,19 @@ class FakeNetwork:
 
     def ping(self, address):
         return address in self.pingable
+
+    def echo(self, address, ttl):
+        """Traceroute replies: the path in self.paths (default: through the core), then the address itself if it
+        pings."""
+        path = self.paths.get(address, ["10.0.0.1"])
+        full = path + ([address] if address in self.pingable else [])
+        self.traced.append(address)
+        if ttl > len(full):
+            return EchoReply(IP_REQ_TIMED_OUT)
+        hop = full[ttl - 1]
+        if hop == address:
+            return EchoReply(IP_SUCCESS, address, 1)
+        return EchoReply(IP_TTL_EXPIRED_TRANSIT, hop) if hop else EchoReply(IP_REQ_TIMED_OUT)
 
 
 class FakeClient:
@@ -183,8 +206,17 @@ def build_network():
     core.interface(3, "TenGigabitEthernet1/0/3", CORE_MAC)
     core.interface(4, "GigabitEthernet1/0/48", CORE_MAC)
     core.interface(50, "Vlan10", CORE_MAC)
-    core.address("10.0.0.1", 50)
+    core.interface(51, "Vlan1", CORE_MAC)
+    core.interface(60, "Loopback0")
+    core.address("10.0.0.1", 51)
     core.address("10.10.0.1", 50)
+    core.address("10.255.0.1", 60, "255.255.255.255")
+    core.route("0.0.0.0", "0.0.0.0", "10.0.0.5", 51)
+    core.route("10.0.0.0", "255.255.255.0", "0.0.0.0", 51, kind=3, protocol=2)
+    core.route("10.10.0.0", "255.255.255.0", "0.0.0.0", 50, kind=3, protocol=2)
+    core.route("10.50.0.0", "255.255.0.0", "10.0.0.254", 51)  # Static, through rtr1 (no SNMP)
+    core.route("10.60.0.0", "255.255.0.0", "10.0.0.253", 51, protocol=13)  # OSPF, through a router not on the map
+    core.route("10.66.0.0", "255.255.0.0", "10.0.0.253", 51, kind=2)  # Reject (null route): left out
     core.cdp(1, 1, "acc1.corp.example(FOC111)", "TenGigabitEthernet1/1/1", "10.0.0.11", "cisco C9300-48P", 0x29)
     core.cdp(2, 1, "acc2(SAL222)", "Ethernet1/49", "10.0.0.12", "N9K-C93180YC-EX", 0x29)
     core.cdp(4, 1, "rtr1.corp.example", "GigabitEthernet0/0/0", "10.0.0.254", "cisco ISR4331/K9", 0x01)
@@ -232,7 +264,12 @@ def build_network():
     acc2.learned(FW_MAC, 100, 11)  # The firewall's MAC, on a port-channel member: makes port-channel1 an uplink
 
     network.pingable.add("10.0.0.254")  # rtr1: no SNMP for us
+    network.pingable.add("10.0.0.253")
+    network.paths["10.50.0.1"] = ["10.0.0.1", "10.0.0.254", "", "10.99.0.1"]  # Then silence
     fw = network.add("10.0.0.5", Device("pa-fw1", "Palo Alto Networks PA-3200 series firewall", PALO_ALTO))
     fw.interface(1, "ethernet1/1", FW_MAC)
+    fw.interface(2, "ethernet1/2", FW_MAC)
+    fw.address("10.0.0.5", 1)
+    fw.address("192.0.2.2", 2, "255.255.255.252")
     fw.lldp(1, "ethernet1/1", 1, "core", "Te1/0/3", "10.0.0.1", CORE_MAC, 0x28)
     return network

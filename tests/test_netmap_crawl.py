@@ -10,7 +10,8 @@ from nomad.netmap.model import FIREWALL, NO_SNMP, ROUTER, SNMP, SWITCH, UNREACHA
 def crawl(network, **options):
     settings = CrawlSettings(seeds=options.pop("seeds", ["10.0.0.1"]),
                              overrides=options.pop("overrides", [("10.0.0.12/32", "secret")]), **options)
-    return Crawler(settings, client_factory=network.client, pinger=network.ping).run()
+    return Crawler(settings, client_factory=network.client, pinger=network.ping,
+                   echo=network.echo).run()
 
 
 def test_crawl_finds_every_device_and_link():
@@ -99,7 +100,7 @@ def test_stop_returns_a_partial_map():
     network.client = client
     settings = CrawlSettings(seeds=["10.0.0.1"])
     network_map = Crawler(settings, client_factory=network.client, pinger=network.ping,
-                          should_stop=stop.is_set).run()
+                          echo=network.echo, should_stop=stop.is_set).run()
     assert network_map.stopped
     assert network_map.finished
 
@@ -108,7 +109,8 @@ def test_crawl_over_real_udp():
     """One device served over UDP by the SNMP tests' agent, to check the crawler with the real client."""
     agent = FakeAgentClient(build_network().devices["10.0.0.1"])
     try:
-        network_map = Crawler(CrawlSettings(seeds=["127.0.0.1"], scope=["127.0.0.1/32"], timeout=500, retries=0),
+        network_map = Crawler(CrawlSettings(seeds=["127.0.0.1"], scope=["127.0.0.1/32"], timeout=500, retries=0,
+                                            trace=False),
                               client_factory=agent.factory, pinger=lambda address: False).run()
     finally:
         agent.close()
