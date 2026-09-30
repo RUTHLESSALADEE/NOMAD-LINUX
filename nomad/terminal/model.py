@@ -70,6 +70,47 @@ class TerminalScreen(pyte.HistoryScreen):
 
     scrolled_out = 0  # Lines ever added to the scrollback: once it's full, the oldest go as new ones arrive
 
+    def resize(self, lines=None, columns=None):
+        """Change the size as xterm and Windows Terminal do, not as pyte does (pyte throws away lines from the top
+        and leaves the cursor where the prompt was): shrinking moves only as many top lines into the scrollback as
+        keep the cursor on screen, and growing brings them back. A screen with room to spare doesn't move, and
+        growing back to the old size restores exactly what was shown."""
+        lines = lines or self.lines
+        if lines != self.lines:
+            if lines < self.lines:
+                self._move_lines_up(max(0, self.cursor.y - (lines - 1)), lines)
+            elif not self.alternate:
+                self._move_lines_down(min(lines - self.lines, len(self.history.top)))
+            self.lines = lines  # So pyte only deals with the columns
+            self.set_margins()
+            self.dirty.update(range(lines))
+        super().resize(lines, columns)
+
+    def _move_lines_up(self, count, lines):
+        """Shift the screen up `count` lines (into the scrollback, unless on the alternate screen), keeping
+        `lines` of it."""
+        if count:
+            if not self.alternate:
+                for y in range(count):
+                    self.history.top.append(self.buffer[y])
+                self.scrolled_out += count
+            self.cursor.y -= count
+        kept = {y - count: line for y, line in self.buffer.items() if count <= y < count + lines}
+        self.buffer.clear()
+        self.buffer.update(kept)
+
+    def _move_lines_down(self, count):
+        """Bring the last `count` scrollback lines back onto the top of the screen."""
+        if not count:
+            return
+        moved = {y + count: line for y, line in self.buffer.items()}
+        self.buffer.clear()
+        self.buffer.update(moved)
+        for y in range(count - 1, -1, -1):
+            self.buffer[y] = self.history.top.pop()
+        self.scrolled_out -= count
+        self.cursor.y += count
+
     def prev_page(self):
         pass  # The view scrolls through history itself; pyte's own paging would rewrite the screen
 

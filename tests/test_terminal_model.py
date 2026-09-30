@@ -111,3 +111,40 @@ def test_telnet_option_can_be_switched_back_on():
     assert protocol.feed(bytes([IAC, DONT, NAWS]))[1] == bytes([IAC, WONT, NAWS])
     again = protocol.feed(bytes([IAC, DO, NAWS]))[1]
     assert again.startswith(bytes([IAC, WILL, NAWS])) and protocol.naws_agreed
+
+
+def screen(model):
+    return [model.line_text(index) for index in range(model.history_length, model.line_count)]
+
+
+def test_shrinking_with_room_to_spare_moves_nothing():
+    """Opening the Buttons bar (or tiling) makes the terminal shorter: text above the prompt must stay put."""
+    model = TerminalModel(20, 8, scrollback=100)
+    model.feed(b"line1\r\nline2\r\nswitch#")
+    model.resize(20, 5)
+    assert screen(model)[:3] == ["line1", "line2", "switch#"] and model.history_length == 0
+    assert (model.screen.cursor.y, model.screen.cursor.x) == (2, 7)  # Still on the prompt
+    model.resize(20, 8)
+    assert screen(model)[:3] == ["line1", "line2", "switch#"] and model.rows == 8
+
+
+def test_shrinking_a_full_screen_keeps_the_prompt_and_growing_brings_lines_back():
+    model = TerminalModel(20, 6, scrollback=100)
+    model.feed(b"l1\r\nl2\r\nl3\r\nl4\r\nl5\r\nsw#")
+    model.resize(20, 4)
+    assert screen(model) == ["l3", "l4", "l5", "sw#"] and lines(model)[:2] == ["l1", "l2"]  # In the scrollback
+    assert model.screen.cursor.y == 3
+    model.resize(20, 6)
+    assert screen(model) == ["l1", "l2", "l3", "l4", "l5", "sw#"] and model.history_length == 0
+    model.feed(b"x\r\nnext#")  # Carries on normally afterwards
+    assert screen(model)[-2:] == ["sw#x", "next#"] and lines(model)[0] == "l1"
+
+
+def test_shrinking_the_alternate_screen_keeps_the_scrollback_clean():
+    model = TerminalModel(20, 4, scrollback=100)
+    model.feed(b"shell$ ")
+    model.feed(b"\x1b[?1049h\x1b[4;1Hstatus")  # A full-screen program, writing on its last line
+    model.resize(20, 3)
+    assert model.history_length == 0 and model.screen.cursor.y == 2
+    model.feed(b"\x1b[?1049l")
+    assert screen(model)[0] == "shell$"

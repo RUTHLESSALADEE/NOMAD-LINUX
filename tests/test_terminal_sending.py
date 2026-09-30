@@ -179,6 +179,61 @@ def test_a_command_button_goes_to_all_while_typing_in_all(page):
     assert one.transport.sent == two.transport.sent == b"ping "
 
 
+def test_ctrl_number_presses_that_button_even_with_the_bar_hidden(page):
+    one, two = connect(page, "one"), connect(page, "two")
+    page.commands.put(CommandButton("Clock", "show clock"))
+    page.commands.put(CommandButton("Brief", "show ip int brief"))
+    assert not page.tabs.command_bar.isVisible()
+    QTest.keyClick(two.view, Qt.Key_2, Qt.ControlModifier)  # In the session the key was pressed in
+    assert two.transport.sent == b"show ip int brief\r" and one.transport.sent == b""
+    page.tabs.show_command_bar(True)
+    QTest.keyClick(two.view, Qt.Key_1, Qt.ControlModifier)
+    assert two.transport.sent.endswith(b"show clock\r")
+
+
+def test_ctrl_number_goes_to_the_device_without_a_button(page):
+    one = connect(page, "one")
+    page.commands.put(CommandButton("Clock", "show clock"))
+    QTest.keyClick(one.view, Qt.Key_6, Qt.ControlModifier)  # No sixth button: Ctrl+^ as before
+    assert one.transport.sent == b"\x1e"
+
+
+def test_reordering_buttons_moves_their_hotkeys_too(page):
+    one = connect(page, "one")
+    for name in ("Clock", "Brief", "Run"):
+        page.commands.put(CommandButton(name, f"show {name.lower()}"))
+    run = page.commands.buttons[2]
+    page.commands.move_to(run.id, 0)
+    assert [button.name for button in page.commands.buttons] == ["Run", "Clock", "Brief"]
+    QTest.keyClick(one.view, Qt.Key_1, Qt.ControlModifier)
+    assert one.transport.sent == b"show run\r"
+    page.commands.move_to(run.id, 99)  # Past the end: last
+    assert [button.name for button in page.commands.buttons] == ["Clock", "Brief", "Run"]
+
+
+def test_dropping_a_button_puts_it_where_it_lands(page):
+    for name in ("Clock", "Brief", "Run"):
+        page.commands.put(CommandButton(name, f"show {name.lower()}"))
+    connect(page, "one")  # So the sessions, and the bar under them, are showing
+    page.tabs.show_command_bar(True)
+    QApplication.processEvents()
+    row = page.tabs.command_bar.row
+    clock, brief, run = sorted(row.buttons(), key=lambda widget: widget.x())
+    assert row.drop_position(0, run.button_id)[0] == 0  # Before Clock
+    assert row.drop_position(brief.geometry().center().x() + 1, clock.button_id)[0] == 1  # After Brief
+    assert row.drop_position(row.width(), clock.button_id)[0] == 2  # At the end
+
+    from PyQt5.QtCore import QMimeData, QPoint
+    from PyQt5.QtGui import QDropEvent
+    from nomad.ui.command_bar import BUTTON_MIME
+    mime = QMimeData()
+    mime.setData(BUTTON_MIME, run.button_id.encode())
+    row.dropEvent(QDropEvent(QPoint(1, 5), Qt.MoveAction, mime, Qt.LeftButton, Qt.NoModifier))
+    QApplication.processEvents()
+    assert [button.name for button in page.commands.buttons] == ["Run", "Clock", "Brief"]
+    assert [widget.text() for widget in row.buttons()] == ["Run", "Clock", "Brief"]  # The bar shows it
+
+
 def test_the_bar_shows_a_new_button(page):
     page.commands.put(CommandButton("Clock", "show clock"))
     layout = page.tabs.command_bar.row_layout

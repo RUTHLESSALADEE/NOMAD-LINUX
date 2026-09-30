@@ -130,6 +130,13 @@ def test_export_keeps_mistakes_and_reports_what_it_cannot_hold(store, tmp_path):
     assert [address.ip for address in outside_subnets(store, network)] == ["10.9.9.9"]
 
 
+def test_export_keeps_unit_details_in_their_columns(store, tmp_path):
+    network = store.add_network("Lab", fields={"Revision date": "2026-09-01", "Revision": "03", "ASN": "64512"})
+    store.add_subnet(network.id, "10.0.0.0/24", "LAN")
+    sheet = round_trip(store, network, tmp_path)
+    assert sheet.fields == {"Revision date": "2026-09-01", "Revision": "03", "ASN": "64512"}  # No Unit or Location
+
+
 # --------------------------------------------------------------------- Comparing with the workbook
 
 def edited_workbook_plan(store, network, tmp_path):

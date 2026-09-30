@@ -71,6 +71,7 @@ class TerminalView(QWidget):
         self.selecting = False
         self.highlight = None  # (Position, length) of a find match
         self.highlighter = None  # Keyword highlighting (terminal.highlight.Highlighter), or None when it's off
+        self.hotkey = None  # Called with 0-8 for Ctrl+1 to Ctrl+9 (command buttons); True if it used the key
         self.application_keys = False
         self.backspace_delete = True
         self.enter = "\r"
@@ -393,6 +394,9 @@ class TerminalView(QWidget):
         if ctrl and shift and key == Qt.Key_F:
             self.find_requested.emit()
             return
+        if ctrl and not shift and not alt and Qt.Key_1 <= key <= Qt.Key_9 and self.hotkey is not None and \
+                self.hotkey(key - Qt.Key_1):
+            return  # A command button's hotkey; otherwise Ctrl+digit goes to the device as usual
         if shift and not ctrl and key in (Qt.Key_PageUp, Qt.Key_PageDown):
             self.set_offset(self.offset + (1 if key == Qt.Key_PageUp else -1) * max(1, self.model.rows - 1))
             return
