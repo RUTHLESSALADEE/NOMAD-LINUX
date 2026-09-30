@@ -54,7 +54,7 @@ TEAM, ADMIN = "team", "admin"
 ADMIN_ONLY_ACTIONS = {"add_network", "delete_network"}
 CERTIFICATE_YEARS = 20
 MAX_WAIT_SECONDS = 55
-API_LEVEL = 3  # 2 added /api/wait (instant sync), 3 /api/log (history). Clients cope with servers below this
+API_LEVEL = 4  # 2 added /api/wait (instant sync), 3 /api/log (history), 4 loopback subnets. Clients cope with servers below this
 
 
 class ConflictError(IpamError):
@@ -361,7 +361,8 @@ class IpamServer:
 
     def _edit_add_subnet(self, request):
         self.store.add_subnet(request["network_id"], request["cidr"], request.get("name", ""),
-                              request.get("gateway", ""), request.get("description", ""), request.get("fields"))
+                              request.get("gateway", ""), request.get("description", ""), request.get("fields"),
+                              bool(request.get("loopbacks")))
 
     def _edit_update_subnet(self, request):
         self._check_version("subnets", request["subnet_id"], request.get("expected_version"), "subnet")

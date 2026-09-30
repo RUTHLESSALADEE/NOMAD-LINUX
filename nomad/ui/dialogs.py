@@ -22,14 +22,17 @@ class KeepChangesDialog(QDialog):
     and the previous settings come back on their own.
     """
 
-    def __init__(self, parent, summary, seconds=15):
+    def __init__(self, parent, summary, seconds=15, title="Keep These Settings?",
+                 heading="The new settings have been applied. Do you want to keep them?",
+                 countdown="Reverting to the previous settings in {} seconds..."):
         super().__init__(parent)
-        self.setWindowTitle("Keep These Settings?")
+        self.setWindowTitle(title)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self.remaining = seconds
+        self.countdown = countdown
 
         layout = QVBoxLayout(self)
-        heading = QLabel("The new settings have been applied. Do you want to keep them?")
+        heading = QLabel(heading)
         font = QFont(heading.font())
         font.setBold(True)
         heading.setFont(font)
@@ -62,7 +65,7 @@ class KeepChangesDialog(QDialog):
             self.update_countdown()
 
     def update_countdown(self):
-        self.countdown_label.setText(f"Reverting to the previous settings in {self.remaining} seconds...")
+        self.countdown_label.setText(self.countdown.format(self.remaining))
 
 
 class LogDialog(QDialog):
