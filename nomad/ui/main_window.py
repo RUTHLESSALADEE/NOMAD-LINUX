@@ -27,6 +27,7 @@ from .lookup_tab import LookupTab
 from .mtu_tab import MtuTab
 from .navigation import Navigator
 from .neighbors_tab import NeighborsTab
+from .netmap_tab import NetworkMapTab
 from .netreset_tab import NetworkResetTab
 from .ping_tab import PingTab
 from .ports_tab import PortsTab
@@ -142,6 +143,7 @@ class MainWindow(QMainWindow):
         self.ports_tab = PortsTab(self)
         self.iperf_tab = IperfTab(self)
         self.sweep_tab = SweepTab(self)
+        self.netmap_tab = NetworkMapTab(self)
         self.switch_tab = SwitchTab(self)
         self.dhcp_tab = DhcpTab(self)
         self.snmp_tab = SnmpTab(self)
@@ -165,8 +167,8 @@ class MainWindow(QMainWindow):
             ("Manage", [(self.ipam_tab, "IP Addresses")]),
             ("Test", [(self.ping_tab, "Ping"), (self.latency_tab, "Latency"), (self.traceroute_tab, "Traceroute"),
                       (self.mtu_tab, "MTU"), (self.ports_tab, "Ports"), (self.iperf_tab, "iperf")]),
-            ("Discover", [(self.sweep_tab, "Sweep"), (self.switch_tab, "Switch Port"),
-                          (self.dhcp_tab, "DHCP Servers"), (self.snmp_tab, "SNMP")]),
+            ("Discover", [(self.sweep_tab, "Sweep"), (self.netmap_tab, "Network Map"),
+                          (self.switch_tab, "Switch Port"), (self.dhcp_tab, "DHCP Servers"), (self.snmp_tab, "SNMP")]),
             ("DNS & Web", [(self.lookup_tab, "DNS Lookup"), (self.dns_servers_tab, "DNS Servers"),
                            (self.web_check_tab, "Web Check")]),
             ("Tools", [(self.capture_tab, "Packet Capture"), (self.syslog_tab, "Syslog"), (self.tftp_tab, "TFTP"),

@@ -1,0 +1,238 @@
+"""A small made-up network for the map tests: a core switch, two access switches, a router and a firewall, each
+answering SNMP from a dict the way the real devices would."""
+import socket
+
+from nomad.netmap import collect
+from nomad.snmp import IP_ADDRESS, INTEGER, OBJECT_ID, OCTET_STRING, SnmpClient, SnmpError, Value, parse_oid
+
+CISCO_SWITCH = (1, 3, 6, 1, 4, 1, 9, 1, 2494)
+CISCO_ROUTER = (1, 3, 6, 1, 4, 1, 9, 1, 1861)
+PALO_ALTO = (1, 3, 6, 1, 4, 1, 25461, 2, 3, 38)
+
+CORE_MAC, ACC1_MAC, ACC2_MAC = "00-1A-2B-00-00-01", "00-1A-2B-00-00-11", "00-1A-2B-00-00-12"
+FW_MAC = "00-1B-17-00-00-05"
+PC1_MAC, PHONE_MAC, PRINTER_MAC = "3C-52-82-00-00-01", "00-AA-BB-CC-DD-EE", "00-00-48-00-00-09"
+LAB_MACS = [f"52-54-00-00-00-{number:02X}" for number in range(10)]  # Behind an unmanaged switch
+
+
+def string(text):
+    return Value(OCTET_STRING, text.encode() if isinstance(text, str) else text)
+
+
+def number(value):
+    return Value(INTEGER, value)
+
+
+def mac_bytes(mac):
+    return bytes.fromhex(mac.replace("-", ""))
+
+
+def oid(*parts):
+    numbers = []
+    for part in parts:
+        numbers += list(parse_oid(part)) if isinstance(part, str) else list(part) if isinstance(part, tuple) else [part]
+    return tuple(numbers)
+
+
+class Device:
+    def __init__(self, name, descr, object_id, communities=("public",)):
+        self.communities = set(communities)
+        self.mib = {}
+        self.contexts = {}  # VLAN -> {oid: Value}, answered for community@vlan
+        self.set(collect.SYS_DESCR, string(descr))
+        self.set(collect.SYS_OBJECT_ID, Value(OBJECT_ID, object_id))
+        self.set(collect.SYS_NAME, string(name))
+
+    def set(self, *parts, value=None, mib=None):
+        *oid_parts, value = parts if value is None else (*parts, value)
+        (self.mib if mib is None else mib)[oid(*oid_parts)] = value
+
+    def interface(self, index, name, mac=None):
+        self.set(collect.IF_DESCR, index, string(name))
+        self.set(collect.IF_NAME, index, string(name))  # Real switches give the short name; long is fine here
+        if mac:
+            self.set(collect.IF_PHYS_ADDRESS, index, string(mac_bytes(mac)))
+
+    def address(self, ip, if_index, mask="255.255.255.0"):
+        numbers = tuple(int(part) for part in ip.split("."))
+        self.set(collect.IP_ADDR_ENTRY, 1, numbers, Value(IP_ADDRESS, ip))
+        self.set(collect.IP_ADDR_ENTRY, 2, numbers, number(if_index))
+        self.set(collect.IP_ADDR_ENTRY, 3, numbers, Value(IP_ADDRESS, mask))
+
+    def cdp(self, if_index, device_index, name, port, address="", platform="", capabilities=0x28):
+        entry = (collect.CDP_CACHE_ENTRY,)
+        if address:
+            self.set(*entry, 3, if_index, device_index, number(1))
+            self.set(*entry, 4, if_index, device_index, string(socket.inet_aton(address)))
+        self.set(*entry, 6, if_index, device_index, string(name))
+        self.set(*entry, 7, if_index, device_index, string(port))
+        self.set(*entry, 8, if_index, device_index, string(platform))
+        self.set(*entry, 9, if_index, device_index, string(capabilities.to_bytes(4, "big")))
+
+    def lldp(self, local_port, local_name, remote_index, name, port, address="", chassis_mac="", capabilities=0x08,
+             descr=""):
+        self.set(collect.LLDP_LOC_PORT_ENTRY, 2, local_port, number(5))
+        self.set(collect.LLDP_LOC_PORT_ENTRY, 3, local_port, string(local_name))
+        index = (0, local_port, remote_index)
+        entry = collect.LLDP_REM_ENTRY
+        if chassis_mac:
+            self.set(entry, 4, index, number(4))
+            self.set(entry, 5, index, string(mac_bytes(chassis_mac)))
+        self.set(entry, 6, index, number(5))
+        self.set(entry, 7, index, string(port))
+        self.set(entry, 9, index, string(name))
+        self.set(entry, 10, index, string(descr))
+        self.set(entry, 12, index, string(bytes([capabilities, 0])))
+        if address:
+            numbers = tuple(int(part) for part in address.split("."))
+            self.set(collect.LLDP_REM_MAN_ADDR_IF_SUBTYPE, index, 1, 4, numbers, number(2))
+
+    def arp(self, if_index, ip, mac):
+        numbers = tuple(int(part) for part in ip.split("."))
+        self.set(collect.ARP_PHYS_ADDRESS, if_index, numbers, string(mac_bytes(mac)))
+
+    def vlan(self, vlan):
+        self.set(collect.VTP_VLAN_STATE, 1, vlan, number(1))
+
+    def learned(self, mac, bridge_port, if_index, vlan=None, status=3):
+        mib = self.mib if vlan is None else self.contexts.setdefault(vlan, {})
+        index = tuple(mac_bytes(mac))
+        self.set(collect.FDB_ENTRY, 1, index, string(mac_bytes(mac)), mib=mib)
+        self.set(collect.FDB_ENTRY, 2, index, number(bridge_port), mib=mib)
+        self.set(collect.FDB_ENTRY, 3, index, number(status), mib=mib)
+        self.set(collect.BASE_PORT_IFINDEX, bridge_port, number(if_index), mib=mib)
+
+    def lag(self, member, parent):
+        self.set(collect.IF_STACK_STATUS, parent, member, number(1))
+
+
+class FakeAgentClient:
+    """Serves one device over real UDP with the SNMP tests' agent; factory() makes SnmpClients that talk to it."""
+
+    def __init__(self, device, community="public"):
+        from test_snmp import FakeAgent
+        self.agent = FakeAgent(community, device.mib)
+
+    def factory(self, host, community, version, timeout=2000, retries=1):
+        return SnmpClient(host, community, version, timeout=timeout, retries=retries, port=self.agent.port)
+
+    def close(self):
+        self.agent.close()
+
+
+class FakeNetwork:
+    """Addresses -> Device, handing out clients like SnmpClient's."""
+
+    def __init__(self):
+        self.devices = {}
+        self.pingable = set()
+        self.requests = []
+
+    def add(self, address, device):
+        self.devices[address] = device
+        self.pingable.add(address)
+        return device
+
+    def client(self, host, community, version, timeout=2000, retries=1):
+        return FakeClient(self, host, community)
+
+    def ping(self, address):
+        return address in self.pingable
+
+
+class FakeClient:
+    def __init__(self, network, host, community):
+        self.network, self.host, self.community = network, host, community
+        device = network.devices.get(host)
+        base, _, vlan = community.partition("@")
+        if device is None or base not in device.communities:
+            self.mib = None
+        elif vlan:
+            self.mib = device.contexts.get(int(vlan), {})
+        else:
+            self.mib = device.mib
+        self.mib_sorted = sorted(self.mib.items()) if self.mib is not None else []
+
+    def check(self):
+        self.network.requests.append((self.host, self.community))
+        if self.mib is None:
+            raise SnmpError(f"No answer from {self.host}.")
+
+    def get(self, oids):
+        self.check()
+        return [(tuple(item), self.mib.get(tuple(item), Value(0x80, None))) for item in oids]
+
+    def walk(self, root, max_repetitions=25, should_stop=lambda: False, limit=None):
+        self.check()
+        root = tuple(root)
+        for key, value in self.mib_sorted:
+            if key[:len(root)] == root:
+                yield key, value
+
+
+def build_network():
+    """core (10.0.0.1) -- acc1 (10.0.0.11, per-VLAN MAC tables, a phone and PC on Gi1/0/5)
+                       -- acc2 (10.0.0.12, NX-OS, community "secret", an unmanaged switch on Eth1/10)
+                       -- rtr1 (10.0.0.254, pings but no SNMP)
+                       -- pa-fw1 (10.0.0.5, LLDP only)"""
+    network = FakeNetwork()
+    core = network.add("10.0.0.1", Device("core.corp.example", "Cisco IOS Software, Catalyst L3 Switch Software "
+                                          "(CAT9K_IOSXE)", CISCO_SWITCH))
+    core.interface(1, "TenGigabitEthernet1/0/1", CORE_MAC)
+    core.interface(2, "TenGigabitEthernet1/0/2", CORE_MAC)
+    core.interface(3, "TenGigabitEthernet1/0/3", CORE_MAC)
+    core.interface(4, "GigabitEthernet1/0/48", CORE_MAC)
+    core.interface(50, "Vlan10", CORE_MAC)
+    core.address("10.0.0.1", 50)
+    core.address("10.10.0.1", 50)
+    core.cdp(1, 1, "acc1.corp.example(FOC111)", "TenGigabitEthernet1/1/1", "10.0.0.11", "cisco C9300-48P", 0x29)
+    core.cdp(2, 1, "acc2(SAL222)", "Ethernet1/49", "10.0.0.12", "N9K-C93180YC-EX", 0x29)
+    core.cdp(4, 1, "rtr1.corp.example", "GigabitEthernet0/0/0", "10.0.0.254", "cisco ISR4331/K9", 0x01)
+    core.lldp(3, "Te1/0/3", 1, "pa-fw1", "ethernet1/1", "10.0.0.5", FW_MAC, 0x08, "Palo Alto Networks PA-3220")
+    core.arp(50, "10.10.0.21", PC1_MAC)
+    core.arp(50, "10.10.0.22", PHONE_MAC)
+    core.arp(50, "10.10.0.30", PRINTER_MAC)
+    core.vlan(1)
+    core.vlan(10)
+    core.vlan(1002)
+    core.learned(ACC1_MAC, 1, 1, vlan=10)
+    core.learned(PC1_MAC, 1, 1, vlan=10)  # Behind acc1: must not be placed on the core's uplink
+
+    acc1 = network.add("10.0.0.11", Device("acc1.corp.example", "Cisco IOS Software, Catalyst L3 Switch Software",
+                                           CISCO_SWITCH))
+    acc1.interface(1, "TenGigabitEthernet1/1/1", ACC1_MAC)
+    acc1.interface(5, "GigabitEthernet1/0/5", ACC1_MAC)
+    acc1.interface(7, "GigabitEthernet1/0/7", ACC1_MAC)
+    acc1.address("10.0.0.11", 1)
+    acc1.cdp(1, 1, "core.corp.example(FOC999)", "TenGigabitEthernet1/0/1", "10.0.0.1", "cisco C9500-24Y4C", 0x29)
+    acc1.cdp(5, 2, "SEP00AABBCCDDEE", "Port 1", "10.10.0.22", "Cisco IP Phone 8845", 0x90)
+    acc1.vlan(1)
+    acc1.vlan(10)
+    acc1.learned(CORE_MAC, 1, 1, vlan=1)
+    acc1.learned(PC1_MAC, 5, 5, vlan=10)
+    acc1.learned(PHONE_MAC, 5, 5, vlan=10)
+    acc1.learned(PRINTER_MAC, 7, 7, vlan=10)
+    acc1.learned(ACC1_MAC, 1, 1, vlan=10, status=4)  # Its own: status self
+
+    acc2 = network.add("10.0.0.12", Device("acc2", "Cisco Nexus Operating System (NX-OS) Software", CISCO_SWITCH,
+                                           communities=("secret",)))
+    acc2.interface(1, "Ethernet1/49", ACC2_MAC)
+    acc2.interface(10, "Ethernet1/10", ACC2_MAC)
+    acc2.interface(11, "Ethernet1/11", ACC2_MAC)
+    acc2.interface(12, "Ethernet1/12", ACC2_MAC)
+    acc2.interface(100, "port-channel1", ACC2_MAC)
+    acc2.lag(11, 100)
+    acc2.lag(12, 100)
+    acc2.cdp(1, 1, "core", "TenGigabitEthernet1/0/2", "10.0.0.1", "cisco C9500-24Y4C", 0x29)
+    acc2.vlan(1)
+    acc2.vlan(10)
+    for position, mac in enumerate(LAB_MACS):
+        acc2.learned(mac, 10, 10)
+    acc2.learned(CORE_MAC, 1, 1)
+    acc2.learned(FW_MAC, 100, 11)  # The firewall's MAC, on a port-channel member: makes port-channel1 an uplink
+
+    network.pingable.add("10.0.0.254")  # rtr1: no SNMP for us
+    fw = network.add("10.0.0.5", Device("pa-fw1", "Palo Alto Networks PA-3200 series firewall", PALO_ALTO))
+    fw.interface(1, "ethernet1/1", FW_MAC)
+    fw.lldp(1, "ethernet1/1", 1, "core", "Te1/0/3", "10.0.0.1", CORE_MAC, 0x28)
+    return network

@@ -14,6 +14,7 @@ Screenshots use made-up demo data.
 
 - [Getting around](#getting-around)
 - [Pages](#pages)
+- [Network map](#network-map)
 - [Terminal and SCP](#terminal-and-scp)
 - [IP address management (IPAM)](#ip-address-management-ipam)
 - [Sharing IPAM with the tribe](#sharing-ipam-with-the-tribe)
@@ -70,6 +71,7 @@ Screenshots use made-up demo data.
 | Page | Functions |
 | --- | --- |
 | **Sweep** | Finds every host on a subnet (ping, plus ARP on local subnets), with names, MACs and vendors. **Compare with IPAM** shows which hosts IPAM has, is missing or records with a different MAC. |
+| **Network Map** | Crawls switches, routers and firewalls over SNMP from a starting device and draws what's plugged into what (CDP/LLDP), with the hosts on each switch port. See [Network map](#network-map). |
 | **Switch Port** | Which switch, port and VLAN you're plugged into, from LLDP and CDP. |
 | **DHCP Servers** | Every DHCP server that answers, with each option it offers decoded, and warns about rogue servers. Nothing is leased. |
 | **SNMP** | Walk or get over SNMP v1/v2c, with presets and a per-port interface summary. |
@@ -93,6 +95,19 @@ Screenshots use made-up demo data.
 | **Wake-on-LAN** | Wake a computer by its MAC, and save the ones you wake often. |
 
 ![The Subnet Calculator](docs/screenshots/subnet-calculator.png)
+
+## Network map
+
+![The Network Map page](docs/screenshots/network-map.png)
+
+Enter a core switch or your gateway (or use **Adapter's Gateway**) and click **Start**. NOMAD reads the device's CDP and LLDP neighbors over SNMP, then asks each neighbor for its neighbors, and so on. Nothing needs installing on the devices, and nothing is changed on them.
+
+- **Community strings:** **Communities...** holds the ones to try, in order, plus ones for particular subnets (tried first there). They're saved encrypted for your Windows account. SNMP v1 and v2c.
+- **Scope:** **Scope...** limits the crawl to subnets (by default any private address), a number of hops and a number of devices. Devices outside it still appear as neighbors, just without their own neighbors.
+- **Hosts:** each switch's MAC table (per VLAN on Catalyst IOS, using `community@vlan`) and the routers' and firewalls' ARP tables put hosts on the edge ports they're plugged into. MACs learned on uplinks are left out, and phones get their names from CDP/LLDP. Double-click a switch to see its hosts by port. A port with many hosts and no neighbor is marked as a likely unmanaged switch or hypervisor.
+- **Reading the map:** colours show the kind of device (switch, router, firewall, access point). A dashed outline is a device NOMAD didn't read itself: one only seen as a neighbor, or one that **pings but doesn't answer SNMP** (usually the community string or an SNMP ACL). Red means it answered neither. Palo Alto firewalls are found through LLDP, so turn on an LLDP profile on the interfaces facing the switches.
+- **Working with it:** scroll to zoom, drag the background to move around, and drag devices where you want them (NOMAD remembers, even after mapping again). **Find** jumps to a device or host by name, IP, MAC or vendor. Right-click a device for SSH, ping, SNMP and the rest, **Crawl from Here**, or **Put at the Top**. The Devices, Links and Hosts tabs list everything, and double-clicking a row shows it on the map.
+- **Saving and exporting:** each map is saved automatically (reopen it with **Recent** or **Open**). **Export** saves a picture (PNG or SVG), a draw.io file (which Visio can import), or the devices, links or hosts as CSV.
 
 ## Terminal and SCP
 
@@ -252,6 +267,7 @@ Spreadsheets are imported, and tribe networks added or deleted, only in NOMAD on
 | Terminal sessions and SSH host keys | `%APPDATA%\NOMAD\sessions.json`, `known_hosts` |
 | Profiles | `%APPDATA%\NOMAD\profiles.json` |
 | Local IPAM networks | `%APPDATA%\NOMAD\ipam.db` |
+| Network maps | `%APPDATA%\NOMAD\maps` |
 | Log (Tools > View Log) | `%LOCALAPPDATA%\NOMAD\nomad.log` |
 | IPAM server | `%ProgramData%\NOMAD\server` |
 

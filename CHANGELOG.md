@@ -6,6 +6,13 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-09-30
+
+### Added
+
+- Network Map page (Discover): start from a core switch or your gateway and NOMAD crawls the network over SNMP, reading each device's CDP and LLDP neighbors and then theirs, within a scope you set (subnets, hops and a device limit). It draws the switches, routers, firewalls and access points with the ports at each end of every link, and puts hosts on the edge ports they're plugged into, from the switches' MAC tables (per VLAN on Catalyst IOS) and the ARP tables, with vendors and phones' names. Devices that answer ping but not SNMP are marked, so a wrong community string or an SNMP ACL stands out. Community strings are tried in order, with per-subnet ones first, and saved encrypted. Drag devices where you want them (kept when you map again), find a device or host by name, IP, MAC or vendor, and right-click a device for SSH, ping, SNMP and more. Maps are saved automatically and export to PNG, SVG, draw.io (which Visio can import) and CSV.
+- SNMP page: walk presets for CDP neighbors and Cisco VLANs.
+
 ## [1.9.1] - 2026-09-30
 
 ### Added

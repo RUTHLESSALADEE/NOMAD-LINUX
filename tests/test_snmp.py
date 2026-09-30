@@ -75,14 +75,16 @@ class FakeAgent:
                 _, raw, offset = read_tlv(pdu, offset)
                 fields.append(int.from_bytes(raw, "big", signed=True))
             _, varbinds, _ = read_tlv(pdu, offset)
-            _, varbind, _ = read_tlv(varbinds, 0)
-            _, oid_raw, _ = read_tlv(varbind, 0)
-            oid = decode_oid(oid_raw)
+            oids, position = [], 0
+            while position < len(varbinds):
+                _, varbind, position = read_tlv(varbinds, position)
+                oids.append(decode_oid(read_tlv(varbind, 0)[1]))
+            oid = oids[0]
             self.requests.append(pdu_type)
             version = int.from_bytes(version_raw, "big")
             results, error = [], 0
             if pdu_type == GET:
-                results = [(oid, self.mib.get(oid, Value(0x81, None)))]
+                results = [(item, self.mib.get(item, Value(0x81, None))) for item in oids]
             elif pdu_type == GET_NEXT:
                 found = self.next_after(oid)
                 if found:
