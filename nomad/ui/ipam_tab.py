@@ -1449,7 +1449,7 @@ class IpamTab(QWidget):
             if subnet.gateway:
                 parts.append(f"gateway {subnet.gateway}")
             if subnet.loopbacks:
-                parts.append(f"loopbacks, each /{network.max_prefixlen}")
+                parts.append(f"loopbacks, each /{network.first.max_prefixlen}")
             else:
                 parts.append(f"netmask {network.netmask}" if network.version == 4 else
                              f"{network.num_addresses:,} addresses")
