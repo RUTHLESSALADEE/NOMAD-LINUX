@@ -1,6 +1,7 @@
 """The drawing on the Network Map page: devices as boxes you can drag, links with the port at each end, and each
 switch's hosts behind a badge that opens into one box per port."""
 import math
+import time
 
 from PyQt5.QtCore import QLineF, QPointF, QRectF, QSize, QSizeF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QFontMetrics, QImage, QKeySequence, QPainter, QPainterPath, QPen
@@ -8,11 +9,13 @@ from PyQt5.QtWidgets import QGraphicsItem, QGraphicsScene, QGraphicsView, QStyle
 
 from ..netmap.l3 import HOP, STAR, SUBNET
 from ..netmap.layout import NODE_HEIGHT, NODE_WIDTH
+from ..netmap.monitor import DOWN, UNKNOWN, UP, duration_text
 from ..netmap.model import AP, FIREWALL, KIND_NAMES, NO_SNMP, ROUTER, SHARED_PORT_HOSTS, SNMP, SOURCE_NAMES, SWITCH, \
     UNREACHABLE
 from .theme import COLORS
 
 KIND_COLORS = {SWITCH: COLORS["link"], ROUTER: COLORS["accent"], FIREWALL: "#ff9f43", AP: "#c792ea"}
+STATUS_COLORS = {UP: COLORS["success"], DOWN: COLORS["error"], UNKNOWN: COLORS["muted"]}
 KIND_TAGS = {SWITCH: "SW", ROUTER: "RTR", FIREWALL: "FW", AP: "AP"}
 STRIP_WIDTH = 34
 BADGE_HEIGHT = 20
@@ -108,6 +111,7 @@ class DeviceItem(NodeItem):
     def __init__(self, device, host_ports, view):
         super().__init__(device.key, device.label, view)
         self.device, self.host_ports = device, host_ports
+        self.monitor_state = None  # A monitor.DeviceStatus while the device is monitored
         self.rect = QRectF(-NODE_WIDTH / 2, -NODE_HEIGHT / 2, NODE_WIDTH, NODE_HEIGHT)
         self.host_count = sum(len(hosts) for hosts in host_ports.values())
         self.badge = QRectF(-45, NODE_HEIGHT / 2 + 4, 90, BADGE_HEIGHT) if self.host_count else QRectF()
@@ -149,8 +153,13 @@ class DeviceItem(NodeItem):
         painter.setFont(small_font(0.75, bold=True))
         painter.drawText(QRectF(self.rect.left(), self.rect.top(), STRIP_WIDTH, self.rect.height()), Qt.AlignCenter,
                          KIND_TAGS.get(device.kind, "?"))
+        state = self.monitor_state
+        if state is not None and state.status == DOWN:  # Tint the box: it's the one to look at
+            tint = QColor(COLORS["error"])
+            tint.setAlpha(45)
+            painter.fillPath(path, tint)
         left = self.rect.left() + STRIP_WIDTH + 6
-        width = self.rect.right() - left - 5
+        width = self.rect.right() - left - (18 if state is not None else 5)
         name_font = small_font(0.95, bold=True)
         painter.setFont(name_font)
         painter.setPen(QColor(COLORS["error"] if device.source == UNREACHABLE else COLORS["text"]))
@@ -159,8 +168,13 @@ class DeviceItem(NodeItem):
         detail_font = small_font(0.8)
         painter.setFont(detail_font)
         painter.setPen(QColor(COLORS["muted"]))
-        lines = [(device.mgmt_ip if device.mgmt_ip != device.label else "", COLORS["muted"])]
-        if device.source in (NO_SNMP, UNREACHABLE):
+        address = device.mgmt_ip if device.mgmt_ip != device.label else ""
+        if state is not None and state.status == UP and state.rtt is not None:
+            address = f"{address}  ·  {'<1' if state.rtt < 1 else state.rtt} ms".strip(" ·")
+        lines = [(address, COLORS["muted"])]
+        if state is not None and state.status == DOWN:
+            lines.append((f"Down for {duration_text(time.time() - state.since)}", COLORS["error"]))
+        elif device.source in (NO_SNMP, UNREACHABLE):
             lines.append((SOURCE_NAMES[device.source], COLORS["warning" if device.source == NO_SNMP else "error"]))
         else:
             lines.append((device.platform or (device.sys_descr.splitlines()[0] if device.sys_descr else ""),
@@ -169,6 +183,9 @@ class DeviceItem(NodeItem):
             painter.setPen(QColor(line_color))
             painter.drawText(QRectF(left, self.rect.top() + 22 + row * 15, width, 15), Qt.AlignLeft | Qt.AlignVCenter,
                              elided(line, detail_font, width))
+
+        if state is not None:
+            self.draw_status_dot(painter, state)
 
         if self.host_count:
             painter.setPen(QPen(QColor(COLORS["border"]), 1))
@@ -185,6 +202,15 @@ class DeviceItem(NodeItem):
     def mouseDoubleClickEvent(self, event):
         self.view.toggle_hosts(self)
         event.accept()
+
+    def draw_status_dot(self, painter, state):
+        """Monitoring: green when it answers ping, red when it's down, an empty ring until it's been checked."""
+        center = QPointF(self.rect.right() - 10, self.rect.top() + 10)
+        color = QColor(STATUS_COLORS[state.status])
+        painter.setPen(QPen(color, 1.5))
+        painter.setBrush(color if state.status != UNKNOWN else Qt.NoBrush)
+        painter.drawEllipse(center, 4.5, 4.5)
+        painter.setBrush(Qt.NoBrush)
 
     def set_expanded(self, expanded):
         if expanded == self.expanded:
@@ -422,10 +448,9 @@ class MapView(QGraphicsView):
         super().__init__(parent)
         self.setScene(QGraphicsScene(self))
         self.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
-        # Drag the background to select several devices; pan with the middle button, or Space and drag
-        self.setDragMode(QGraphicsView.RubberBandDrag)
+        # Drag the background to move around (or with the middle button); Shift and drag to select a group
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.setFocusPolicy(Qt.StrongFocus)
-        self.space_down = False
         self.pan_from = None
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setViewportUpdateMode(QGraphicsView.BoundingRectViewportUpdate)
@@ -472,6 +497,15 @@ class MapView(QGraphicsView):
             self.scene().addItem(item)
             self.link_items.append(item)
 
+    def set_statuses(self, status_of):
+        """Monitoring: status_of(key) gives a device's monitor.DeviceStatus, or None if it isn't monitored."""
+        for key, item in self.items_by_key.items():
+            if isinstance(item, DeviceItem):
+                state = status_of(key)
+                if state is not item.monitor_state or state is not None:
+                    item.monitor_state = state
+                    item.update()
+
     def set_highlights(self, colors):
         """Ring the items in {key: colour}; clear the rest."""
         for key, item in self.items_by_key.items():
@@ -511,11 +545,15 @@ class MapView(QGraphicsView):
 
     def mousePressEvent(self, event):
         self.auto_fit = False
-        if event.button() == Qt.MiddleButton or (event.button() == Qt.LeftButton and self.space_down):
+        if event.button() == Qt.MiddleButton:
             self.pan_from = event.pos()
             self.viewport().setCursor(Qt.ClosedHandCursor)
             event.accept()
             return
+        if event.button() == Qt.LeftButton:
+            # Drag the background to move around; Shift and drag to draw a box selecting what's in it
+            boxing = bool(event.modifiers() & Qt.ShiftModifier) and self.itemAt(event.pos()) is None
+            self.setDragMode(QGraphicsView.RubberBandDrag if boxing else QGraphicsView.ScrollHandDrag)
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -531,35 +569,20 @@ class MapView(QGraphicsView):
     def mouseReleaseEvent(self, event):
         if self.pan_from is not None:
             self.pan_from = None
-            self.viewport().setCursor(Qt.OpenHandCursor if self.space_down else Qt.ArrowCursor)
+            self.viewport().unsetCursor()
             event.accept()
             return
         super().mouseReleaseEvent(event)
+        if self.dragMode() == QGraphicsView.RubberBandDrag:
+            self.setDragMode(QGraphicsView.ScrollHandDrag)
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Space and not event.isAutoRepeat():
-            self.space_down = True
-            self.viewport().setCursor(Qt.OpenHandCursor)
-            event.accept()
-        elif event.matches(QKeySequence.SelectAll):
+        if event.matches(QKeySequence.SelectAll):
             for item in self.items_by_key.values():
                 item.setSelected(True)
             event.accept()
         else:
             super().keyPressEvent(event)
-
-    def keyReleaseEvent(self, event):
-        if event.key() == Qt.Key_Space and not event.isAutoRepeat():
-            self.space_down = False
-            self.viewport().setCursor(Qt.ArrowCursor)
-            event.accept()
-        else:
-            super().keyReleaseEvent(event)
-
-    def focusOutEvent(self, event):
-        self.space_down = False
-        self.viewport().setCursor(Qt.ArrowCursor)
-        super().focusOutEvent(event)
 
     def showEvent(self, event):
         super().showEvent(event)

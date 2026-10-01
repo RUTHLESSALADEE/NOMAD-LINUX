@@ -92,7 +92,7 @@ class SyslogTab(QWidget):
 
         view_row = QHBoxLayout()
         self.filter_input = QLineEdit()
-        self.filter_input.setPlaceholderText("Filter by address, host, app or text...")
+        self.filter_input.setPlaceholderText("Filter by address, host, app or text... (Ctrl+F)")
         self.filter_input.setClearButtonEnabled(True)
         self.severity_combo = QComboBox()
         for index, name in enumerate(SEVERITIES):
@@ -135,6 +135,11 @@ class SyslogTab(QWidget):
         self.fill_addresses()
 
     # ----------------------------------------------------------------- Page interface
+
+    def focus_find(self):
+        """Ctrl+F on this page."""
+        self.filter_input.setFocus()
+        self.filter_input.selectAll()
 
     def save_settings(self, settings):
         settings.setValue("syslog/address", self.address_combo.currentData())

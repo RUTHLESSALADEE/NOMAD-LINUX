@@ -543,7 +543,7 @@ class IpamTab(QWidget):
         search_row = QHBoxLayout()
         search_row.addWidget(QLabel("Search:"))
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Find an address, name or subnet (Enter)")
+        self.search_input.setPlaceholderText("Find an address, name or subnet (Enter) (Ctrl+F)")
         self.search_input.setClearButtonEnabled(True)
         self.search_input.setMinimumWidth(200)
         search_row.addWidget(self.search_input, 1)
@@ -762,6 +762,11 @@ class IpamTab(QWidget):
         super().showEvent(event)
         self.open_store()
         QTimer.singleShot(0, self.fit_subnet_panel)  # Once the page has its real width
+
+    def focus_find(self):
+        """Ctrl+F on this page."""
+        self.search_input.setFocus()
+        self.search_input.selectAll()
 
     def save_settings(self, settings):
         if self.network_id:

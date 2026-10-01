@@ -86,3 +86,38 @@ def test_blanks_can_be_filtered(table):
 def test_natural_order():
     assert sorted(["Gi1/0/10", "Gi1/0/2", "VLAN 100", "VLAN 20"], key=natural_key) == \
         ["Gi1/0/2", "Gi1/0/10", "VLAN 20", "VLAN 100"]
+
+
+def test_filter_button_and_right_click_open_the_filter(table, app):
+    from PyQt5.QtCore import QEvent, QPoint, QPointF
+    from PyQt5.QtGui import QContextMenuEvent, QMouseEvent
+    table_filter = TableFilter(table)
+    table.resize(600, 300)
+    table.show()
+    app.processEvents()
+    header = table_filter.header
+    opened = []
+    header.filter_requested.disconnect()
+    header.filter_requested.connect(lambda column, position: opened.append(column))
+    kind = header.section_rect(1)
+    button = header.button_rect(kind)
+    assert button.left() < kind.center().x()  # At the left of the column, clear of the sort arrow
+
+    def click(point):
+        header.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, QPointF(point), Qt.LeftButton, Qt.LeftButton,
+                                           Qt.NoModifier))
+    click(button.center())
+    assert opened == [1]
+    assert header.button_at(QPoint(kind.right() - 5, kind.center().y())) == -1  # The rest of the header sorts
+    header.contextMenuEvent(QContextMenuEvent(QContextMenuEvent.Mouse, QPoint(kind.right() - 5, 5)))
+    assert opened == [1, 1]
+    table.hide()
+
+
+def test_popup_puts_the_filter_first(table):
+    table_filter = TableFilter(table)
+    table_filter.set_filter(2, {"10"})
+    popup = FilterPopup(table_filter, 1, table)
+    texts = [action.text() for action in popup.actions() if action.text()]
+    assert texts == ["Clear All Filters", "Sort A to Z", "Sort Z to A"]  # After the list of values
+    assert popup.actions()[0].defaultWidget() is not None  # The search and the values come first

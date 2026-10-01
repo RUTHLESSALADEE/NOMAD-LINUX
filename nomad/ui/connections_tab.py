@@ -43,7 +43,7 @@ class ConnectionsTab(QWidget):
 
         toolbar = QHBoxLayout()
         self.filter_input = QLineEdit()
-        self.filter_input.setPlaceholderText("Filter by port, address, program or PID, such as 443 or chrome")
+        self.filter_input.setPlaceholderText("Filter by port, address, program or PID, such as 443 or chrome (Ctrl+F)")
         self.filter_input.setClearButtonEnabled(True)
         toolbar.addWidget(self.filter_input, 1)
         self.tcp_check = QCheckBox("TCP")
@@ -92,6 +92,11 @@ class ConnectionsTab(QWidget):
         self.table.customContextMenuRequested.connect(self.show_context_menu)
 
     # ----------------------------------------------------------------- Tab interface
+
+    def focus_find(self):
+        """Ctrl+F on this page."""
+        self.filter_input.setFocus()
+        self.filter_input.selectAll()
 
     def save_settings(self, settings):
         settings.setValue("connections/tcp", self.tcp_check.isChecked())
