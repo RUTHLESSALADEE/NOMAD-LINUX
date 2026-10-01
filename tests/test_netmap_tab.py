@@ -5,11 +5,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
 from netmap_fakes import LAB_MACS, PC1_MAC, build_network  # noqa: E402
-from PyQt5.QtCore import QSettings, pyqtSignal  # noqa: E402
+from PyQt5.QtCore import QRectF, QSettings, pyqtSignal  # noqa: E402
 from PyQt5.QtWidgets import QApplication, QWidget  # noqa: E402
 
 from nomad.netmap import export, store  # noqa: E402
 from nomad.netmap.crawl import CrawlSettings, Crawler  # noqa: E402
+from nomad.netmap.layout import NODE_WIDTH  # noqa: E402
 from nomad.ui import netmap_tab  # noqa: E402
 from nomad.ui.netmap_view import DeviceItem, HostPortItem, LinkItem  # noqa: E402
 
@@ -85,6 +86,23 @@ def test_expanding_hosts_and_shared_ports(tab, crawled):
     assert [item.port for item in acc2.port_items] == ["Eth1/10"]
     tab.view.toggle_hosts(acc2)
     assert acc2.port_items == []
+
+
+def test_port_labels_clear_the_hosts_badge(tab, crawled):
+    tab.on_crawled(crawled)
+    acc2, core = tab.view.items_by_key["acc2"], tab.view.items_by_key["core"]
+    link = next(link for link in acc2.links if core in (link.a_item, link.b_item))
+    for dx in (0, 60, -120):  # Straight below, then off to each side
+        acc2.setPos(0, 0)
+        core.setPos(dx, 400)
+        badge = acc2.mapRectToScene(acc2.badge)
+        point = link.label_point(link.a_item is acc2)
+        label = QRectF(0, 0, 60, 16)
+        label.moveCenter(point)
+        assert not label.intersects(badge)
+    acc2.setPos(0, 0)
+    core.setPos(400, 0)  # Off to the side the badge doesn't matter: the label stays just past the box
+    assert link.label_point(link.a_item is acc2).x() == pytest.approx(NODE_WIDTH / 2 + 26)
 
 
 def test_dragged_positions_are_saved_and_kept_after_recrawl(tab, crawled):
@@ -213,7 +231,7 @@ def test_adding_and_deleting_hosts(tab, crawled, monkeypatch):
     before = len(crawled.hosts)
     printer = Host(mac="", device="acc1", port="Gi1/0/20", ip="10.10.0.50", name="old-printer", manual=True)
     crawled.hosts.append(printer)
-    tab.hosts_changed(printer)
+    tab.map_changed(printer)
     assert tab.hosts_table.rowCount() == before + 1
     assert "Gi1/0/20" in [item.port for item in tab.view.items_by_key["acc1"].port_items]  # Opened to show it
     assert any(host.name == "old-printer" and host.manual for host in store.load(tab.map_path).hosts)
@@ -565,3 +583,16 @@ def test_crawl_from_here_updates_the_map_open(tab, tmp_path):
     assert tab.view.items_by_key["core"].pos().x() == 3000  # Left where it was
     assert store.load(path).devices["acc1"].source == "snmp"
     assert "added 0 devices to this map (1 read over SNMP for the first time)" in tab.status_label.text()
+
+
+def test_session_hints_for_a_device(tab, crawled):
+    tab.on_crawled(crawled)
+    network_map = tab.network_map
+    device = next(device for device in network_map.devices.values() if device.name and device.interfaces_l3)
+    site = network_map.new_group("HQ")
+    building = network_map.new_group("Main / North", netmap_tab.BUILDING, site.key)
+    network_map.set_group([device.key], building.key)
+    hints = tab.session_hints(network_map, device)
+    assert hints["folder"] == "HQ/Main - North"
+    assert hints["name"] and hints["name"] in hints["aliases"]
+    assert device.interfaces_l3[0][0] in hints["aliases"]

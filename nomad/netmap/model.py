@@ -1,7 +1,7 @@
 """What a network map holds: devices, the links between them, and the hosts on switch ports. Saved as JSON."""
 import json
 import re
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 
 FORMAT_VERSION = 1
 
@@ -16,11 +16,16 @@ SNMP = "snmp"  # Answered SNMP: its neighbors, MAC and ARP tables were read
 NEIGHBOR = "neighbor"  # Only in another device's CDP/LLDP (not asked: out of scope, too far, or not a network device)
 NO_SNMP = "no-snmp"  # Answers ping but not SNMP (wrong community or an ACL)
 UNREACHABLE = "unreachable"  # Answered neither SNMP nor ping
-SOURCE_NAMES = {SNMP: "SNMP", NEIGHBOR: "Seen as a neighbor", NO_SNMP: "Pings, no SNMP", UNREACHABLE: "Unreachable"}
+UNCHECKED = "unchecked"  # Added by hand and not asked yet (or it has no address to ask)
+SOURCE_NAMES = {SNMP: "SNMP", NEIGHBOR: "Seen as a neighbor", NO_SNMP: "Pings, no SNMP", UNREACHABLE: "Unreachable",
+                UNCHECKED: "Not checked"}
+MANUAL_SOURCE_NAMES = {SNMP: "Added by hand, answers SNMP", NO_SNMP: "Added by hand, pings, no SNMP",
+                       UNREACHABLE: "Added by hand, unreachable", UNCHECKED: "Added by hand"}
 
-# Groups of devices on the map: sites, which can hold buildings
-SITE, BUILDING = "site", "building"
-GROUP_KINDS = {SITE: "Site", BUILDING: "Building"}
+# Groups of devices on the map: sites, which can hold buildings, which can hold rooms (or workspaces)
+SITE, BUILDING, ROOM = "site", "building", "room"
+GROUP_KINDS = {SITE: "Site", BUILDING: "Building", ROOM: "Room"}
+PARENT_KIND = {BUILDING: SITE, ROOM: BUILDING}  # The kind of group each kind can be in
 
 SHARED_PORT_HOSTS = 8  # More MACs than this on a port with no neighbor: probably an unmanaged switch or a hypervisor
 
@@ -78,10 +83,23 @@ class Device:
     interfaces_l3: list = field(default_factory=list)  # [[ip, prefix length, port]]
     routes: list = field(default_factory=list)  # [[destination, next hop ("" if connected), port, protocol]]
     routes_truncated: bool = False
+    manual: bool = False  # Added by hand (an unmanaged switch, or one the crawl can't reach), kept when mapping again
+    note: str = ""
 
     @property
     def label(self):
         return self.name or self.mgmt_ip or self.key
+
+    @property
+    def found_by(self):
+        """For the Devices table and the details: how it got on the map, and whether it answers SNMP."""
+        names = MANUAL_SOURCE_NAMES if self.manual else SOURCE_NAMES
+        return names.get(self.source, self.source)
+
+    def owns(self, address):
+        """Whether the address is one of the device's."""
+        return bool(address) and (address == self.mgmt_ip or address in self.addresses
+                                  or any(item[0] == address for item in self.interfaces_l3))
 
 
 @dataclass
@@ -91,6 +109,7 @@ class Link:
     b: str
     b_port: str
     protocols: list = field(default_factory=list)  # ["cdp"], ["lldp"] or both
+    manual: bool = False  # Drawn by hand, kept when mapping again (until the crawl finds it)
 
     @property
     def key(self):
@@ -134,12 +153,12 @@ class Trace:
 
 @dataclass
 class Group:
-    """A site or building drawn as a box round its devices. A building can be in a site; a site can't be in
-    anything."""
+    """A site, building or room drawn as a box round its devices. A room can be in a building and a building in
+    a site; a site can't be in anything."""
     key: str
     name: str
     kind: str = SITE
-    parent: str = ""  # A building's site ("" if it isn't in one)
+    parent: str = ""  # A building's site or a room's building ("" if it isn't in one)
     collapsed: bool = False  # Drawn as one box, with its links to the rest of the map
 
 
@@ -167,6 +186,7 @@ class NetworkMap:
                 for protocol in link.protocols:
                     if protocol not in existing.protocols:
                         existing.protocols.append(protocol)
+                existing.manual = existing.manual and link.manual  # Drawn by hand, and now found for real
                 return existing
         self.links.append(link)
         return link
@@ -207,11 +227,107 @@ class NetworkMap:
         this map as it was."""
         preview = NetworkMap(seeds=self.seeds, started=self.started, positions=dict(self.positions), root=self.root)
         preview.devices = dict(self.devices)
-        preview.links = [Link(link.a, link.a_port, link.b, link.b_port, list(link.protocols)) for link in self.links]
+        preview.links = [replace(link, protocols=list(link.protocols)) for link in self.links]
         preview.hosts = list(self.hosts)
         preview.groups, preview.group_of = self.groups, dict(self.group_of)
         preview.merge_crawl(newer, hosts=False)
         return preview
+
+    # ----------------------------------------------------------------- Devices and links added by hand
+
+    def new_device_key(self):
+        number = 1
+        while f"manual:{number}" in self.devices:
+            number += 1
+        return f"manual:{number}"
+
+    def remove_devices(self, keys):
+        """Take devices off the map, with their links and hosts."""
+        keys = set(keys)
+        for key in keys:
+            self.devices.pop(key, None)
+            self.positions.pop(key, None)
+            self.l3_positions.pop(key, None)
+        self.links = [link for link in self.links if link.a not in keys and link.b not in keys]
+        self.hosts = [host for host in self.hosts if host.device not in keys]
+        if self.root in keys:
+            self.root = ""
+        self.prune_groups()
+
+    def carry_manual(self, older):
+        """Bring the devices and links added by hand to an earlier map of the network over to this one; a device the
+        crawl has now found takes over its links (fold_manual_devices). Returns (the [(hand-added Device, found
+        Device)] folded together, how many links drawn by hand were left out because an end isn't on this map)."""
+        keys = {}
+        for key, device in older.devices.items():
+            if device.manual:
+                keys[key] = key if key not in self.devices else self.new_device_key()
+                self.devices[keys[key]] = replace(device, key=keys[key], addresses=list(device.addresses))
+        left_out = 0
+        for link in older.links:
+            if not link.manual:
+                continue
+            a, b = keys.get(link.a, link.a), keys.get(link.b, link.b)
+            if a in self.devices and b in self.devices:
+                self.add_link(replace(link, a=a, b=b, protocols=list(link.protocols)))
+            else:
+                left_out += 1
+        for host in (host for host in older.hosts if host.device in keys):  # Hosts added by hand on them
+            found = next((item for item in self.hosts if not item.manual and item.same_as(host)), None)
+            if found is not None:  # Found by the crawl elsewhere: it gets the name and note
+                found.name, found.note = found.name or host.name, found.note or host.note
+            else:
+                self.hosts.append(replace(host, device=keys[host.device]))
+        return self.fold_manual_devices(), left_out
+
+    def found_for(self, manual):
+        """The device a crawl found that a device added by hand is (by address, or by name), or None."""
+        name = normalize_name(manual.name) if manual.name else ""
+        for device in self.devices.values():
+            if device.manual:
+                continue
+            if manual.mgmt_ip and device.owns(manual.mgmt_ip):
+                return device
+            if name and (normalize_name(device.name) == name or device.key == name):
+                return device
+        return None
+
+    def fold_manual_devices(self):
+        """Devices added by hand that a crawl has now found for real become the found ones: their links, hosts, place
+        and group move over, and what the found one doesn't know (an address, a model, a note) is filled in. A link
+        drawn by hand is dropped when the crawl found one between the same two devices. Returns [(hand-added Device,
+        found Device)]."""
+        folded = []
+        for key, manual in list(self.devices.items()):
+            found = self.found_for(manual) if manual.manual else None
+            if found is None:
+                continue
+            for attribute in ("name", "mgmt_ip", "platform", "note"):
+                if not getattr(found, attribute):
+                    setattr(found, attribute, getattr(manual, attribute))
+            if found.kind == UNKNOWN:
+                found.kind = manual.kind
+            crawled_pairs = {frozenset((link.a, link.b)) for link in self.links if not link.manual}
+            links, self.links = self.links, []
+            for link in links:
+                if key in (link.a, link.b):
+                    link.a, link.b = (found.key if link.a == key else link.a), (found.key if link.b == key else link.b)
+                    if link.a == link.b or frozenset((link.a, link.b)) in crawled_pairs:
+                        continue
+                self.add_link(link)
+            for host in self.hosts:
+                if host.device == key:
+                    host.device = found.key
+            for positions in (self.positions, self.l3_positions):
+                if key in positions:
+                    positions.setdefault(found.key, positions[key])
+            if key in self.group_of:
+                self.group_of.setdefault(found.key, self.group_of[key])
+            if self.root == key:
+                self.root = found.key
+            self.remove_devices([key])
+            folded.append((manual, found))
+        return folded
 
     def carry_manual_hosts(self, older):
         """Bring the hosts added by hand to an earlier map of the network over to this one. One that has since
@@ -219,6 +335,8 @@ class NetworkMap:
         their switch isn't on this map."""
         dropped = []
         for manual in (host for host in older.hosts if host.manual):
+            if host_device_manual(older, manual):
+                continue  # Came over with its device (carry_manual)
             found = next((host for host in self.hosts if not host.manual and host.same_as(manual)), None)
             if found is not None:
                 found.name = found.name or manual.name
@@ -240,34 +358,43 @@ class NetworkMap:
         number = 1
         while f"g{number}" in used:
             number += 1
-        group = Group(f"g{number}", name, kind, parent if kind == BUILDING else "")
+        outer = self.group(parent)
+        fits = outer is not None and outer.kind == PARENT_KIND.get(kind)  # A building in a site, a room in a building
+        group = Group(f"g{number}", name, kind, parent if fits else "")
         self.groups.append(group)
         return group
 
     def subgroups(self, key):
         return [group for group in self.groups if group.parent == key]
 
-    def group_path(self, device_key):
-        """The groups a device is in, outermost first: [], [site], [building] or [site, building]."""
-        path = []
-        group = self.group(self.group_of.get(device_key, ""))
-        while group is not None and group not in path:
-            path.insert(0, group)
+    def group_chain(self, group):
+        """The group and the groups it's in, outermost first: [site, building, room], or as much as there is."""
+        chain = []
+        while group is not None and group not in chain:
+            chain.insert(0, group)
             group = self.group(group.parent)
-        return path
+        return chain
+
+    def group_path(self, device_key):
+        """The groups a device is in, outermost first, such as [], [site], [building] or [site, building, room]."""
+        return self.group_chain(self.group(self.group_of.get(device_key, "")))
 
     def group_label(self, group):
-        """"Site / Building", or just the group's name if it's a site or isn't in one."""
-        parent = self.group(group.parent)
-        return f"{parent.name} / {group.name}" if parent is not None else group.name
+        """"Site / Building / Room", or as much of that as the group is in."""
+        return " / ".join(item.name for item in self.group_chain(group))
 
     def device_group_label(self, device_key):
         path = self.group_path(device_key)
         return self.group_label(path[-1]) if path else ""
 
     def members(self, key, deep=True):
-        """Keys of the devices in a group (and, deep, in its buildings)."""
-        keys = {key} | ({group.key for group in self.subgroups(key)} if deep else set())
+        """Keys of the devices in a group (and, deep, in its buildings and their rooms)."""
+        keys = {key}
+        if deep:
+            inner = [key]
+            while inner:
+                inner = [group.key for parent in inner for group in self.subgroups(parent) if group.key not in keys]
+                keys.update(inner)
         return [device for device, group in self.group_of.items() if group in keys]
 
     def set_group(self, device_keys, key):
@@ -280,13 +407,13 @@ class NetworkMap:
         self.prune_groups()
 
     def remove_group(self, key):
-        """Ungroup: a building's devices go to its site; a site's buildings stand on their own and its devices
-        are left in no group."""
+        """Ungroup: a room's devices go to its building and a building's to its site; the groups that were in it
+        stand on their own, and devices in a group that wasn't in anything are left in no group."""
         group = self.group(key)
         if group is None:
             return
-        for building in self.subgroups(key):
-            building.parent = ""
+        for inner in self.subgroups(key):
+            inner.parent = ""
         for device in self.members(key, deep=False):
             if group.parent:
                 self.group_of[device] = group.parent
@@ -297,22 +424,27 @@ class NetworkMap:
 
     def prune_groups(self):
         """Forget devices no longer on the map and groups with nothing in them."""
-        keys = {group.key for group in self.groups}
-        sites = {group.key for group in self.groups if group.kind == SITE}
+        kinds = {group.key: group.kind for group in self.groups}
         self.group_of = {device: group for device, group in self.group_of.items()
-                         if device in self.devices and group in keys}
+                         if device in self.devices and group in kinds}
         for group in self.groups:
-            if group.kind != BUILDING or group.parent not in sites:
+            if group.kind not in PARENT_KIND or kinds.get(group.parent) != PARENT_KIND[group.kind]:
                 group.parent = ""
         used = set(self.group_of.values())
-        buildings = [group for group in self.groups if group.kind == BUILDING and group.key in used]
-        used |= {group.parent for group in buildings}
+        for kind in (ROOM, BUILDING):  # Innermost first, so a site holding only a building of rooms stays
+            used |= {group.parent for group in self.groups if group.kind == kind and group.key in used}
+        used.discard("")
         self.groups = [group for group in self.groups if group.key in used]
 
-    def carry_groups(self, older):
-        """Bring an earlier map's sites and buildings over, with the devices still on this map in them."""
+    def carry_groups(self, older, folded=()):
+        """Bring an earlier map's sites, buildings and rooms over, with the devices still on this map in them.
+        folded: carry_manual's [(hand-added Device, found Device)], whose found ones take the hand-added ones'
+        place in them (unless the earlier map had them in one already)."""
         self.groups = [Group(**asdict(group)) for group in older.groups]
         self.group_of = dict(older.group_of)
+        for manual, found in folded:
+            if manual.key in self.group_of:
+                self.group_of.setdefault(found.key, self.group_of[manual.key])
         self.prune_groups()
 
     def links_of(self, key):
@@ -353,6 +485,11 @@ class NetworkMap:
         network_map.group_of = dict(data.get("group_of", {}))
         network_map.prune_groups()
         return network_map
+
+
+def host_device_manual(network_map, host):
+    device = network_map.devices.get(host.device)
+    return device is not None and device.manual
 
 
 def _build(cls, data):

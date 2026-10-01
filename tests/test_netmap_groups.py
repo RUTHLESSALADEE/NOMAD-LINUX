@@ -1,4 +1,4 @@
-"""Network Map: sites and buildings, the other arrangements, and lining devices up."""
+"""Network Map: sites, buildings and rooms, the other arrangements, and lining devices up."""
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -13,7 +13,8 @@ from nomad.netmap import export, store  # noqa: E402
 from nomad.netmap.crawl import CrawlSettings, Crawler  # noqa: E402
 from nomad.netmap.layout import CIRCLE, GRID, GROUP_PAD, GROUP_TITLE, HORIZONTAL, LEFT, LEFT_RIGHT, MIDDLE, \
     NODE_HEIGHT, NODE_WIDTH, STYLE_NAMES, TOP_DOWN, align, arrange, arrange_in_place, distribute  # noqa: E402
-from nomad.netmap.model import BUILDING, SITE, Device, NetworkMap  # noqa: E402
+from nomad.netmap.model import BUILDING, ROOM, SITE, Device, NetworkMap  # noqa: E402
+from nomad.ui.netmap_dialogs import GroupDialog  # noqa: E402
 from nomad.ui.netmap_view import GroupItem, LinkItem  # noqa: E402
 from test_netmap_tab import Window, app, tab  # noqa: E402,F401
 
@@ -78,6 +79,30 @@ def test_groups_in_the_model():
     network_map.remove_group(site.key)  # Its building stands on its own; its devices are in no group
     assert [(group.name, group.parent) for group in network_map.groups] == [("Annex", "")]
     assert network_map.group_of == {"b": network_map.groups[0].key}
+
+
+def test_rooms_in_buildings():
+    network_map = NetworkMap(devices={key: Device(key) for key in ("a", "b", "c")})
+    site = network_map.new_group("Head Office")
+    building = network_map.new_group("Building 2", BUILDING, site.key)
+    room = network_map.new_group("Room 114", ROOM, building.key)
+    network_map.set_group(["a", "b"], room.key)
+    network_map.set_group(["c"], building.key)
+    assert [group.name for group in network_map.group_path("a")] == ["Head Office", "Building 2", "Room 114"]
+    assert network_map.device_group_label("a") == "Head Office / Building 2 / Room 114"
+    assert sorted(network_map.members(site.key)) == ["a", "b", "c"]  # Down through the building to its rooms
+    assert sorted(network_map.members(building.key)) == ["a", "b", "c"]
+    assert network_map.members(building.key, deep=False) == ["c"]
+    assert [group.name for group in NetworkMap.from_json(network_map.to_json()).groups] == [
+        "Head Office", "Building 2", "Room 114"]
+
+    network_map.set_group(["c"], "")  # The building holds only a room now, and the site only it: both stay
+    assert [group.name for group in network_map.groups] == ["Head Office", "Building 2", "Room 114"]
+    assert network_map.new_group("Desk", ROOM, site.key).parent == ""  # A room can't be straight in a site
+    network_map.remove_group(room.key)  # Its devices go to its building
+    assert network_map.group_of == {"a": building.key, "b": building.key}
+    network_map.remove_group(building.key)
+    assert network_map.group_of == {"a": site.key, "b": site.key}
 
 
 def test_groups_carried_to_a_new_crawl():
@@ -262,6 +287,45 @@ def test_buildings_in_sites_and_ungrouping(tab, crawled):
     assert keys[0] not in tab.network_map.group_of
 
 
+def test_rooms_on_the_page(tab, crawled):
+    tab.on_crawled(crawled)
+    keys = sorted(crawled.devices)
+    site = make_site(tab, keys[:4], "Campus")
+    building = make_site(tab, keys[1:4], "Library", BUILDING, site.key)
+    room = make_site(tab, keys[2:4], "Server Room", ROOM, building.key)
+    items = tab.view.group_items
+    assert items[room.key].parent_group is items[building.key] and items[building.key].children == [items[room.key]]
+    assert items[building.key].rect.contains(items[room.key].rect)
+    assert items[site.key].rect.contains(items[building.key].rect)
+    assert items[room.key].zValue() > items[building.key].zValue() > items[site.key].zValue()
+    assert "1 room" in items[building.key].summary()[0]
+    tab.view.set_collapsed(items[site.key], True)  # The room is hidden inside the collapsed site
+    assert not items[room.key].isVisible()
+    assert tab.view.show_group(room.key) and items[room.key].isVisible()
+    tab.rearrange(TOP_DOWN)
+    assert items[building.key].rect.contains(items[room.key].rect)
+    assert [box[0].kind for box in tab.view.group_boxes()] == [SITE, BUILDING, ROOM]
+    tab.ungroup(room.key)
+    assert "its building" in tab.status_label.text()
+    assert {tab.network_map.group_of[key] for key in keys[1:4]} == {building.key}
+
+
+def test_group_dialog_offers_rooms(tab, crawled):
+    tab.on_crawled(crawled)
+    keys = sorted(crawled.devices)
+    site = make_site(tab, keys[:2], "Campus")
+    building = make_site(tab, keys[1:2], "Library", BUILDING, site.key)
+    dialog = GroupDialog(tab.network_map, count=1, inside=building.key)  # In a building: most likely a room
+    assert dialog.kind_radios[ROOM].isChecked() and dialog.inside_combo.currentData() == building.key
+    assert dialog.inside_combo.itemText(dialog.inside_combo.currentIndex()) == "Campus / Library"
+    dialog.name_input.setText("Room 2")
+    assert dialog.values() == ("Room 2", ROOM, building.key)
+    dialog.kind_radios[BUILDING].setChecked(True)  # Buildings go in sites
+    assert [dialog.inside_combo.itemData(index) for index in range(dialog.inside_combo.count())] == ["", site.key]
+    dialog.kind_radios[SITE].setChecked(True)
+    assert not dialog.inside_combo.isEnabled() and dialog.values() == ("Room 2", SITE, "")
+
+
 def test_rearranging_in_each_style_keeps_groups_apart(tab, crawled):
     tab.on_crawled(crawled)
     keys = sorted(crawled.devices)
@@ -292,3 +356,68 @@ def test_drawio_export_has_the_group_boxes(tab, crawled):
     root = ElementTree.fromstring(export.drawio(tab.network_map, tab.view.positions(), tab.view.group_boxes()))
     boxes = [cell for cell in root.iter("mxCell") if cell.get("id", "").startswith("g")]
     assert [cell.get("value") for cell in boxes] == ["North & South"]
+
+
+# ----------------------------------------------------------------- Undo and Redo
+
+
+def test_undo_and_redo_moves(tab, crawled):
+    tab.on_crawled(crawled)
+    view = tab.view
+    key = sorted(crawled.devices)[0]
+    item = view.items_by_key[key]
+    start = (item.pos().x(), item.pos().y())
+    assert not tab.undo_button.isEnabled() and not tab.redo_button.isEnabled()
+    view.begin_node_drag(item)
+    item.setPos(start[0] + 500, start[1] + 300)
+    view.on_item_moved()
+    assert tab.undo_button.isEnabled()
+    tab.undo()
+    assert (item.pos().x(), item.pos().y()) == start
+    assert tab.network_map.positions[key] == start
+    assert "Undid" in tab.status_label.text()
+    assert tab.redo_button.isEnabled() and not tab.undo_button.isEnabled()
+    tab.redo()
+    assert (item.pos().x(), item.pos().y()) == (start[0] + 500, start[1] + 300)
+
+    # Aligning and re-arranging are steps too, and a new change forgets what was undone
+    keys = sorted(crawled.devices)[:3]
+    before = view.positions()
+    tab.align_selected(view, keys, LEFT)
+    tab.undo()
+    assert view.positions() == before
+    tab.rearrange(GRID)
+    assert not tab.redo_button.isEnabled()
+    tab.undo()
+    assert view.positions() == before
+
+
+def test_undo_dragging_into_a_group(tab, crawled):
+    tab.on_crawled(crawled)
+    keys = sorted(crawled.devices)
+    group = make_site(tab, keys[:2])
+    view = tab.view
+    newcomer = view.items_by_key[keys[2]]
+    start = QPointF(newcomer.pos())
+    view.scene().clearSelection()
+    newcomer.setSelected(True)
+    view.begin_node_drag(newcomer)
+    newcomer.setPos(view.group_items[group.key].rect.center() + QPointF(0, 10))
+    view.on_item_moved()
+    assert tab.network_map.group_of.get(keys[2]) == group.key
+    tab.undo()  # The move and joining the group are one step
+    assert keys[2] not in tab.network_map.group_of and newcomer.pos() == start
+    assert view.items_by_key[keys[2]].group_item is None
+    tab.undo()  # Making the site
+    assert not tab.network_map.groups and not view.group_items
+    tab.redo()
+    assert [g.name for g in tab.network_map.groups] == ["North"]
+    assert set(tab.network_map.members(tab.network_map.groups[0].key)) == set(keys[:2])
+
+
+def test_undo_forgotten_with_another_map(tab, crawled):
+    tab.on_crawled(crawled)
+    tab.align_selected(tab.view, sorted(crawled.devices)[:3], LEFT)
+    assert tab.undo_button.isEnabled()
+    tab.show_map(store.load(tab.map_path), tab.map_path)
+    assert not tab.undo_button.isEnabled()

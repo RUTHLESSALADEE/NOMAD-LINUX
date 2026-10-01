@@ -13,13 +13,27 @@ class HostActions:
     def __init__(self, window, parent):
         self.window, self.parent = window, parent
 
-    def add_to(self, menu, host):
-        """Add the actions for host to menu. Returns {QAction: callable} for running the chosen one."""
-        return {
-            menu.addAction("Open SSH Session"): lambda: self.open_terminal(host, SSH),
-            menu.addAction("Open SCP Session"): lambda: self.window.scp_tab.open_address(host),
-            menu.addAction("Open Telnet Session"): lambda: self.open_terminal(host, TELNET),
-            menu.addAction("SSH with PuTTY"): lambda: self.open_ssh(host),
+    def add_to(self, menu, host, aliases=(), name="", folder=""):
+        """Add the actions for host to menu. Returns {QAction: callable} for running the chosen one. aliases: the
+        host's other addresses and names, for finding its saved sessions; name and folder: what to call a new
+        session to it, and the folder to suggest when it's saved."""
+        actions = {}
+        for label, page, protocol in (("SSH", self.window.terminal_tab, SSH), ("SCP", self.window.scp_tab, SSH),
+                                      ("Telnet", self.window.terminal_tab, TELNET)):
+            matches = page.saved_matches(host, aliases, protocol)
+            if len(matches) == 1:
+                text = f"Open {label} Session ({matches[0].name})"
+            elif matches:
+                text = f"Open {label} Session ({len(matches)} Saved)..."
+            else:
+                text = f"Open {label} Session"
+            actions[menu.addAction(text)] = lambda page=page, protocol=protocol: page.open_address(
+                host, protocol, aliases, name, folder)
+            if matches:
+                actions[menu.addAction(f"Open New {label} Session")] = lambda page=page, protocol=protocol: \
+                    page.open_address(host, protocol, aliases, name, folder, use_saved=False)
+        actions.update({
+            menu.addAction("SSH with PuTTY"): lambda: self.open_ssh(host, aliases),
             menu.addAction(f"Open https://{host}"): lambda: self.open_web(host),
             menu.addAction(f"Open http://{host}"): lambda: self.open_web(host, "http"),
             menu.addAction("Ping"): lambda: self.ping(host),
@@ -28,14 +42,16 @@ class HostActions:
             menu.addAction("Scan Ports"): lambda: self.scan_ports(host),
             menu.addAction("SNMP Details"): lambda: self.snmp(host),
             menu.addAction("Capture Traffic..."): lambda: self.capture(host),
-        }
+        })
+        return actions
 
     def open_terminal(self, host, protocol):
-        """Open a session to host on the Terminal page."""
+        """Open a session to host on the Terminal page (its saved session, if it has one)."""
         if host:
             self.window.terminal_tab.open_address(host, protocol)
 
-    def open_ssh(self, host):
+    def open_ssh(self, host, aliases=()):
+        """SSH in PuTTY, as the user of host's saved session if it has just one (PuTTY asks for the password)."""
         if not host:
             return
         putty = find_putty()
@@ -45,7 +61,9 @@ class HostActions:
                                 "Install PuTTY from https://www.putty.org, then try again.")
             return
         try:
-            subprocess.Popen([putty, "-ssh", host])
+            matches = self.window.terminal_tab.saved_matches(host, aliases, SSH)
+            user = ["-l", matches[0].username] if len(matches) == 1 and matches[0].username else []
+            subprocess.Popen([putty, "-ssh", *user, host])
         except OSError as error:
             QMessageBox.critical(self.parent, "SSH", f"Couldn't start PuTTY:\n\n{error}")
             return

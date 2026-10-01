@@ -1,5 +1,6 @@
 """Saved terminal sessions (SSH, Telnet, serial, raw TCP), organised in folders, plus importing PuTTY's sessions."""
 import dataclasses
+import ipaddress
 import json
 import logging
 import os
@@ -152,6 +153,25 @@ def target_key(session):
     if session.protocol == SERIAL:
         return SERIAL, session.serial_port.upper(), int(session.baud_rate)
     return session.protocol, session.host.lower(), int(session.port), session.username.lower()
+
+
+def same_host(first, second):
+    """Whether two host names or addresses are the same place: the same address (however it's written), the same
+    name, or the same name with and without its domain ("core-sw1" and "core-sw1.corp.local")."""
+    first, second = (text.strip().strip("[]").rstrip(".").lower() for text in (first or "", second or ""))
+    if not first or not second:
+        return False
+    try:
+        return ipaddress.ip_address(first) == ipaddress.ip_address(second)
+    except ValueError:
+        pass
+    if first == second:
+        return True
+    if "." in first and "." in second:
+        return False  # Two full names that differ
+    if any(re.fullmatch(r"[\d.]+|.*:.*", text) for text in (first, second)):
+        return False  # An address (or something like one) never matches a name by its first part
+    return first.split(".")[0] == second.split(".")[0]
 
 
 @dataclass
@@ -321,6 +341,15 @@ class SessionStore:
         self.sessions = [session for session in self.sessions if not inside(session.folder)]
         self.folders = {path for path in self.folders if not inside(path)}
         self.save()
+
+    def matching(self, hosts, protocol, username=""):
+        """Saved sessions that connect to any of hosts (a device's addresses and names) with protocol, and as
+        username if one is given; by folder and name."""
+        hosts = [host for host in hosts if host]
+        found = [session for session in self.sessions if session.protocol == protocol
+                 and (not username or session.username.lower() == username.lower())
+                 and any(same_host(session.host, host) for host in hosts)]
+        return sorted(found, key=lambda session: session.path.lower())
 
     # ----------------------------------------------------------------- Recent connections
 

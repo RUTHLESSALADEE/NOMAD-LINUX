@@ -1856,11 +1856,32 @@ class IpamTab(QWidget):
             menu.addAction("Ping", lambda: self.go_to(self.window.ping_tab, "ping_host", host))
             menu.addAction("Traceroute", lambda: self.go_to(self.window.traceroute_tab, "trace_host", host))
             menu.addAction("Scan Ports", lambda: self.go_to(self.window.ports_tab, "scan_host", host))
-            menu.addAction("SSH", lambda: self.window.terminal_tab.open_address(host))
-            menu.addAction("SCP", lambda: self.window.scp_tab.open_address(host))
+            self.add_session_actions(menu, host)
             menu.addSeparator()
             menu.addAction("History...", lambda: self.show_history("address", host)).setEnabled(self.as_of is None)
         menu.exec_(self.table.viewport().mapToGlobal(position))
+
+    def add_session_actions(self, menu, host):
+        """SSH and SCP to an address: with its saved session if there is one (found by the address or its recorded
+        name). A new session is named after the address and suggests the network and subnet as its folder."""
+        record = self.model.recorded.get(ipaddress.ip_address(host))
+        name = record.name.strip() if record is not None else ""
+        network, subnet = self.network(), self.selected_subnet()
+        parts = [network.name if network is not None else "", subnet.name if subnet is not None else ""]
+        folder = "/".join(part.strip().replace("/", "-") for part in parts if part and part.strip())
+        aliases = [name] if name else []
+        for label, page in (("SSH", self.window.terminal_tab), ("SCP", self.window.scp_tab)):
+            matches = page.saved_matches(host, aliases)
+            if len(matches) == 1:
+                text = f"{label} ({matches[0].name})"
+            elif matches:
+                text = f"{label} ({len(matches)} Saved)..."
+            else:
+                text = label
+            menu.addAction(text, lambda page=page: page.open_address(host, aliases=aliases, name=name, folder=folder))
+            if matches:
+                menu.addAction(f"{label} as a New Session", lambda page=page: page.open_address(
+                    host, aliases=aliases, name=name, folder=folder, use_saved=False))
 
     def go_to(self, page, method, host):
         self.window.navigator.setCurrentWidget(page)

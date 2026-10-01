@@ -1,5 +1,5 @@
 """Network Map settings: the SNMP community strings to try, and how far the crawl may go; and the dialogs for
-hosts added by hand and for sites and buildings."""
+hosts added by hand and for sites, buildings and rooms."""
 import ipaddress
 
 from PyQt5.QtCore import Qt, pyqtSignal
@@ -10,7 +10,8 @@ from PyQt5.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QDialog, QD
 
 from ..netmap import diff
 from ..netmap.crawl import MAX_WORKERS, WORKERS, parse_networks
-from ..netmap.model import BUILDING, SITE, Host, port_sort_key, short_port
+from ..netmap.model import AP, FIREWALL, GROUP_KINDS, KIND_NAMES, PARENT_KIND, ROUTER, SITE, SWITCH, UNCHECKED, \
+    UNKNOWN, Device, Host, Link, normalize_name, port_sort_key, short_port
 from ..oui import format_mac, vendor
 from ..snmp import VERSIONS, community_is_valid
 from .theme import COLORS
@@ -286,14 +287,7 @@ class HostDialog(QDialog):
         layout.addWidget(buttons)
 
     def fill_ports(self):
-        """The ports the chosen switch is known to have: its links and the ports hosts are on."""
-        key = self.device_combo.currentData()
-        text = self.port_combo.currentText()
-        ports = {link.port_on(key) for link in self.network_map.links_of(key)}
-        ports |= set(self.network_map.hosts_by_port(key))
-        self.port_combo.clear()
-        self.port_combo.addItems(sorted((port for port in ports if port), key=port_sort_key))
-        self.port_combo.setEditText(text)
+        fill_ports(self.port_combo, self.network_map, self.device_combo.currentData())
 
     def values(self):
         """The host as entered. Raises ValueError for anything that isn't valid."""
@@ -336,43 +330,165 @@ class HostDialog(QDialog):
         super().accept()
 
 
-class GroupDialog(QDialog):
-    """New site or building for the devices selected, or renaming one."""
+def fill_ports(combo, network_map, key):
+    """Offer the ports a device is known to have (its links and the ports hosts are on), keeping what's typed."""
+    text = combo.currentText()
+    ports = {link.port_on(key) for link in network_map.links_of(key)} if key else set()
+    ports |= set(network_map.hosts_by_port(key)) if key else set()
+    combo.clear()
+    combo.addItems(sorted((port for port in ports if port), key=port_sort_key))
+    combo.setEditText(text)
 
-    def __init__(self, network_map, group=None, count=0, site="", parent=None):
+
+def device_combo(network_map, chosen="", blank="", leave_out=""):
+    """A list of the map's devices by name, with an entry for none at the top when blank names it."""
+    combo = QComboBox()
+    if blank:
+        combo.addItem(blank, "")
+    for item in sorted(network_map.devices.values(), key=lambda item: item.label.lower()):
+        if item.key != leave_out:
+            combo.addItem(item.label, item.key)
+    if chosen:
+        combo.setCurrentIndex(max(0, combo.findData(chosen)))
+    return combo
+
+
+def port_combo(network_map, key, text=""):
+    combo = QComboBox()
+    combo.setEditable(True)
+    fill_ports(combo, network_map, key)
+    combo.setEditText(text)
+    combo.lineEdit().setPlaceholderText("Such as Gi1/0/24 (optional)")
+    return combo
+
+
+class DeviceDialog(QDialog):
+    """Add a device by hand (an unmanaged switch, or one the crawl can't reach), or edit one added by hand. Adding,
+    it can be linked to a device already on the map."""
+
+    def __init__(self, network_map, device=None, linked_to="", parent=None):
         super().__init__(parent)
-        self.network_map, self.group = network_map, group
-        self.setWindowTitle(f"Rename {'Building' if group.kind == BUILDING else 'Site'}" if group else "New Group")
-        self.resize(380, 0)
+        self.network_map, self.device = network_map, device
+        self.setWindowTitle("Edit Device" if device else "Add Device")
+        self.resize(440, 0)
         layout = QVBoxLayout(self)
-        if group is None:
-            note = QLabel(f"Put the {count} device{'' if count == 1 else 's'} selected in a new site or building. "
-                          "It's drawn as a box round them; drag devices into or out of the box to change what's "
-                          "in it.")
+        if device is None:
+            note = QLabel("For a device the crawl didn't find: an unmanaged switch, or one SNMP can't reach. It's "
+                          "marked as added by hand and kept when you map again. With an address, it's checked over "
+                          "SNMP with the map's community strings, and pinged while monitoring, like the others.")
             note.setWordWrap(True)
             layout.addWidget(note)
         form = QFormLayout()
-        self.name_input = QLineEdit(group.name if group else "")
-        self.name_input.setPlaceholderText("Such as Head Office, or Building 2")
+        self.name_input = QLineEdit(device.name if device else "")
+        self.name_input.setPlaceholderText("Such as closet-sw3")
+        self.ip_input = QLineEdit(device.mgmt_ip if device else "")
+        self.ip_input.setPlaceholderText("To ping and check over SNMP (optional)")
+        self.kind_combo = QComboBox()
+        for kind in (SWITCH, ROUTER, FIREWALL, AP, UNKNOWN):
+            self.kind_combo.addItem(KIND_NAMES[kind], kind)
+        self.kind_combo.setCurrentIndex(max(0, self.kind_combo.findData(device.kind if device else SWITCH)))
+        self.platform_input = QLineEdit(device.platform if device else "")
+        self.platform_input.setPlaceholderText("Such as Netgear GS108 (optional)")
+        self.note_input = QLineEdit(device.note if device else "")
         form.addRow("Name:", self.name_input)
-        self.site_radio = QRadioButton("Site")
-        self.building_radio = QRadioButton("Building")
-        self.site_combo = QComboBox()
-        self.site_combo.addItem("(Not in a site)", "")
-        for item in sorted((item for item in network_map.groups if item.kind == SITE),
-                           key=lambda item: item.name.lower()):
-            self.site_combo.addItem(item.name, item.key)
-        if group is None:
-            kinds = QHBoxLayout()
-            kinds.addWidget(self.site_radio)
-            kinds.addWidget(self.building_radio)
-            kinds.addStretch(1)
-            form.addRow("Kind:", kinds)
-            form.addRow("In site:", self.site_combo)
-            self.site_combo.setCurrentIndex(max(0, self.site_combo.findData(site)))
-            (self.building_radio if site else self.site_radio).setChecked(True)
-            self.site_radio.toggled.connect(lambda: self.site_combo.setEnabled(self.building_radio.isChecked()))
-            self.site_combo.setEnabled(self.building_radio.isChecked())
+        form.addRow("IP address:", self.ip_input)
+        form.addRow("Kind:", self.kind_combo)
+        form.addRow("Model:", self.platform_input)
+        form.addRow("Note:", self.note_input)
+        self.link_combo = self.there_port = self.here_port = None
+        if device is None and network_map.devices:
+            self.link_combo = device_combo(network_map, linked_to, blank="(Not linked to anything yet)")
+            self.there_port = port_combo(network_map, linked_to)
+            self.here_port = port_combo(network_map, "")
+            self.link_combo.currentIndexChanged.connect(self.on_link_changed)
+            form.addRow("Linked to:", self.link_combo)
+            form.addRow("Its port:", self.there_port)
+            form.addRow("This device's port:", self.here_port)
+            self.on_link_changed()
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def on_link_changed(self):
+        key = self.link_combo.currentData()
+        fill_ports(self.there_port, self.network_map, key)
+        self.there_port.setEnabled(bool(key))
+        self.here_port.setEnabled(bool(key))
+
+    def values(self):
+        """(Device, Link or None) as entered: the device keeps its key when edited, and has none ("") when new; the
+        link's end on it has that key too. Raises ValueError for anything that isn't valid."""
+        name, ip = self.name_input.text().strip(), self.ip_input.text().strip()
+        if not (name or ip):
+            raise ValueError("Enter a name or an IP address for it.")
+        if ip:
+            try:
+                ip = str(ipaddress.ip_address(ip))
+            except ValueError:
+                raise ValueError(f"'{ip}' isn't an IP address.") from None
+        for other in self.network_map.devices.values():
+            if self.device is not None and other.key == self.device.key:
+                continue
+            if ip and other.owns(ip):
+                raise ValueError(f"{ip} is already on the map: it's {other.label}'s.")
+            if name and normalize_name(other.name) == normalize_name(name):
+                raise ValueError(f"There's already a device called {other.label} on the map.")
+        key = self.device.key if self.device else ""
+        old = self.device
+        device = Device(key=key, name=name, mgmt_ip=ip, kind=self.kind_combo.currentData(),
+                        platform=self.platform_input.text().strip(), note=self.note_input.text().strip(),
+                        manual=True, source=UNCHECKED)
+        if old is not None and old.mgmt_ip == ip:  # Same address: what was found asking it still holds
+            device.source, device.error = old.source, old.error
+            device.sys_descr, device.sys_object_id = old.sys_descr, old.sys_object_id
+        link = None
+        there = self.link_combo.currentData() if self.link_combo is not None else ""
+        if there:
+            link = Link(there, short_port(self.there_port.currentText().strip()), key,
+                        short_port(self.here_port.currentText().strip()), manual=True)
+        return device, link
+
+    def accept(self):
+        try:
+            self.values()
+        except ValueError as error:
+            QMessageBox.warning(self, self.windowTitle(), str(error))
+            return
+        super().accept()
+
+
+class LinkDialog(QDialog):
+    """Draw a link by hand between two devices (one the crawl couldn't see: a port with CDP and LLDP off, or to an
+    unmanaged switch), or change the ports of one drawn by hand."""
+
+    def __init__(self, network_map, a="", b="", link=None, parent=None):
+        super().__init__(parent)
+        self.network_map, self.link = network_map, link
+        self.setWindowTitle("Edit Link" if link else "Add Link")
+        self.resize(440, 0)
+        layout = QVBoxLayout(self)
+        if link is None:
+            note = QLabel("A link the crawl couldn't see. It's drawn dotted, kept when you map again, and dropped "
+                          "once the crawl finds a link between the two devices. The ports are optional.")
+            note.setWordWrap(True)
+            layout.addWidget(note)
+        if link is not None:
+            a, b = link.a, link.b
+        form = QFormLayout()
+        self.a_combo = device_combo(network_map, a)
+        self.a_port = port_combo(network_map, a, link.a_port if link else "")
+        self.b_combo = device_combo(network_map, b)
+        self.b_port = port_combo(network_map, b, link.b_port if link else "")
+        self.a_combo.currentIndexChanged.connect(lambda _: fill_ports(self.a_port, network_map,
+                                                                      self.a_combo.currentData()))
+        self.b_combo.currentIndexChanged.connect(lambda _: fill_ports(self.b_port, network_map,
+                                                                      self.b_combo.currentData()))
+        form.addRow("From:", self.a_combo)
+        form.addRow("Its port:", self.a_port)
+        form.addRow("To:", self.b_combo)
+        form.addRow("Its port:", self.b_port)
         layout.addLayout(form)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -380,20 +496,100 @@ class GroupDialog(QDialog):
         layout.addWidget(buttons)
 
     def values(self):
-        """(name, kind, site key). Raises ValueError for a name that's missing or taken."""
+        """The Link as entered. Raises ValueError for anything that isn't valid."""
+        a, b = self.a_combo.currentData(), self.b_combo.currentData()
+        if not a or not b:
+            raise ValueError("Choose the devices at both ends.")
+        if a == b:
+            raise ValueError("Choose two different devices.")
+        link = Link(a, short_port(self.a_port.currentText().strip()), b, short_port(self.b_port.currentText().strip()),
+                    manual=True)
+        for other in self.network_map.links:
+            if other is not self.link and other.key == link.key:
+                raise ValueError("That link is already on the map.")
+        return link
+
+    def accept(self):
+        try:
+            self.values()
+        except ValueError as error:
+            QMessageBox.warning(self, self.windowTitle(), str(error))
+            return
+        super().accept()
+
+
+class GroupDialog(QDialog):
+    """New site, building or room for the devices selected, or renaming one."""
+
+    def __init__(self, network_map, group=None, count=0, inside="", parent=None):
+        super().__init__(parent)
+        self.network_map, self.group = network_map, group
+        self.setWindowTitle(f"Rename {GROUP_KINDS[group.kind]}" if group else "New Group")
+        self.resize(380, 0)
+        layout = QVBoxLayout(self)
+        if group is None:
+            note = QLabel(f"Put the {count} device{'' if count == 1 else 's'} selected in a new site, building or "
+                          "room. It's drawn as a box round them; drag devices into or out of the box to change "
+                          "what's in it.")
+            note.setWordWrap(True)
+            layout.addWidget(note)
+        form = QFormLayout()
+        self.name_input = QLineEdit(group.name if group else "")
+        self.name_input.setPlaceholderText("Such as Head Office, Building 2 or Room 114")
+        form.addRow("Name:", self.name_input)
+        self.kind_radios = {kind: QRadioButton(name) for kind, name in GROUP_KINDS.items()}
+        self.inside_label = QLabel()
+        self.inside_combo = QComboBox()
+        if group is None:
+            kinds = QHBoxLayout()
+            for radio in self.kind_radios.values():
+                kinds.addWidget(radio)
+                radio.toggled.connect(lambda on: on and self.fill_inside())
+            kinds.addStretch(1)
+            form.addRow("Kind:", kinds)
+            form.addRow(self.inside_label, self.inside_combo)
+            outer = network_map.group(inside)
+            kind = next((kind for kind, parent_kind in PARENT_KIND.items()
+                         if outer is not None and parent_kind == outer.kind), SITE)
+            self.kind_radios[kind].setChecked(True)
+            self.fill_inside()
+            self.inside_combo.setCurrentIndex(max(0, self.inside_combo.findData(inside)))
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def kind(self):
+        return next((kind for kind, radio in self.kind_radios.items() if radio.isChecked()), SITE)
+
+    def fill_inside(self):
+        """The groups the chosen kind can go in: sites for a building, buildings for a room."""
+        parent_kind = PARENT_KIND.get(self.kind())
+        self.inside_combo.clear()
+        self.inside_label.setText(f"In {GROUP_KINDS[parent_kind].lower()}:" if parent_kind else "In:")
+        if parent_kind:
+            self.inside_combo.addItem(f"(Not in a {GROUP_KINDS[parent_kind].lower()})", "")
+            for item in sorted((item for item in self.network_map.groups if item.kind == parent_kind),
+                               key=lambda item: self.network_map.group_label(item).lower()):
+                self.inside_combo.addItem(self.network_map.group_label(item), item.key)
+        self.inside_combo.setEnabled(bool(parent_kind))
+
+    def values(self):
+        """(name, kind, key of the group it's in). Raises ValueError for a name that's missing or taken."""
         name = self.name_input.text().strip()
         if not name:
             raise ValueError("Enter a name for it.")
         if self.group is not None:
-            kind, site = self.group.kind, self.group.parent
+            kind, inside = self.group.kind, self.group.parent
         else:
-            kind = BUILDING if self.building_radio.isChecked() else SITE
-            site = self.site_combo.currentData() if kind == BUILDING else ""
+            kind = self.kind()
+            inside = (self.inside_combo.currentData() or "") if kind in PARENT_KIND else ""
         for other in self.network_map.groups:
-            if other is not self.group and other.parent == site and other.name.lower() == name.lower():
-                where = f" in {self.network_map.group(site).name}" if site else ""
+            if other is not self.group and other.parent == inside and other.name.lower() == name.lower():
+                where = f" in {self.network_map.group(inside).name}" if inside else ""
                 raise ValueError(f"There's already a group called {other.name}{where}.")
-        return name, kind, site
+        return name, kind, inside
 
     def accept(self):
         try:

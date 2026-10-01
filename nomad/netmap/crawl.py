@@ -27,6 +27,8 @@ MAX_WORKERS = 64
 BULK_ROWS = 50  # Rows asked for in each SNMP GETBULK: fewer round trips than the usual 25
 VLAN_WORKERS = 4  # A Catalyst's per-VLAN MAC tables read at once
 STOPPED = "Stopped"
+PINGS_NO_SNMP = "Answers ping but not SNMP: check the community string and the device's SNMP ACL."
+NO_ANSWER = "No answer to SNMP or ping."
 LIVE_INTERVAL = 1.5  # Seconds between snapshots of the map for drawing it while it's crawled
 ROUTE_ROWS = 20000  # Per column: a core with the full internet table shouldn't take all day
 MAX_ROUTES = 5000  # Kept per device in the map
@@ -95,7 +97,7 @@ class Crawler:
         self.known = known
         if known is not None:
             for key, device in known.devices.items():
-                if device.source == SNMP:  # Already read: recognize it, but don't ask it again
+                if device.source == SNMP and not device.manual:  # Already read: recognize it, but don't ask again
                     for address in [device.mgmt_ip] + list(device.addresses):
                         if address:
                             self.aliases.setdefault(address, key)
@@ -230,30 +232,34 @@ class Crawler:
         self.map.traces = sorted(traces, key=lambda item: ipaddress.ip_address(item.target))
         self.map.stopped = self.should_stop()
 
-    def visit(self, address):
-        """Read one device. Returns (DeviceTables or None, error). Runs on a worker thread."""
-        started = time.monotonic()
-        client = info = None
+    def connect(self, address):
+        """Find the community string a device answers to. Returns (client, SystemInfo, community), or Nones when it
+        answers none of them (or the crawl is stopping)."""
         communities = self.communities_for(address)
         for number, community in enumerate(communities, start=1):
             if self.should_stop():
-                return None, STOPPED
+                break
             self.events("step", address, f"Trying community {number} of {len(communities)}")
             try:
                 client = self.client_factory(address, community, self.settings.version,
                                              timeout=self.settings.timeout, retries=self.settings.retries)
                 info = collect.system_info(client.get([parse_oid(collect.SYS_DESCR), parse_oid(collect.SYS_OBJECT_ID),
                                                        parse_oid(collect.SYS_NAME)]))
-                break
+                return client, info, community
             except (SnmpError, OSError) as problem:
                 log.debug("SNMP to %s: %s", address, problem)
                 self.events("log", f"{address}: no answer with community {number} of {len(communities)}")
-                client = None
+        return None, None, None
+
+    def visit(self, address):
+        """Read one device. Returns (DeviceTables or None, error). Runs on a worker thread."""
+        started = time.monotonic()
+        client, info, community = self.connect(address)
         if client is None:
+            if self.should_stop():
+                return None, STOPPED
             self.events("step", address, "Pinging")
-            if self.pinger(address):
-                return None, "Answers ping but not SNMP: check the community string and the device's SNMP ACL."
-            return None, "No answer to SNMP or ping."
+            return None, PINGS_NO_SNMP if self.pinger(address) else NO_ANSWER
         tables = collect.DeviceTables(info=info)
         tables.timings["Finding the community string"] = time.monotonic() - started
         self.read_tables(client, tables, community)
@@ -405,7 +411,7 @@ class Crawler:
             if error == STOPPED:
                 self.events("finished", address, "stopped")
             elif device.source != SNMP:
-                device.source = NO_SNMP if error.startswith("Answers ping") else UNREACHABLE
+                device.source = NO_SNMP if error == PINGS_NO_SNMP else UNREACHABLE
                 device.error = error
                 device.hops = hops
                 self.counts["no_snmp" if device.source == NO_SNMP else "unreachable"] += 1
@@ -570,6 +576,34 @@ class Crawler:
                 port = tables.interfaces.get(tables.lag_parents.get(if_index, if_index), str(if_index))
                 uplinks.add(port_key(port))
         return uplinks
+
+
+@dataclass
+class Check:
+    """What asking one device (one added by hand) found: whether it answers SNMP with one of the communities, or
+    only ping, or neither."""
+    source: str  # SNMP, NO_SNMP or UNREACHABLE
+    error: str = ""
+    info: collect.SystemInfo = None
+
+    def apply(self, device):
+        """Note it on the device, as a crawl would: its sysName (if it hasn't a name), description and kind."""
+        device.source, device.error = self.source, self.error
+        if self.info is not None:
+            device.name = device.name or self.info.name
+            device.sys_descr, device.sys_object_id = self.info.descr, self.info.object_id
+            if device.kind == UNKNOWN:
+                device.kind = collect.classify(self.info.object_id, self.info.descr, platform=device.platform)
+
+
+def check_device(settings, address, client_factory=SnmpClient, pinger=None):
+    """Ask one device for its system details with the communities a crawl would try; ping it if none answers.
+    Returns a Check. Reads nothing else (no neighbors or tables): Crawl from Here does that."""
+    crawler = Crawler(settings, client_factory=client_factory, pinger=pinger)
+    _, info, _ = crawler.connect(address)
+    if info is not None:
+        return Check(SNMP, "", info)
+    return Check(NO_SNMP, PINGS_NO_SNMP) if crawler.pinger(address) else Check(UNREACHABLE, NO_ANSWER)
 
 
 def timing_summary(timings):

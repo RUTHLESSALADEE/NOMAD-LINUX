@@ -6,6 +6,20 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-10-01
+
+### Added
+
+- Network Map: add devices and draw links by hand, for what the crawl can't find (an unmanaged switch, a device SNMP can't reach, a port with CDP and LLDP off). Right-click the background > Add Device Here..., or a device > Add Device Linked to This..., Draw Link from Here (then click the other device) or Add Link...; the Devices and Links tabs' right-click menus have them too. A device added by hand with an IP address is checked over SNMP with the map's community strings, as the crawl's devices are, and shown the same way when the community isn't working (dashed, "Pings, no SNMP") or it doesn't answer at all; it's pinged while monitoring. Devices added by hand have italic names, links drawn by hand are dotted (in draw.io exports too), and the Found by and Seen by columns say "Added by hand" and "Drawn by hand". They're saved with the map and carried over (and checked again) when you map again; once a crawl finds the device by its address or name, the crawl's entry takes over its links, hosts, group, place and note, and a link drawn by hand goes once the crawl finds one between the same two devices. Right-click them to edit them, check SNMP again, or delete them.
+- Opening an SSH, SCP or Telnet session from the Network Map, IP Addresses or Sweep uses the host's saved session when there is one, with its user name, saved password or key and settings. A saved session is found by any address or name the map knows for the device (its management address, other interface addresses and its name, with or without the domain), or by the address's recorded name in IP Addresses. The menu names the session it will open ("Open SSH Session (Core-SW1)"); with several saved sessions for a host it asks which, and "Open New SSH Session" connects without them. SSH with PuTTY logs in as the saved session's user.
+- A session opened that way without a saved session is named after the device or address record, and Save as Session suggests a folder: the device's site, building and room on the map, or the network and subnet in IP Addresses.
+- Network Map groups can now be rooms (or workspaces) inside buildings, as well as sites and buildings. Choose Room in New Group (it's already picked when the devices are all in one building), or move a room to another building from its right-click menu. Rooms are drawn as their own boxes inside the building's box, collapse like the other groups, appear as "Site / Building / Room" in the Group column, and are exported to draw.io.
+- Undo and Redo on the Network Map (buttons beside Fit, or Ctrl+Z and Ctrl+Y / Ctrl+Shift+Z). They step back and forward through dragging devices, re-arranging, arranging or aligning the selection, and changes to sites, buildings and rooms (including dragging a device into or out of one, which is a single step with the move), on both the physical and logical views. The last 100 changes are kept until another map is opened or crawled.
+
+### Fixed
+
+- Network Map: a link's port label is no longer hidden under a switch's "▾ hosts" badge when the device it goes to is below the switch.
+
 ## [1.11.0] - 2026-10-01
 
 ### Changed

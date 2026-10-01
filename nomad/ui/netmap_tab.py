@@ -7,6 +7,7 @@ import json
 import logging
 import socket
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
@@ -16,18 +17,19 @@ from PyQt5.QtWidgets import QAbstractItemView, QActionGroup, QApplication, QChec
     QTextBrowser, QToolButton, QVBoxLayout, QWidget
 
 from ..netmap import diff, export, l3, monitor, store
-from ..netmap.crawl import MAX_WORKERS, WORKERS, CrawlSettings, Crawler
+from ..netmap.crawl import MAX_WORKERS, WORKERS, CrawlSettings, Crawler, check_device
 from ..netmap.layout import BOTTOM, CENTER, HORIZONTAL, LEFT, MIDDLE, RIGHT, STYLE_NAMES, TOP, TOP_DOWN, VERTICAL, \
     align, arrange, arrange_in_place, distribute, merge_positions
-from ..netmap.model import BUILDING, FIREWALL, GROUP_KINDS, KIND_NAMES, NO_SNMP, ROUTER, SITE, SNMP, SOURCE_NAMES, \
-    SWITCH, UNREACHABLE, port_key, short_port
+from ..netmap.model import BUILDING, FIREWALL, GROUP_KINDS, KIND_NAMES, NO_SNMP, PARENT_KIND, ROUTER, SNMP, \
+    SWITCH, UNCHECKED, UNREACHABLE, Group, NetworkMap, display_name, port_key, short_port
 from ..snmp import V2C
 from ..terminal.credentials import CredentialError, protect, unprotect
 from .common import SortableTableItem, StoppableThread, read_only_table, set_hint
 from .host_menu import HostActions
 from .netmap_monitor import NetworkMonitor
 from .netmap_progress import CrawlProgress
-from .netmap_dialogs import CommunitiesDialog, CompareDialog, GroupDialog, HostDialog, ScopeDialog
+from .netmap_dialogs import CommunitiesDialog, CompareDialog, DeviceDialog, GroupDialog, HostDialog, LinkDialog, \
+    ScopeDialog
 from .netmap_view import MapView
 from .table_filter import TableFilter
 from .theme import COLORS, accent_button
@@ -37,11 +39,13 @@ log = logging.getLogger(__name__)
 MAP_FILTER = f"Network maps (*{store.EXTENSION})"
 KIND_WEIGHTS = {FIREWALL: 3, ROUTER: 2, SWITCH: 1}  # Breaks ties when choosing the top device
 SAVE_DELAY_MS = 1000
+UNDO_LIMIT = 100  # Layout changes Undo can go back through
 ROUTES_SHOWN = 50
 DEFAULTS = {"max_hops": 6, "max_devices": 500, "timeout": 2000}
 ALIGNMENTS = [("Align Left", LEFT), ("Align Center", CENTER), ("Align Right", RIGHT), None, ("Align Top", TOP),
               ("Align Middle", MIDDLE), ("Align Bottom", BOTTOM)]
 GROUP_LINKS_SHOWN = 20
+CHECK_WORKERS = 8  # Devices added by hand asked over SNMP at once
 
 
 def ip_sort_key(text):
@@ -88,6 +92,31 @@ class CrawlThread(StoppableThread):
         self.crawled.emit(network_map)
 
 
+class CheckThread(StoppableThread):
+    """Asks devices added by hand whether they answer SNMP (or only ping), as a crawl would, a few at once."""
+    checked = pyqtSignal(str, str, object)  # Device key, the address asked, crawl.Check
+
+    def __init__(self, settings, targets, checker, parent=None):
+        super().__init__(parent)
+        self.settings, self.targets, self.checker = settings, targets, checker  # targets: [(key, address)]
+
+    def run(self):
+        def ask(target):
+            key, address = target
+            if self.stopping:
+                return
+            try:
+                result = self.checker(self.settings, address)
+            except Exception:  # One device's trouble shouldn't stop the rest
+                log.exception("Checking %s over SNMP failed", address)
+                return
+            if not self.stopping:
+                self.checked.emit(key, address, result)
+
+        with ThreadPoolExecutor(max_workers=max(1, min(CHECK_WORKERS, len(self.targets)))) as executor:
+            list(executor.map(ask, self.targets))
+
+
 class NetworkMapTab(QWidget):
     def __init__(self, window):
         super().__init__(window)
@@ -104,7 +133,7 @@ class NetworkMapTab(QWidget):
         self.l3_nodes = {}
         self.l3_links = []
         self.arrange_style = TOP_DOWN
-        self.keep_groups = True  # Re-arrange lays out each site and building in its own box
+        self.keep_groups = True  # Re-arrange lays out each site, building and room in its own box
         self.compare_dialog = None
         self.extending = False  # The crawl running adds to the map open (Crawl from Here)
         self.live_map = None  # The map so far, drawn while a crawl runs
@@ -114,10 +143,19 @@ class NetworkMapTab(QWidget):
         self.monitor = NetworkMonitor(self)
         self.history_map = None  # The map whose monitoring history the Monitor log is showing
         self.host_actions = HostActions(window, self)
+        self.check_threads = []  # Asking devices added by hand over SNMP
+        self.checking = set()  # Keys of the devices being asked
+        self.announce = set()  # Of those, the ones to say what was found for (one added or asked again)
+        self.check_device = check_device  # What asks one (tests swap in the fake network)
         self.save_timer = QTimer(self)
         self.save_timer.setSingleShot(True)
         self.save_timer.setInterval(SAVE_DELAY_MS)
         self.save_timer.timeout.connect(self.save_positions)
+        # Undo and Redo: the layout (where everything is on both views, and which group each device is in) before
+        # each change, and the changes undone; layout_now is the layout as it is
+        self.undo_stack, self.redo_stack = [], []
+        self.layout_now = None
+        self.restoring = False
         self.init_ui()
         window.adapter_changed.connect(lambda _: self.update_gateway_button())
         window.snapshot_changed.connect(lambda _: self.update_gateway_button())
@@ -189,7 +227,7 @@ class NetworkMapTab(QWidget):
         self.arrange_button.setPopupMode(QToolButton.MenuButtonPopup)
         self.arrange_button.setToolTip("Lay the map out again, forgetting where devices were dragged to. The arrow "
                                        "chooses how (top to bottom, left to right, a grid or a circle, with each "
-                                       "site and building in its own box), and arranges or lines up just the "
+                                       "site, building and room in its own box), and arranges or lines up just the "
                                        "devices selected.")
         self.arrange_menu = QMenu(self.arrange_button)
         self.arrange_menu.aboutToShow.connect(self.fill_arrange_menu)
@@ -217,6 +255,13 @@ class NetworkMapTab(QWidget):
         self.hosts_check.setToolTip("Show every switch's hosts, a box per port with each host's VLAN. Or double-click "
                                     "one switch to show just its hosts.")
         tools.addWidget(self.hosts_check)
+        self.undo_button = QPushButton("Undo")
+        self.undo_button.setToolTip("Put devices back where they were before the last move, re-arrange or "
+                                    "alignment, or the last change to the sites, buildings and rooms (Ctrl+Z).")
+        self.redo_button = QPushButton("Redo")
+        self.redo_button.setToolTip("Do again what Undo undid (Ctrl+Y or Ctrl+Shift+Z).")
+        tools.addWidget(self.undo_button)
+        tools.addWidget(self.redo_button)
         tools.addWidget(self.fit_button)
         tools.addWidget(self.arrange_button)
         layout.addLayout(tools)
@@ -264,6 +309,10 @@ class NetworkMapTab(QWidget):
         self.tabs.currentChanged.connect(self.on_subtab_changed)
         self.set_find_placeholder()
         self.fit_button.clicked.connect(lambda: self.current_view().fit())
+        self.undo_button.clicked.connect(self.undo)
+        self.redo_button.clicked.connect(self.redo)
+        for keys, handler in ((QKeySequence.Undo, self.undo), ("Ctrl+Y", self.redo), ("Ctrl+Shift+Z", self.redo)):
+            QShortcut(QKeySequence(keys), self, context=Qt.WidgetWithChildrenShortcut).activated.connect(handler)
         self.arrange_button.clicked.connect(lambda: self.rearrange())
         self.hosts_check.toggled.connect(self.view.set_all_hosts_shown)
         self.monitor_check.toggled.connect(self.on_monitor_toggled)
@@ -274,6 +323,7 @@ class NetworkMapTab(QWidget):
         for view in (self.view, self.l3_view):
             view.selection_changed.connect(self.show_details)
             view.positions_changed.connect(self.save_timer.start)
+            view.positions_changed.connect(self.record_layout)
             view.context_requested.connect(self.show_device_menu)
         self.view.group_context_requested.connect(self.show_group_menu)
         self.view.groups_changed.connect(self.save_timer.start)
@@ -291,6 +341,9 @@ class NetworkMapTab(QWidget):
         delete = QShortcut(QKeySequence.Delete, self.hosts_table, context=Qt.WidgetShortcut)
         delete.activated.connect(lambda: self.delete_hosts(self.selected_table_hosts()))
         self.view.port_context_requested.connect(self.show_port_menu)
+        self.view.background_context_requested.connect(self.show_background_menu)
+        self.view.link_context_requested.connect(self.show_link_menu)
+        self.view.link_drawn.connect(lambda a, b: self.add_link(a, b))
 
     # ----------------------------------------------------------------- Page interface
 
@@ -355,6 +408,9 @@ class NetworkMapTab(QWidget):
 
     def shutdown(self):
         self.monitor.shutdown()
+        for thread in list(self.check_threads):
+            thread.stop()
+            thread.wait(self.timeout * 2 + 3000)
         if self.save_timer.isActive():
             self.save_timer.stop()
             self.save_positions()
@@ -412,11 +468,7 @@ class NetworkMapTab(QWidget):
             else:
                 set_hint(self.status_label, "Enter the address of a switch or router to start from.", "error")
                 return
-        settings = CrawlSettings(seeds=seeds, communities=list(self.communities), overrides=list(self.overrides),
-                                 scope=list(self.scope), max_hops=self.max_hops, max_devices=self.max_devices,
-                                 version=self.version, timeout=self.timeout, collect_hosts=self.collect_hosts,
-                                 trace=self.trace, workers=self.workers)
-        self.worker = CrawlThread(settings, self.network_map if self.extending else None, self)
+        self.worker = CrawlThread(self.crawl_settings(seeds), self.network_map if self.extending else None, self)
         self.worker.event.connect(self.on_crawl_event)
         self.worker.crawled.connect(self.on_crawled)
         self.worker.failed.connect(lambda message: set_hint(self.status_label, message, "error"))
@@ -438,6 +490,12 @@ class NetworkMapTab(QWidget):
         self.worker.start()
         self.update_buttons()
 
+    def crawl_settings(self, seeds):
+        return CrawlSettings(seeds=seeds, communities=list(self.communities), overrides=list(self.overrides),
+                             scope=list(self.scope), max_hops=self.max_hops, max_devices=self.max_devices,
+                             version=self.version, timeout=self.timeout, collect_hosts=self.collect_hosts,
+                             trace=self.trace, workers=self.workers)
+
     def stop(self):
         if self.worker is not None:
             self.worker.stop()
@@ -455,6 +513,7 @@ class NetworkMapTab(QWidget):
                 self.view.scene().clear()
                 self.view.items_by_key = {}
         self.window.clear_busy("netmap")
+        self.record_layout()  # Where Undo starts from on the map crawled
         self.update_buttons()
 
     def on_crawl_event(self, kind, details):
@@ -495,6 +554,7 @@ class NetworkMapTab(QWidget):
         base.positions = self.view.positions() if self.live_map is not None else base.positions
         before = {key for key, device in base.devices.items() if device.source == SNMP}
         added, read = base.merge_crawl(newer)
+        folded = base.fold_manual_devices()  # Ones added by hand it has now found
         self.live_map = None
         if self.map_path is not None:
             try:
@@ -509,6 +569,7 @@ class NetworkMapTab(QWidget):
         problems = sum(1 for key in added if base.devices[key].source in (NO_SNMP, UNREACHABLE))
         if problems:
             message += f" {problems} of the new ones didn't answer SNMP."
+        message += folded_text(folded)
         set_hint(self.status_label, message, "warning" if newer.stopped or problems else "success")
 
     def ring_devices_being_read(self):
@@ -527,7 +588,9 @@ class NetworkMapTab(QWidget):
         if self.extending:
             self.add_crawl(network_map)
             return
-        dropped = []
+        dropped, folded, links_left_out = [], [], 0
+        if self.network_map is not None:  # Devices and links added by hand, first: their places are kept below
+            folded, links_left_out = network_map.carry_manual(self.network_map)
         if self.live_positions:  # Where devices were drawn (and dragged) while it crawled
             network_map.positions = {key: position for key, position in self.live_positions.items()
                                      if key in network_map.devices}
@@ -538,9 +601,12 @@ class NetworkMapTab(QWidget):
             if not self.live_positions:
                 network_map.positions = {key: position for key, position in self.network_map.positions.items()
                                          if key in network_map.devices}
+            for key, device in network_map.devices.items():  # The live drawing only had what the crawl found
+                if device.manual and key in self.network_map.positions:
+                    network_map.positions.setdefault(key, self.network_map.positions[key])
             network_map.root = self.network_map.root if self.network_map.root in network_map.devices else ""
             dropped = network_map.carry_manual_hosts(self.network_map)
-            network_map.carry_groups(self.network_map)  # Sites and buildings, with the devices still there
+            network_map.carry_groups(self.network_map, folded)  # Sites and buildings, with the devices still there
             network_map.status_log = self.network_map.status_log  # The same network's monitoring history
             if self.history_map is self.network_map:
                 self.history_map = network_map  # So the Monitor log isn't reloaded
@@ -561,14 +627,22 @@ class NetworkMapTab(QWidget):
         if dropped:
             message += (" 1 host added by hand wasn't kept: its switch isn't on this map." if len(dropped) == 1
                         else f" {len(dropped)} hosts added by hand weren't kept: their switch isn't on this map.")
+        message += folded_text(folded)
+        if links_left_out:
+            message += (f" {count_text(links_left_out, 'link')} drawn by hand "
+                        f"{'was' if links_left_out == 1 else 'were'} left out: a device at the end isn't on this map.")
         if path:
             message += f" Saved as {path.name}."
         set_hint(self.status_label, message, "warning" if network_map.stopped or problems or dropped
-                 else "success")
+                 or links_left_out else "success")
+        # Ask the devices added by hand again, so whether they answer SNMP is as fresh as the rest
+        self.check_devices([key for key, device in network_map.devices.items() if device.manual and device.mgmt_ip])
 
     # ----------------------------------------------------------------- Showing a map
 
     def show_map(self, network_map, path=None, fit=False):
+        if network_map is not self.network_map:  # Another map: nothing to undo on it yet
+            self.undo_stack, self.redo_stack, self.layout_now = [], [], None
         self.network_map, self.map_path = network_map, path
         nodes = list(network_map.devices)
         edges = [(link.a, link.b) for link in network_map.links]
@@ -596,6 +670,7 @@ class NetworkMapTab(QWidget):
         if fit:
             self.view.request_fit()
             self.l3_view.request_fit()
+        self.record_layout()  # Re-arranged: Undo puts it back
         self.update_buttons()
 
     def current_view(self):
@@ -642,7 +717,7 @@ class NetworkMapTab(QWidget):
             styles.addAction(action)
             action.triggered.connect(lambda _, style=style: self.rearrange(style))
         menu.addSeparator()
-        keep = menu.addAction("Keep Sites and Buildings Together")
+        keep = menu.addAction("Keep Groups Together")
         keep.setCheckable(True)
         keep.setChecked(self.keep_groups)
         keep.toggled.connect(self.set_keep_groups)
@@ -656,8 +731,8 @@ class NetworkMapTab(QWidget):
 
     def set_keep_groups(self, on):
         self.keep_groups = on
-        set_hint(self.status_label, "Re-arrange lays out each site and building in its own box." if on else
-                 "Re-arrange lays out the devices without regard to their sites and buildings.", "info")
+        set_hint(self.status_label, "Re-arrange lays out each site, building and room in its own box." if on else
+                 "Re-arrange lays out the devices without regard to their groups.", "info")
 
     def add_selection_actions(self, menu, view, keys, always=False):
         """Arrange Selected and Align (with Distribute) for the devices selected on a map. always: show them
@@ -709,7 +784,7 @@ class NetworkMapTab(QWidget):
         fill_table(self.devices_table, export.device_rows(network_map, self.monitor.status_text), ip_columns={2},
                    keys=self.device_keys)
         fill_table(self.links_table, export.link_rows(network_map),
-                   keys=[(link.a, link.b) for link in export.sorted_links(network_map)])
+                   keys=[LinkRow(link) for link in export.sorted_links(network_map)])
         fill_table(self.hosts_table, export.host_rows(network_map), ip_columns={1},
                    keys=list(range(len(network_map.hosts))))
         for table_filter in self.table_filters.values():
@@ -787,8 +862,10 @@ class NetworkMapTab(QWidget):
                         "Hosts for every switch). Right-click a device for SSH, ping, SNMP and more.</p>"
                         "<p>Drag the background to move around. Hold Shift and drag to draw a box round several "
                         "devices, then drag any of them to move them together.</p>"
-                        "<p>Right-click devices > Group to put them in a site or building, drawn as a box you can "
-                        "collapse. Re-arrange's arrow has other layouts.</p>")
+                        "<p>Right-click devices > Group to put them in a site, building or room, drawn as a box you "
+                        "can collapse. Re-arrange's arrow has other layouts.</p>"
+                        "<p>Right-click the background to add a device the crawl can't find (an unmanaged switch, "
+                        "say), and a device > Draw Link from Here to link it.</p>")
             else:
                 text = "<p>Select a device to see its details.</p>"
             self.details.setHtml(text)
@@ -797,7 +874,7 @@ class NetworkMapTab(QWidget):
             self.details.setHtml(f"<p>{selection[1]} selected. Drag any of them to move them all.</p>"
                                  "<p>Shift and drag the background to select several, Ctrl+click to add or remove "
                                  "one, and Ctrl+A to select everything.</p>"
-                                 "<p>Right-click one of them to put them in a site or building (Group), arrange "
+                                 "<p>Right-click one of them to put them in a site, building or room (Group), arrange "
                                  "just them, or line them up (Align).</p>")
         elif selection[0] == "group":
             self.details.setHtml(group_html(network_map, selection[1], self.monitor.status))
@@ -811,6 +888,21 @@ class NetworkMapTab(QWidget):
         else:
             self.details.setHtml(port_html(network_map, selection[1], selection[2]))
 
+    def session_hints(self, network_map, device):
+        """For a device's Open SSH Session: its other addresses and names (a saved session may use any of them), its
+        name for a new session, and its site, building and room as the folder to suggest when that's saved."""
+        aliases = [device.name, display_name(device.name), *device.addresses,
+                   *(item[0] for item in device.interfaces_l3)]
+        folder = "/".join(group.name.replace("/", "-") for group in network_map.group_path(device.key))
+        return {"aliases": [alias for alias in aliases if alias], "name": display_name(device.name), "folder": folder}
+
+    def host_session_hints(self, host):
+        """session_hints for a host learned on a switch port: its announced name, and the folder of its switch."""
+        folder = ""
+        if self.network_map is not None and host.device:
+            folder = "/".join(group.name.replace("/", "-") for group in self.network_map.group_path(host.device))
+        return {"aliases": [host.name] if host.name else [], "name": host.name, "folder": folder}
+
     def show_device_menu(self, key, position):
         shown = self.displayed_map()
         device = shown.devices.get(key) if shown else None
@@ -818,7 +910,8 @@ class NetworkMapTab(QWidget):
             self.show_node_menu(key, position)
             return
         menu = QMenu(self)
-        actions = self.host_actions.add_to(menu, device.mgmt_ip) if device.mgmt_ip else {}
+        actions = self.host_actions.add_to(menu, device.mgmt_ip, **self.session_hints(shown, device)) \
+            if device.mgmt_ip else {}
         menu.addSeparator()
         self.add_show_in(menu, actions, key)
         menu.addSeparator()
@@ -833,6 +926,7 @@ class NetworkMapTab(QWidget):
         keys = selected if key in selected else [key]
         if self.worker is None and self.network_map is not None and key in self.network_map.devices:
             self.add_group_menu(menu, actions, [item for item in keys if item in self.network_map.devices])
+            self.add_by_hand_actions(menu, actions, key, keys)
         if here in (self.view, self.l3_view):
             self.add_selection_actions(menu, here, keys)
         item = self.view.items_by_key.get(key)
@@ -895,6 +989,10 @@ class NetworkMapTab(QWidget):
     def show_devices_table_menu(self, position):
         item = self.devices_table.itemAt(position)
         if item is None:
+            if self.worker is None:
+                menu = QMenu(self)
+                menu.addAction("Add Device...", lambda: self.add_device())
+                menu.exec_(self.devices_table.viewport().mapToGlobal(position))
             return
         self.devices_table.selectRow(item.row())
         key = self.devices_table.item(item.row(), 0).data_object
@@ -902,7 +1000,13 @@ class NetworkMapTab(QWidget):
 
     def show_links_table_menu(self, position):
         item = self.links_table.itemAt(position)
-        if item is None or self.network_map is None:
+        if self.network_map is None:
+            return
+        if item is None:
+            if self.worker is None and len(self.network_map.devices) > 1:
+                menu = QMenu(self)
+                menu.addAction("Add Link...", lambda: self.add_link())
+                menu.exec_(self.links_table.viewport().mapToGlobal(position))
             return
         if not self.links_table.item(item.row(), 0).isSelected():
             self.links_table.clearSelection()
@@ -922,6 +1026,9 @@ class NetworkMapTab(QWidget):
         actions[menu.addAction("Copy")] = lambda: QApplication.clipboard().setText("\n".join(
             "\t".join(self.links_table.item(row, column).text() for column in range(self.links_table.columnCount()))
             for row in rows))
+        if self.worker is None:
+            menu.addSeparator()
+            self.add_link_actions(menu, actions, [self.links_table.item(row, 0).data_object.link for row in rows])
         chosen = menu.exec_(self.links_table.viewport().mapToGlobal(position))
         if chosen in actions:
             actions[chosen]()
@@ -968,7 +1075,7 @@ class NetworkMapTab(QWidget):
         if len(hosts) == 1:
             host = hosts[0]
             if host.ip:
-                actions = self.host_actions.add_to(menu, host.ip)
+                actions = self.host_actions.add_to(menu, host.ip, **self.host_session_hints(host))
                 menu.addSeparator()
             actions[menu.addAction("Show on Map")] = lambda: self.show_on_map("host", item.row())
             actions[menu.addAction("Edit Host...")] = lambda: self.edit_host(host)
@@ -989,7 +1096,7 @@ class NetworkMapTab(QWidget):
         menu = QMenu(self)
         actions = {}
         if len(hosts) == 1 and hosts[0].ip:
-            actions = self.host_actions.add_to(menu, hosts[0].ip)
+            actions = self.host_actions.add_to(menu, hosts[0].ip, **self.host_session_hints(hosts[0]))
             menu.addSeparator()
         if len(hosts) == 1:
             actions[menu.addAction("Edit Host...")] = lambda: self.edit_host(hosts[0])
@@ -1008,7 +1115,7 @@ class NetworkMapTab(QWidget):
         if dialog.exec_() == QDialog.Accepted:
             host = dialog.values()
             self.network_map.hosts.append(host)
-            self.hosts_changed(host)
+            self.map_changed(host)
             set_hint(self.status_label, f"Added {host.name or host.ip or host.mac} on "
                      f"{self.network_map.devices[host.device].label} {host.port}. It's kept when you map again.",
                      "success")
@@ -1018,7 +1125,7 @@ class NetworkMapTab(QWidget):
         if dialog.exec_() == QDialog.Accepted:
             edited = dialog.values()
             self.network_map.hosts[self.network_map.hosts.index(host)] = edited
-            self.hosts_changed(edited)
+            self.map_changed(edited)
 
     def delete_hosts(self, hosts):
         if not hosts or self.network_map is None or self.worker is not None:
@@ -1034,17 +1141,22 @@ class NetworkMapTab(QWidget):
             return
         doomed = {id(host) for host in hosts}
         self.network_map.hosts = [host for host in self.network_map.hosts if id(host) not in doomed]
-        self.hosts_changed()
+        self.map_changed()
         set_hint(self.status_label, f"Deleted {len(hosts)} host{'' if len(hosts) == 1 else 's'}.", "info")
 
-    def hosts_changed(self, show=None):
-        """Redraw after hosts were added, edited or deleted, keeping the view where it was, and save."""
+    def map_changed(self, show=None, place=None, select=None):
+        """Redraw after hosts, devices or links were added, edited or deleted, keeping the view where it was (and
+        what was selected), and save. show: a Host whose switch to open; place: {device key: (x, y)} for ones put
+        somewhere; select: a device key to select instead."""
         network_map = self.network_map
         network_map.hosts.sort(key=lambda host: (network_map.devices[host.device].label.lower(),
                                                  port_key(host.port), host.mac))
-        network_map.positions = self.view.positions()
+        network_map.positions = {key: position for key, position in self.view.positions().items()
+                                 if key in network_map.devices}
+        network_map.positions.update(place or {})
         network_map.l3_positions = self.l3_view.positions()
         expanded = {key for key, item in self.view.items_by_key.items() if item.expanded}
+        selected = [select] if select else self.view.selected_keys()
         scroll = (self.view.horizontalScrollBar().value(), self.view.verticalScrollBar().value())
         self.show_map(network_map, self.map_path)
         for key in expanded | ({show.device} if show else set()):
@@ -1053,6 +1165,9 @@ class NetworkMapTab(QWidget):
         self.view.update_scene_rect()
         self.view.horizontalScrollBar().setValue(scroll[0])
         self.view.verticalScrollBar().setValue(scroll[1])
+        for key in selected:
+            if key in self.view.items_by_key:
+                self.view.items_by_key[key].setSelected(True)
         try:
             self.map_path = store.save(network_map, self.map_path) if self.map_path else store.save(network_map)
         except OSError as error:
@@ -1068,14 +1183,247 @@ class NetworkMapTab(QWidget):
         self.tabs.setCurrentWidget(self.view)
         self.rearrange()
 
-    # ----------------------------------------------------------------- Sites and buildings
+    # ----------------------------------------------------------------- Devices and links added by hand
+
+    def add_by_hand_actions(self, menu, actions, key, keys):
+        """The device menu's links and devices drawn by hand: draw a link from it, add a device linked to it, and
+        for one added by hand, edit, ask again over SNMP, or delete."""
+        network_map = self.network_map
+        device = network_map.devices[key]
+        menu.addSeparator()
+        if self.current_view() is self.view and self.view.items_by_key.get(key) is not None \
+                and self.view.items_by_key[key].isVisible():
+            actions[menu.addAction("Draw Link from Here")] = lambda: self.draw_link_from(key)
+        if len(network_map.devices) > 1:
+            actions[menu.addAction("Add Link...")] = lambda: self.add_link(key)
+        actions[menu.addAction("Add Device Linked to This...")] = lambda: self.add_device(linked_to=key)
+        if not device.manual:
+            return
+        actions[menu.addAction("Edit Device...")] = lambda: self.edit_device(key)
+        if device.mgmt_ip:
+            check = menu.addAction("Checking SNMP..." if key in self.checking else "Check SNMP Again")
+            check.setEnabled(key not in self.checking)
+            actions[check] = lambda: self.check_devices([key], announce=True)
+        manual = [item for item in keys if item in network_map.devices and network_map.devices[item].manual]
+        label = "Delete Device" if len(manual) == 1 else f"Delete the {len(manual)} Devices Added by Hand"
+        actions[menu.addAction(label)] = lambda: self.delete_devices(manual)
+
+    def add_link_actions(self, menu, actions, links):
+        """Edit or delete links drawn by hand, and add another between the same two devices."""
+        manual = [link for link in links if link.manual]
+        if len(manual) == 1:
+            actions[menu.addAction("Edit Link...")] = lambda: self.edit_link(manual[0])
+        if manual:
+            label = "Delete Link" if len(manual) == 1 else f"Delete the {len(manual)} Links Drawn by Hand"
+            actions[menu.addAction(label)] = lambda: self.delete_links(manual)
+        if len({frozenset((link.a, link.b)) for link in links}) == 1:
+            actions[menu.addAction("Add Another Link Between These...")] = \
+                lambda: self.add_link(links[0].a, links[0].b)
+        else:
+            actions[menu.addAction("Add Link...")] = lambda: self.add_link()
+
+    def show_background_menu(self, scene_position, position):
+        """Right-click on the physical view's background."""
+        if self.worker is not None:
+            return
+        menu = QMenu(self)
+        actions = {}
+        place = (scene_position.x(), scene_position.y())
+        actions[menu.addAction("Add Device Here...")] = lambda: self.add_device(place=place)
+        if self.network_map is not None and len(self.network_map.devices) > 1:
+            actions[menu.addAction("Add Link...")] = lambda: self.add_link()
+        if self.network_map is not None and self.network_map.devices:
+            menu.addSeparator()
+            actions[menu.addAction("Fit")] = self.view.fit
+        chosen = menu.exec_(position)
+        if chosen in actions:
+            actions[chosen]()
+
+    def show_link_menu(self, links, position):
+        """Right-click on a line on the physical view (the links it stands for)."""
+        if self.network_map is None or self.worker is not None:
+            return
+        menu = QMenu(self)
+        actions = {}
+        actions[menu.addAction("Show in Links")] = lambda: self.show_links_in_table(links)
+        menu.addSeparator()
+        self.add_link_actions(menu, actions, links)
+        chosen = menu.exec_(position)
+        if chosen in actions:
+            actions[chosen]()
+
+    def show_links_in_table(self, links):
+        self.tabs.setCurrentWidget(self.links_table)
+        self.links_table.clearSelection()
+        wanted = {id(link) for link in links}
+        rows = [row for row in range(self.links_table.rowCount())
+                if id(self.links_table.item(row, 0).data_object.link) in wanted]
+        if any(self.links_table.isRowHidden(row) for row in rows):
+            self.table_filters[self.links_table].clear()
+        mode = self.links_table.selectionMode()
+        self.links_table.setSelectionMode(QAbstractItemView.MultiSelection)
+        for row in rows:
+            self.links_table.selectRow(row)
+        self.links_table.setSelectionMode(mode)
+        if rows:
+            self.links_table.scrollToItem(self.links_table.item(rows[0], 0))
+
+    def add_device(self, place=None, linked_to=""):
+        """Add a device by hand (optionally linked to one on the map), and ask it over SNMP if it has an address.
+        With no map open, it starts one."""
+        if self.worker is not None:
+            return
+        network_map = self.network_map or NetworkMap(started=datetime.datetime.now().isoformat(timespec="seconds"))
+        dialog = DeviceDialog(network_map, linked_to=linked_to, parent=self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        device, link = dialog.values()
+        device.key = network_map.new_device_key()
+        network_map.devices[device.key] = device
+        if link is not None:
+            link.b = device.key
+            network_map.add_link(link)
+            if link.a in network_map.group_of:  # Most likely in the same room as what it's plugged into
+                network_map.group_of[device.key] = network_map.group_of[link.a]
+        if self.network_map is None:
+            self.show_map(network_map)
+        self.map_changed(place={device.key: place} if place else None, select=device.key)
+        message = f"Added {device.label}. It's kept when you map again."
+        if device.mgmt_ip:
+            message += " Checking whether it answers SNMP..."
+            self.check_devices([device.key], announce=True)
+        else:
+            message += " Give it an IP address (Edit Device) to ping it while monitoring and check it over SNMP."
+        set_hint(self.status_label, message, "success")
+
+    def edit_device(self, key):
+        device = self.network_map.devices.get(key) if self.network_map else None
+        if device is None or self.worker is not None:
+            return
+        dialog = DeviceDialog(self.network_map, device=device, parent=self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        edited, _ = dialog.values()
+        self.network_map.devices[key] = edited
+        self.map_changed(select=key)
+        if edited.mgmt_ip and edited.source == UNCHECKED:  # A new address: ask it
+            set_hint(self.status_label, f"Checking whether {edited.label} answers SNMP...", "info")
+            self.check_devices([key], announce=True)
+
+    def delete_devices(self, keys):
+        network_map = self.network_map
+        keys = [key for key in keys if network_map is not None and key in network_map.devices]
+        if not keys or self.worker is not None:
+            return
+        what = network_map.devices[keys[0]].label if len(keys) == 1 else f"these {len(keys)} devices"
+        links = sum(1 for link in network_map.links if link.a in keys or link.b in keys)
+        hosts = sum(1 for host in network_map.hosts if host.device in keys)
+        text = f"Delete {what} from the map?"
+        if links or hosts:
+            parts = [count_text(count, noun) for count, noun in ((links, "link"), (hosts, "host")) if count]
+            text += f"\n\n{' and '.join(parts).capitalize()} on {'it' if len(keys) == 1 else 'them'} go too."
+        if QMessageBox.question(self, "Delete Devices", text, QMessageBox.Yes | QMessageBox.No,
+                                QMessageBox.No) != QMessageBox.Yes:
+            return
+        network_map.remove_devices(keys)
+        self.map_changed()
+        set_hint(self.status_label, f"Deleted {count_text(len(keys), 'device')}.", "info")
+
+    def draw_link_from(self, key):
+        self.tabs.setCurrentWidget(self.view)
+        if self.view.start_drawing(key):
+            set_hint(self.status_label, f"Click the device to link {self.network_map.devices[key].label} to. Esc, a "
+                     "right-click or a click on the background stops.", "info")
+
+    def add_link(self, a="", b=""):
+        network_map = self.network_map
+        if network_map is None or len(network_map.devices) < 2 or self.worker is not None:
+            return
+        dialog = LinkDialog(network_map, a, b, parent=self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        link = dialog.values()
+        network_map.add_link(link)
+        self.map_changed()
+        set_hint(self.status_label, f"Linked {network_map.devices[link.a].label} and "
+                 f"{network_map.devices[link.b].label}. It's drawn dotted, and kept when you map again until the "
+                 "crawl finds a link between them.", "success")
+
+    def edit_link(self, link):
+        if self.network_map is None or link not in self.network_map.links or self.worker is not None:
+            return
+        dialog = LinkDialog(self.network_map, link=link, parent=self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.network_map.links[next(index for index, item in enumerate(self.network_map.links)
+                                        if item is link)] = dialog.values()
+            self.map_changed()
+
+    def delete_links(self, links):
+        if not links or self.network_map is None or self.worker is not None:
+            return
+        what = "this link" if len(links) == 1 else f"these {len(links)} links"
+        if QMessageBox.question(self, "Delete Links", f"Delete {what} drawn by hand?",
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        doomed = {id(link) for link in links}
+        self.network_map.links = [link for link in self.network_map.links if id(link) not in doomed]
+        self.map_changed()
+        set_hint(self.status_label, f"Deleted {count_text(len(links), 'link')}.", "info")
+
+    def check_devices(self, keys, announce=False):
+        """Ask devices added by hand, in the background, whether they answer SNMP with the map's community
+        strings (or only ping), and note it on them as a crawl would."""
+        devices = self.network_map.devices if self.network_map else {}
+        targets = [(key, devices[key].mgmt_ip) for key in keys
+                   if key in devices and devices[key].mgmt_ip and key not in self.checking]
+        if not targets:
+            return
+        self.checking.update(key for key, _ in targets)
+        if announce:
+            self.announce.update(key for key, _ in targets)
+        thread = CheckThread(self.crawl_settings([address for _, address in targets]), targets, self.check_device,
+                             self)
+        thread.checked.connect(self.on_checked)
+        thread.finished.connect(lambda: self.on_check_finished(thread, targets))
+        self.check_threads.append(thread)
+        thread.start()
+
+    def on_check_finished(self, thread, targets):
+        if thread in self.check_threads:
+            self.check_threads.remove(thread)
+        for key, _ in targets:  # Any that failed (or were stopped) without an answer
+            self.checking.discard(key)
+            self.announce.discard(key)
+
+    def on_checked(self, key, address, check):
+        self.checking.discard(key)
+        announce = key in self.announce
+        self.announce.discard(key)
+        device = self.network_map.devices.get(key) if self.network_map else None
+        if device is None or not device.manual or device.mgmt_ip != address:
+            return  # Deleted, found by a crawl, or given another address meanwhile
+        check.apply(device)
+        if self.worker is None:
+            self.map_changed()
+        if announce:
+            if check.source == SNMP:
+                text, level = (f"{device.label} answers SNMP. Right-click it > Crawl from Here to read its neighbors "
+                               "and hosts.", "success")
+            elif check.source == NO_SNMP:
+                text, level = f"{device.label}: {check.error}", "warning"
+            else:
+                text, level = f"{device.label} doesn't answer SNMP or ping.", "error"
+            set_hint(self.status_label, text, level)
+
+    # ----------------------------------------------------------------- Sites, buildings and rooms
 
     def add_group_menu(self, menu, actions, keys):
-        """The Group submenu for the devices right-clicked: a new site or building, move to one, or out of one."""
+        """The Group submenu for the devices right-clicked: a new site, building or room, move to one, or out of
+        one."""
         network_map = self.network_map
         what = "Device" if len(keys) == 1 else f"{len(keys)} Devices"
         submenu = menu.addMenu("Group")
-        actions[submenu.addAction(f"New Site or Building for the {what}...")] = lambda: self.new_group(keys)
+        actions[submenu.addAction(f"New Site, Building or Room for the {what}...")] = lambda: self.new_group(keys)
         groups = sorted(network_map.groups, key=lambda group: network_map.group_label(group).lower())
         if groups:
             submenu.addSeparator()
@@ -1107,17 +1455,18 @@ class NetworkMapTab(QWidget):
                 lambda: self.arrange_group(key)
             menu.addSeparator()
             actions[menu.addAction("Rename...")] = lambda: self.rename_group(key)
-            if group.kind == BUILDING:
-                sites = sorted((other for other in network_map.groups if other.kind == SITE),
-                               key=lambda other: other.name.lower())
-                move = menu.addMenu("Move to Site")
-                for site in sites:
-                    action = move.addAction(site.name)
+            if group.kind in PARENT_KIND:
+                outer = GROUP_KINDS[PARENT_KIND[group.kind]]
+                choices = sorted((other for other in network_map.groups if other.kind == PARENT_KIND[group.kind]),
+                                 key=lambda other: network_map.group_label(other).lower())
+                move = menu.addMenu(f"Move to {outer}")
+                for choice in choices:
+                    action = move.addAction(network_map.group_label(choice))
                     action.setCheckable(True)
-                    action.setChecked(group.parent == site.key)
-                    actions[action] = lambda site=site: self.move_building(key, site.key)
+                    action.setChecked(group.parent == choice.key)
+                    actions[action] = lambda choice=choice: self.move_subgroup(key, choice.key)
                 if group.parent:
-                    actions[move.addAction("Not in a Site")] = lambda: self.move_building(key, "")
+                    actions[move.addAction(f"Not in a {outer}")] = lambda: self.move_subgroup(key, "")
                 move.setEnabled(bool(move.actions()))
             actions[menu.addAction(f"Ungroup {kind}")] = lambda: self.ungroup(key)
         chosen = menu.exec_(position)
@@ -1126,14 +1475,13 @@ class NetworkMapTab(QWidget):
 
     def new_group(self, keys):
         network_map = self.network_map
-        sites = {network_map.group_of.get(key, "") for key in keys}
-        site = sites.pop() if len(sites) == 1 else ""  # All in one site: most likely a building in it
-        site = site if network_map.group(site) is not None and network_map.group(site).kind == SITE else ""
-        dialog = GroupDialog(network_map, count=len(keys), site=site, parent=self)
+        current = {network_map.group_of.get(key, "") for key in keys}
+        inside = current.pop() if len(current) == 1 else ""  # All in one group: most likely a group in it
+        dialog = GroupDialog(network_map, count=len(keys), inside=inside, parent=self)
         if dialog.exec_() != QDialog.Accepted:
             return
-        name, kind, site = dialog.values()
-        group = network_map.new_group(name, kind, site)
+        name, kind, inside = dialog.values()
+        group = network_map.new_group(name, kind, inside)
         network_map.set_group(keys, group.key)
         self.groups_edited(f"Made {GROUP_KINDS[kind].lower()} {name} with {count_text(len(keys), 'device')}. Drag "
                            "devices into or out of its box; right-click its title to arrange, rename or collapse it.")
@@ -1174,16 +1522,18 @@ class NetworkMapTab(QWidget):
             old, group.name = group.name, dialog.values()[0]
             self.groups_edited(f"Renamed {old} to {group.name}.")
 
-    def move_building(self, key, site_key):
+    def move_subgroup(self, key, parent_key):
+        """Move a building to another site or a room to another building ("" for none)."""
         group = self.network_map.group(key)
-        group.parent = site_key
-        site = self.network_map.group(site_key)
-        self.groups_edited(f"Moved {group.name} to {site.name}." if site else f"{group.name} isn't in a site now.")
+        group.parent = parent_key
+        outer = self.network_map.group(parent_key)
+        self.groups_edited(f"Moved {group.name} to {outer.name}." if outer else
+                           f"{group.name} isn't in a {GROUP_KINDS[PARENT_KIND[group.kind]].lower()} now.")
 
     def ungroup(self, key):
         group = self.network_map.group(key)
         self.network_map.remove_group(key)
-        where = "its site" if group.parent else "no group"
+        where = f"its {GROUP_KINDS[PARENT_KIND[group.kind]].lower()}" if group.parent else "no group"
         self.groups_edited(f"Ungrouped {group.name}. Its devices stay where they are, in {where}.")
 
     def select_group_devices(self, key):
@@ -1216,6 +1566,62 @@ class NetworkMapTab(QWidget):
             QMessageBox.warning(self, "Save Network Map", f"Couldn't save the map:\n\n{error}")
         if message:
             set_hint(self.status_label, message, "success")
+        self.record_layout()
+
+    # ----------------------------------------------------------------- Undo and Redo
+
+    def layout_state(self):
+        """What Undo puts back: where everything is on both views, the sites, buildings and rooms (not whether
+        they're collapsed), and which one each device is in."""
+        network_map = self.network_map
+        return {"positions": self.view.positions(), "l3_positions": self.l3_view.positions(),
+                "groups": [(group.key, group.name, group.kind, group.parent) for group in network_map.groups],
+                "group_of": dict(network_map.group_of)}
+
+    def record_layout(self):
+        """After the layout may have changed: keep the one before it for Undo."""
+        if self.network_map is None or self.worker is not None:
+            return  # While a crawl runs the views show the map so far, not the one open
+        state = self.layout_state()
+        if self.layout_now is not None and not self.restoring and state != self.layout_now:
+            self.undo_stack = (self.undo_stack + [self.layout_now])[-UNDO_LIMIT:]
+            self.redo_stack = []
+        self.layout_now = state
+        self.update_undo_buttons()
+
+    def undo(self):
+        self.step_layout(self.undo_stack, self.redo_stack, "Undid")
+
+    def redo(self):
+        self.step_layout(self.redo_stack, self.undo_stack, "Redid")
+
+    def step_layout(self, source, target, verb):
+        """Go back (or forward) to the layout on top of source, keeping the one now on target."""
+        if not source or self.network_map is None or self.worker is not None:
+            return
+        target.append(self.layout_now)
+        state = source.pop()
+        network_map = self.network_map
+        collapsed = {group.key for group in network_map.groups if group.collapsed}
+        self.restoring = True
+        try:
+            network_map.groups = [Group(key, name, kind, parent, collapsed=key in collapsed)
+                                  for key, name, kind, parent in state["groups"]]
+            network_map.group_of = dict(state["group_of"])
+            self.view.rebuild_groups()
+            self.view.move_to(state["positions"])
+            self.l3_view.move_to(state["l3_positions"])
+            network_map.l3_positions = self.l3_view.positions()
+            self.groups_edited(f"{verb} the last change to the layout.")
+        finally:
+            self.restoring = False
+        self.layout_now = self.layout_state()
+        self.update_undo_buttons()
+
+    def update_undo_buttons(self):
+        idle = self.network_map is not None and self.worker is None
+        self.undo_button.setEnabled(idle and bool(self.undo_stack))
+        self.redo_button.setEnabled(idle and bool(self.redo_stack))
 
     # ----------------------------------------------------------------- Monitoring
 
@@ -1406,6 +1812,7 @@ class NetworkMapTab(QWidget):
             widget.setEnabled(not running)
         for widget in (self.fit_button, self.hosts_check):
             widget.setEnabled(has_map or running)
+        self.update_undo_buttons()
         self.monitor_check.setEnabled(has_map or self.monitor_check.isChecked())
         here = self.tabs.currentWidget()
         self.find_input.setEnabled(has_map or running or here is self.crawl_progress.tab)
@@ -1432,10 +1839,9 @@ def device_html(network_map, key, state=None):
              f"<p>{escape(KIND_NAMES.get(device.kind, device.kind))}"
              + (f" &middot; {escape(device.platform)}" if device.platform else "") + "</p><table>"]
     rows = [("Status", monitor_status_text(state)), ("Management IP", device.mgmt_ip),
-            ("Group", network_map.device_group_label(key)),
-            ("Found by", SOURCE_NAMES.get(device.source, device.source)),
-            ("Hops from start", str(device.hops)), ("Addresses", ", ".join(device.addresses)),
-            ("Problem", device.error)]
+            ("Group", network_map.device_group_label(key)), ("Found by", device.found_by),
+            ("Hops from start", "" if device.manual else str(device.hops)),
+            ("Addresses", ", ".join(device.addresses)), ("Problem", device.error), ("Note", device.note)]
     for label, value in rows:
         if value:
             parts.append(f"<tr><td><b>{escape(label)}</b>&nbsp;</td><td>{escape(value)}</td></tr>")
@@ -1473,7 +1879,29 @@ def device_html(network_map, key, state=None):
             parts.append(f"<p>...and {len(routes) - ROUTES_SHOWN} more.</p>")
     if device.sys_descr:
         parts.append(f"<h4>Description</h4><p>{escape(device.sys_descr).replace(chr(10), '<br>')}</p>")
+    if device.manual:
+        parts.append("<p>Added by hand: right-click it to edit or delete it, or to draw a link from it. It's kept "
+                     "when you map again, until the crawl finds it.</p>")
     return "".join(parts)
+
+
+def folded_text(folded):
+    """For the status line after a crawl: devices added by hand that it has now found."""
+    if not folded:
+        return ""
+    if len(folded) == 1:
+        manual, found = folded[0]
+        return f" {manual.label}, added by hand, was found by the crawl: it's {found.label} now."
+    return f" {len(folded)} devices added by hand were found by the crawl and replaced by what it found."
+
+
+class LinkRow(tuple):
+    """A Links table row's data: its two devices' keys (what Show in looks for), and the Link itself."""
+
+    def __new__(cls, link):
+        row = super().__new__(cls, (link.a, link.b))
+        row.link = link
+        return row
 
 
 def count_text(count, noun):
@@ -1481,7 +1909,7 @@ def count_text(count, noun):
 
 
 def group_html(network_map, key, status_of=lambda key: None):
-    """A site or building: what's in it, how many are down, and its links to the rest of the map."""
+    """A site, building or room: what's in it, how many are down, and its links to the rest of the map."""
     group = network_map.group(key)
     if group is None:
         return ""
@@ -1492,20 +1920,20 @@ def group_html(network_map, key, status_of=lambda key: None):
     down = [device for device in members if (status_of(device) or None) is not None
             and status_of(device).status == monitor.DOWN]
     parts = [f"<h3>{escape(group.name)}</h3>",
-             f"<p>{GROUP_KINDS[group.kind]}" + (f" in {escape(parent.name)}" if parent else "")
+             f"<p>{GROUP_KINDS[group.kind]}" + (f" in {escape(network_map.group_label(parent))}" if parent else "")
              + f" &middot; {count_text(len(members), 'device')}"
              + (f" &middot; <span style='color:{COLORS['error']}'>{len(down)} down</span>" if down else "") + "</p>"]
-    buildings = network_map.subgroups(key)
-    if buildings:
-        parts.append("<h4>Buildings</h4><table>")
-        for building in sorted(buildings, key=lambda building: building.name.lower()):
-            parts.append(f"<tr><td>{escape(building.name)}&nbsp;</td>"
-                         f"<td>{count_text(len(network_map.members(building.key)), 'device')}</td></tr>")
+    inner = network_map.subgroups(key)
+    if inner:
+        parts.append(f"<h4>{GROUP_KINDS[inner[0].kind]}s</h4><table>")
+        for subgroup in sorted(inner, key=lambda subgroup: subgroup.name.lower()):
+            parts.append(f"<tr><td>{escape(subgroup.name)}&nbsp;</td>"
+                         f"<td>{count_text(len(network_map.members(subgroup.key)), 'device')}</td></tr>")
         parts.append("</table>")
     parts.append("<h4>Devices</h4><table>")
     for device in sorted((network_map.devices[device] for device in members), key=lambda device: device.label.lower()):
-        building = network_map.group(network_map.group_of.get(device.key, ""))
-        where = escape(building.name) if building is not None and building.key != key else ""
+        path = [group.name for group in network_map.group_path(device.key)]
+        where = escape(" / ".join(path[len(network_map.group_chain(group)):]))
         state = "<span style='color:%s'>down</span>" % COLORS["error"] if device.key in down else ""
         parts.append(f"<tr><td>{escape(device.label)}&nbsp;</td><td>{escape(KIND_NAMES.get(device.kind, ''))}"
                      f"&nbsp;</td><td>{where}&nbsp;</td><td>{state}</td></tr>")
