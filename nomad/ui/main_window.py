@@ -282,9 +282,11 @@ class MainWindow(QMainWindow):
         refresh_action.setShortcut("F5")
         refresh_action.triggered.connect(lambda: self.refresh())
         tools_menu.addAction(refresh_action)
-        find_action = QAction("&Find Route", self)
+        find_action = QAction("&Find on This Page", self)
         find_action.setShortcut("Ctrl+F")
-        find_action.triggered.connect(self.focus_route_filter)
+        find_action.setToolTip("The page's search or filter box: routes, ARP, connections, syslog, IP addresses "
+                               "or the network map")
+        find_action.triggered.connect(self.focus_find)
         tools_menu.addAction(find_action)
         tools_menu.addSeparator()
         tools_menu.addAction("&Flush DNS Cache", self.flush_dns)
@@ -587,9 +589,13 @@ class MainWindow(QMainWindow):
         self.navigator.setCurrentWidget(self.wake_tab)
         self.wake_tab.wake_device(mac, name)
 
-    def focus_route_filter(self):
-        self.navigator.setCurrentWidget(self.routing_tab)
-        self.routing_tab.focus_filter()
+    def focus_find(self):
+        """Ctrl+F: the search or filter box of the page showing, where it has one."""
+        page = self.navigator.currentWidget()
+        if hasattr(page, "focus_find"):
+            page.focus_find()
+        else:
+            self.show_status("This page has nothing to search.", "info", 3000)
 
     def show_log(self):
         if self.log_dialog is None or not self.log_dialog.isVisible():
@@ -613,7 +619,8 @@ class MainWindow(QMainWindow):
                                 "Ctrl+B\tHide or show the sidebar\n"
                                 "F11\tFocus mode: give the page (such as a terminal) the whole window\n"
                                 "Ctrl+= / Ctrl+-\tLarger / smaller text (Ctrl+0 for the default size)\n"
-                                "Ctrl+F\tFilter the routing table\n"
+                                "Ctrl+F\tSearch or filter on the page showing (routes, ARP, connections, syslog, "
+                                "IP addresses, network map)\n"
                                 "Delete\tDelete the selected route (Routing Table tab)\n"
                                 "SCP page (in a file list): F5 copy to the other side, F4 edit, F2 rename, "
                                 "F7 new folder, F8/Delete delete, Alt+Enter properties, Ctrl+R refresh, "

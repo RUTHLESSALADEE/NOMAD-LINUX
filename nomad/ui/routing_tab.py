@@ -160,7 +160,8 @@ class RoutingTab(QWidget):
     def shutdown(self):
         pass
 
-    def focus_filter(self):
+    def focus_find(self):
+        """Ctrl+F on this page."""
         self.route_filter_input.setFocus()
         self.route_filter_input.selectAll()
 

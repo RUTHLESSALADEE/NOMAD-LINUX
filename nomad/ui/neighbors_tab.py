@@ -40,7 +40,7 @@ class NeighborsTab(QWidget):
         self.family_combo.addItem("IPv6 (neighbors)", 6)
         toolbar.addWidget(self.family_combo)
         self.filter_input = QLineEdit()
-        self.filter_input.setPlaceholderText("Filter by address, MAC, vendor, interface...")
+        self.filter_input.setPlaceholderText("Filter by address, MAC, vendor, interface... (Ctrl+F)")
         self.filter_input.setClearButtonEnabled(True)
         toolbar.addWidget(self.filter_input, 1)
         self.adapter_only_check = QCheckBox("Selected adapter only")
@@ -104,6 +104,11 @@ class NeighborsTab(QWidget):
         self.update_buttons()
 
     # ----------------------------------------------------------------- Tab interface
+
+    def focus_find(self):
+        """Ctrl+F on this page."""
+        self.filter_input.setFocus()
+        self.filter_input.selectAll()
 
     def save_settings(self, settings):
         settings.setValue("arp/family", self.family_combo.currentData())

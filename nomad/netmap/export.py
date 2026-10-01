@@ -5,7 +5,7 @@ from xml.sax.saxutils import quoteattr
 from .layout import NODE_HEIGHT, NODE_WIDTH
 from .model import KIND_NAMES, SOURCE_NAMES
 
-DEVICE_COLUMNS = ["Name", "Management IP", "Kind", "Platform", "Found by", "Links", "Hosts", "Addresses",
+DEVICE_COLUMNS = ["Name", "Status", "Management IP", "Kind", "Platform", "Found by", "Links", "Hosts", "Addresses",
                   "Description", "Problem"]
 LINK_COLUMNS = ["Device", "Port", "Neighbor", "Neighbor Port", "Seen by"]
 HOST_COLUMNS = ["MAC Address", "IP Address", "Vendor", "Name", "Switch", "Port", "VLAN", "Found by", "Note"]
@@ -19,16 +19,18 @@ DRAWIO_STYLES = {
 }
 
 
-def device_rows(network_map):
+def device_rows(network_map, status_of=lambda key: ""):
+    """status_of(key) gives the Status column (from monitoring: Up, Down...), "" when it isn't monitored."""
     hosts = {}
     for host in network_map.hosts:
         hosts[host.device] = hosts.get(host.device, 0) + 1
     rows = []
     for device in sorted(network_map.devices.values(), key=lambda device: device.label.lower()):
-        rows.append([device.label, device.mgmt_ip, KIND_NAMES.get(device.kind, device.kind), device.platform,
-                     SOURCE_NAMES.get(device.source, device.source), str(len(network_map.links_of(device.key))),
-                     str(hosts.get(device.key, "")), ", ".join(device.addresses),
-                     device.sys_descr.splitlines()[0] if device.sys_descr else "", device.error])
+        rows.append([device.label, status_of(device.key), device.mgmt_ip, KIND_NAMES.get(device.kind, device.kind),
+                     device.platform, SOURCE_NAMES.get(device.source, device.source),
+                     str(len(network_map.links_of(device.key))), str(hosts.get(device.key, "")),
+                     ", ".join(device.addresses), device.sys_descr.splitlines()[0] if device.sys_descr else "",
+                     device.error])
     return rows
 
 

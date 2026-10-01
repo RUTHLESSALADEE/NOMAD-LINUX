@@ -22,6 +22,14 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 - Network Map: Show Hosts shows every switch's hosts at once (they're hidden until then, or until you double-click a switch). Each port's box lists its hosts one to a line with each one's VLAN (the first six, then how many more), and boxes keep clear of other switches' boxes.
 - Network Map: hosts' VLANs on switches with one MAC table for all VLANs (such as NX-OS), read from Q-BRIDGE-MIB. Before, hosts on those switches had no VLAN.
 - Network Map: add hosts by hand for devices that are turned off or unplugged while mapping (right-click a switch, a port's box or the Hosts tab > Add Host...), with a port, name, IP, MAC, VLAN and note. They're drawn dashed, marked "Added by hand" in the Hosts tab and CSV, and kept when you map again; if one is later found by the crawl, that entry takes over and keeps your name and note. Hosts can be edited and deleted (right-click, or Delete on the Hosts tab, which now selects several at once).
+- Network Map: monitoring. Tick Monitor (every 10 s to 10 min) to ping the devices on the map: each shows a green dot and its response time, or a red tint and how long it's been down (on both maps), after missing two checks in a row. The Devices tab has a Status column, the device details say since when, and a Monitor tab logs each device going down or coming back with how long it was down. The history is saved with the map and kept when you map again. It keeps going on other pages and resumes when NOMAD starts if it was on.
+- Network Map: the find box works on the tab showing, keeping its own text for each: on the Devices, Links and Hosts tabs it filters the rows as you type (words in any column, on top of the column filters), on the Crawl tab it finds text in the log (Enter for the next), and on the maps it finds a device.
+
+### Changed
+
+- Ctrl+F (Tools > Find on This Page) goes to the search or filter box of the page showing (Routing Table, ARP, Connections, Syslog, IP Addresses, Network Map) instead of always the routing table's.
+- Network Map: dragging the background moves the view again; hold Shift and drag to draw a box selecting several devices.
+- Table filters (Network Map's Devices, Links and Hosts tabs): the small ▾, easily taken for a sort arrow and hard to hit, is now a funnel button at the left of each column header, highlighted when the mouse is over it and filled green while the column is filtered, with a tooltip. Right-clicking a column header opens its filter too. The drop-down opens on the list of values to tick ("Show rows where Kind is:"), with sorting below it.
 
 ### Fixed
 

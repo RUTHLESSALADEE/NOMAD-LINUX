@@ -8,7 +8,7 @@ from netmap_fakes import LAB_MACS, PC1_MAC, build_network  # noqa: E402
 from PyQt5.QtCore import QSettings, pyqtSignal  # noqa: E402
 from PyQt5.QtWidgets import QApplication, QWidget  # noqa: E402
 
-from nomad.netmap import store  # noqa: E402
+from nomad.netmap import export, store  # noqa: E402
 from nomad.netmap.crawl import CrawlSettings, Crawler  # noqa: E402
 from nomad.ui import netmap_tab  # noqa: E402
 from nomad.ui.netmap_view import DeviceItem, HostPortItem, LinkItem  # noqa: E402
@@ -381,7 +381,7 @@ def test_filtering_the_hosts_table(tab, crawled, monkeypatch):
 
 def test_show_in_clears_a_filter_hiding_the_row(tab, crawled):
     tab.on_crawled(crawled)
-    tab.table_filters[tab.devices_table].set_filter(2, {"Firewall"})  # Kind
+    tab.table_filters[tab.devices_table].set_filter(export.DEVICE_COLUMNS.index("Kind"), {"Firewall"})
     tab.show_in(tab.devices_table, ["core"])
     assert not tab.table_filters[tab.devices_table].active
     selected = tab.devices_table.selectionModel().selectedRows()
@@ -392,3 +392,154 @@ def test_tables_start_a_to_z(tab, crawled):
     tab.on_crawled(crawled)
     names = [tab.devices_table.item(row, 0).text() for row in range(tab.devices_table.rowCount())]
     assert names == sorted(names, key=str.lower)
+
+
+def drag(view, start, end, modifiers=None):
+    """Press, move and release the left button on the view, as a real drag does (QTest.mouseMove can't hold a
+    button down in Qt 5)."""
+    from PyQt5.QtCore import QEvent, QPointF, Qt
+    from PyQt5.QtGui import QMouseEvent
+    from PyQt5.QtWidgets import QApplication
+    modifiers = modifiers if modifiers is not None else Qt.NoModifier
+    viewport = view.viewport()
+    for kind, point, buttons in ((QEvent.MouseButtonPress, start, Qt.LeftButton),
+                                 (QEvent.MouseMove, (start + end) / 2, Qt.LeftButton),
+                                 (QEvent.MouseMove, end, Qt.LeftButton),
+                                 (QEvent.MouseButtonRelease, end, Qt.NoButton)):
+        QApplication.sendEvent(viewport, QMouseEvent(kind, QPointF(point), Qt.LeftButton, buttons, modifiers))
+
+
+def test_shift_drag_selects_and_plain_drag_moves_the_view(tab, crawled, app):
+    from PyQt5.QtCore import QPoint, Qt
+    tab.on_crawled(crawled)
+    tab.show()
+    tab.tabs.setCurrentWidget(tab.view)
+    view = tab.view
+    view.resetTransform()
+    for _ in range(3):
+        app.processEvents()
+    view.centerOn(view.items_by_key["core"])
+    core = view.mapFromScene(view.items_by_key["core"].pos())
+    start, end = QPoint(core.x() - 120, core.y() - 60), QPoint(core.x() + 120, core.y() + 60)
+
+    before = (view.horizontalScrollBar().value(), view.verticalScrollBar().value())
+    drag(view, start, end)
+    assert view.scene().selectedItems() == []  # A plain drag moves the view, it doesn't select
+    assert (view.horizontalScrollBar().value(), view.verticalScrollBar().value()) != before
+
+    view.centerOn(view.items_by_key["core"])
+    core = view.mapFromScene(view.items_by_key["core"].pos())
+    start, end = QPoint(core.x() - 120, core.y() - 60), QPoint(core.x() + 120, core.y() + 60)
+    drag(view, start, end, Qt.ShiftModifier)
+    assert "core" in {item.key for item in view.scene().selectedItems() if hasattr(item, "key")}
+    assert view.dragMode() == view.ScrollHandDrag  # Back to moving the view afterwards
+    tab.hide()
+
+
+def test_find_box_is_local_to_each_sub_tab(tab, crawled):
+    tab.on_crawled(crawled)
+    tab.tabs.setCurrentWidget(tab.hosts_table)
+    assert "Filter the hosts" in tab.find_input.placeholderText()
+    tab.find_input.setText("52-54-00-00-00-0")
+    visible = [row for row in range(tab.hosts_table.rowCount()) if not tab.hosts_table.isRowHidden(row)]
+    assert len(visible) == len(LAB_MACS)
+    tab.tabs.setCurrentWidget(tab.devices_table)
+    assert tab.find_input.text() == ""  # Its own box
+    tab.find_input.setText("pa-fw")
+    assert sum(not tab.devices_table.isRowHidden(row) for row in range(tab.devices_table.rowCount())) == 1
+    tab.tabs.setCurrentWidget(tab.hosts_table)
+    assert tab.find_input.text() == "52-54-00-00-00-0"  # Back as it was
+    assert tab.tabs.tabText(tab.tabs.indexOf(tab.hosts_table)).startswith(f"Hosts ({len(LAB_MACS)} of")
+    tab.tabs.setCurrentWidget(tab.view)
+    assert "Find a device" in tab.find_input.placeholderText() and tab.find_input.text() == ""
+
+
+def test_find_in_the_crawl_log(tab):
+    tab.crawl_progress.add_log("Found acc1 through CDP")
+    tab.crawl_progress.add_log("Found acc2 through CDP")
+    tab.tabs.setCurrentWidget(tab.crawl_progress.tab)
+    assert tab.find_input.isEnabled()
+    tab.find_input.setText("acc2")
+    tab.find()
+    assert tab.crawl_progress.log_view.textCursor().selectedText() == "acc2"
+    assert tab.crawl_progress.find("acc2")  # Goes round to the top again
+
+
+def test_ctrl_f_goes_to_the_page_showing():
+    from nomad.ui.main_window import MainWindow
+
+    class Page:
+        found = False
+
+        def focus_find(self):
+            self.found = True
+
+    class Navigator:
+        def __init__(self, page):
+            self.page = page
+
+        def currentWidget(self):
+            return self.page
+
+    class Window:
+        statuses = []
+
+        def show_status(self, *args):
+            self.statuses.append(args[0])
+
+    window, page = Window(), Page()
+    window.navigator = Navigator(page)
+    MainWindow.focus_find(window)
+    assert page.found
+    window.navigator = Navigator(object())
+    MainWindow.focus_find(window)
+    assert window.statuses == ["This page has nothing to search."]
+
+
+def test_monitoring_the_map(tab, crawled):
+    from nomad.netmap.monitor import DOWN, UP
+    answers = {"10.0.0.1": 3, "10.0.0.11": 5, "10.0.0.12": 2, "10.0.0.5": 1, "10.0.0.254": None}
+    tab.monitor.pinger = answers.get
+    tab.on_crawled(crawled)
+    status_column = export.DEVICE_COLUMNS.index("Status")
+    assert tab.devices_table.item(0, status_column).text() == ""  # Not monitored yet
+    tab.monitor_check.setChecked(True)
+    assert tab.monitor.running
+    def poll():  # As a poll returns them: by device
+        tab.monitor.on_results({key: answers[address] for key, address in tab.monitor.targets.items()})
+    for _ in range(2):  # rtr1 must miss twice before it counts as down
+        poll()
+    assert tab.monitor.status("core").status == UP and tab.monitor.status("rtr1").status == DOWN
+    assert tab.view.items_by_key["core"].monitor_state.rtt == 3
+    assert tab.view.items_by_key["rtr1"].monitor_state.status == DOWN
+    assert tab.l3_view.items_by_key["rtr1"].monitor_state.status == DOWN  # Both views
+    statuses = {tab.devices_table.item(row, 0).text(): tab.devices_table.item(row, status_column).text()
+                for row in range(tab.devices_table.rowCount())}
+    assert statuses["rtr1.corp.example"] == "Down" and statuses["core.corp.example"] == "Up"
+    assert tab.monitor_label.text() == "4 up · 1 down"
+    assert "rtr1.corp.example (10.0.0.254) is down" in "\n".join(tab.monitor.lines)
+    assert not any("is up" in line for line in tab.monitor.lines)  # First answers aren't news
+    assert tab.network_map.status_log[-1][1:4] == ["rtr1", "rtr1.corp.example", DOWN]
+
+    answers["10.0.0.254"] = 9
+    poll()
+    assert "is up again, after being down" in tab.monitor.lines[-1]
+    assert "Up, 9 ms" in netmap_tab.device_html(crawled, "rtr1", tab.monitor.status("rtr1"))
+
+    tab.monitor_check.setChecked(False)
+    assert tab.view.items_by_key["core"].monitor_state is None and tab.monitor_label.text() == ""
+    tab.save_positions()
+    assert len(store.load(tab.map_path).status_log) == 2  # Down and up again, kept with the map
+
+
+def test_monitoring_resumes_at_startup(tab, crawled, tmp_path):
+    tab.on_crawled(crawled)
+    tab.monitor.pinger = lambda address: 1
+    tab.monitor_check.setChecked(True)
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat)
+    tab.save_settings(settings)
+    other = netmap_tab.NetworkMapTab(Window())
+    other.monitor.pinger = lambda address: 1
+    other.restore_settings(settings)
+    assert other.monitor_check.isChecked() and other.monitor.running
+    other.shutdown()

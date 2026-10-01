@@ -141,6 +141,7 @@ class NetworkMap:
     root: str = ""  # Device laid out at the top, when the user chose one
     traces: list = field(default_factory=list)  # [Trace]
     l3_positions: dict = field(default_factory=dict)  # Node key -> [x, y] on the logical (L3) view
+    status_log: list = field(default_factory=list)  # Monitoring: [[time, device key, label, up/down, text]]
 
     def add_link(self, link):
         """Add a link, merging it with the same link seen from the other end (or by the other protocol)."""
@@ -203,6 +204,7 @@ class NetworkMap:
                                  if key in network_map.devices}
         network_map.traces = [_build(Trace, item) for item in data.get("traces", [])]
         network_map.l3_positions = {key: tuple(value) for key, value in data.get("l3_positions", {}).items()}
+        network_map.status_log = [list(entry) for entry in data.get("status_log", [])]
         return network_map
 
 

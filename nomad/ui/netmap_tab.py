@@ -1,19 +1,21 @@
 """Network Map page: crawl switches, routers and firewalls over SNMP from a starting device, and draw what's
 connected to what (CDP/LLDP), with the hosts on each switch port (MAC and ARP tables)."""
+import datetime
 import html
 import ipaddress
 import json
 import logging
 import socket
+import time
 from pathlib import Path
 
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QKeySequence
-from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QDialog, QFileDialog, QHBoxLayout, QLabel, \
-    QLineEdit, QMenu, QMessageBox, QPushButton, QShortcut, QSplitter, QTabWidget, QTextBrowser, QToolButton, \
-    QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, \
+    QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QShortcut, QSplitter, QTabWidget, QTextBrowser, \
+    QToolButton, QVBoxLayout, QWidget
 
-from ..netmap import diff, export, l3, store
+from ..netmap import diff, export, l3, monitor, store
 from ..netmap.crawl import CrawlSettings, Crawler
 from ..netmap.layout import merge_positions
 from ..netmap.model import FIREWALL, KIND_NAMES, NO_SNMP, ROUTER, SNMP, SOURCE_NAMES, SWITCH, UNREACHABLE, \
@@ -22,6 +24,7 @@ from ..snmp import V2C
 from ..terminal.credentials import CredentialError, protect, unprotect
 from .common import SortableTableItem, StoppableThread, read_only_table, set_hint
 from .host_menu import HostActions
+from .netmap_monitor import NetworkMonitor
 from .netmap_progress import CrawlProgress
 from .netmap_dialogs import CommunitiesDialog, CompareDialog, HostDialog, ScopeDialog
 from .netmap_view import MapView
@@ -98,6 +101,8 @@ class NetworkMapTab(QWidget):
         self.live_positions = {}
         self.crawled_map = False
         self.crawl_progress = CrawlProgress(self)
+        self.monitor = NetworkMonitor(self)
+        self.history_map = None  # The map whose monitoring history the Monitor log is showing
         self.host_actions = HostActions(window, self)
         self.save_timer = QTimer(self)
         self.save_timer.setSingleShot(True)
@@ -165,16 +170,29 @@ class NetworkMapTab(QWidget):
         self.compare_menu.aboutToShow.connect(self.fill_compare_menu)
         self.compare_button.setMenu(self.compare_menu)
         self.find_input = QLineEdit()
-        self.find_input.setPlaceholderText("Find a device, subnet or host: name, IP, MAC or vendor")
         self.find_input.setClearButtonEnabled(True)
         self.fit_button = QPushButton("Fit")
-        self.fit_button.setToolTip("Zoom to show the whole map. Scroll to zoom; drag with the middle button (or hold "
-                                   "Space and drag) to move around.")
+        self.fit_button.setToolTip("Zoom to show the whole map. Scroll to zoom, and drag the background to move "
+                                   "around.")
         self.arrange_button = QPushButton("Re-arrange")
         self.arrange_button.setToolTip("Lay the map out again, forgetting where devices were dragged to.")
         for widget in (self.open_button, self.recent_button, self.save_button, self.export_button,
                        self.compare_button):
             tools.addWidget(widget)
+        tools.addSpacing(16)
+        self.monitor_check = QCheckBox("Monitor")
+        self.monitor_check.setToolTip("Ping the devices on the map every so often, show which are up or down, and "
+                                      "log when one goes down or comes back (on the Monitor tab). Keeps going on "
+                                      "other pages while NOMAD is open.")
+        self.interval_combo = QComboBox()
+        for seconds in monitor.INTERVALS:
+            self.interval_combo.addItem(f"every {monitor.duration_text(seconds)}", seconds)
+        self.interval_combo.setCurrentIndex(monitor.INTERVALS.index(monitor.DEFAULT_INTERVAL))
+        self.interval_combo.setToolTip("How often to ping each device.")
+        self.monitor_label = QLabel()
+        tools.addWidget(self.monitor_check)
+        tools.addWidget(self.interval_combo)
+        tools.addWidget(self.monitor_label)
         tools.addSpacing(16)
         tools.addWidget(self.find_input, 1)
         self.hosts_check = QCheckBox("Show Hosts")
@@ -197,6 +215,7 @@ class NetworkMapTab(QWidget):
         self.tabs.addTab(self.links_table, "Links")
         self.tabs.addTab(self.hosts_table, "Hosts")
         self.tabs.addTab(self.crawl_progress.tab, "Crawl")
+        self.tabs.addTab(self.monitor.tab, "Monitor")
         self.table_names = {self.devices_table: "Devices", self.links_table: "Links", self.hosts_table: "Hosts"}
         self.table_filters = {table: TableFilter(table, lambda shown, total, table=table:
                                                  self.show_filtered_count(table, shown, total))
@@ -221,9 +240,19 @@ class NetworkMapTab(QWidget):
         self.open_button.clicked.connect(self.open_map)
         self.save_button.clicked.connect(self.save_map_as)
         self.find_input.returnPressed.connect(self.find)
+        self.find_input.textChanged.connect(self.on_find_text)
+        self.find_texts = {}  # Sub-tab -> what was in the find box there: each tab has its own
+        self.find_owner = self.tabs.currentWidget()
+        self.tabs.currentChanged.connect(self.on_subtab_changed)
+        self.set_find_placeholder()
         self.fit_button.clicked.connect(lambda: self.current_view().fit())
         self.arrange_button.clicked.connect(self.rearrange)
         self.hosts_check.toggled.connect(self.view.set_all_hosts_shown)
+        self.monitor_check.toggled.connect(self.on_monitor_toggled)
+        self.interval_combo.currentIndexChanged.connect(
+            lambda _: self.monitor.set_interval(self.interval_combo.currentData()))
+        self.monitor.statuses_changed.connect(self.show_statuses)
+        self.monitor.history_added.connect(self.keep_history)
         for view in (self.view, self.l3_view):
             view.selection_changed.connect(self.show_details)
             view.positions_changed.connect(self.save_timer.start)
@@ -258,6 +287,8 @@ class NetworkMapTab(QWidget):
         settings.setValue("netmap/max_devices", self.max_devices)
         settings.setValue("netmap/collect_hosts", self.collect_hosts)
         settings.setValue("netmap/trace", self.trace)
+        settings.setValue("netmap/monitor", self.monitor_check.isChecked())
+        settings.setValue("netmap/monitor_interval", self.interval_combo.currentData())
         settings.setValue("netmap/last_map", str(self.map_path) if self.map_path else "")
         settings.setValue("netmap/splitter", self.splitter.saveState())
 
@@ -288,8 +319,14 @@ class NetworkMapTab(QWidget):
                 self.show_map(store.load(last), Path(last), fit=True)
             except (OSError, ValueError) as error:
                 log.warning("Couldn't reopen the last network map %s: %s", last, error)
+        interval = settings.value("netmap/monitor_interval", monitor.DEFAULT_INTERVAL, int)
+        if interval in monitor.INTERVALS:
+            self.interval_combo.setCurrentIndex(monitor.INTERVALS.index(interval))
+        if settings.value("netmap/monitor", False, bool) and self.network_map is not None:
+            self.monitor_check.setChecked(True)  # Carry on watching from where it was left
 
     def shutdown(self):
+        self.monitor.shutdown()
         if self.save_timer.isActive():
             self.save_timer.stop()
             self.save_positions()
@@ -401,6 +438,7 @@ class NetworkMapTab(QWidget):
                                               weight=lambda key: KIND_WEIGHTS.get(snapshot.devices[key].kind, 0))
         self.live_map = snapshot
         self.view.set_map(snapshot, self.live_positions)
+        self.view.set_statuses(self.monitor.status)
         self.ring_devices_being_read()
         if first:
             self.view.request_fit()
@@ -433,6 +471,9 @@ class NetworkMapTab(QWidget):
                                          if key in network_map.devices}
             network_map.root = self.network_map.root if self.network_map.root in network_map.devices else ""
             dropped = network_map.carry_manual_hosts(self.network_map)
+            network_map.status_log = self.network_map.status_log  # The same network's monitoring history
+            if self.history_map is self.network_map:
+                self.history_map = network_map  # So the Monitor log isn't reloaded
         self.live_map = None
         path = None
         try:
@@ -471,6 +512,11 @@ class NetworkMapTab(QWidget):
                                        weight=lambda key: 1 if self.l3_nodes[key].kind == l3.DEVICE else 0)
         network_map.l3_positions = l3_positions
         self.l3_view.set_graph(self.l3_nodes, l3_links, l3_positions)
+        self.monitor.set_map(network_map)
+        if network_map is not self.history_map:
+            self.history_map = network_map
+            self.monitor.load_history(network_map.status_log)
+        self.show_statuses()
         self.fill_tables()
         self.show_details(None)
         if self.hosts_check.isChecked():
@@ -509,7 +555,8 @@ class NetworkMapTab(QWidget):
         network_map = self.network_map
         self.device_keys = [device.key for device in sorted(network_map.devices.values(),
                                                             key=lambda device: device.label.lower())]
-        fill_table(self.devices_table, export.device_rows(network_map), ip_columns={1}, keys=self.device_keys)
+        fill_table(self.devices_table, export.device_rows(network_map, self.monitor.status_text), ip_columns={2},
+                   keys=self.device_keys)
         fill_table(self.links_table, export.link_rows(network_map),
                    keys=[(link.a, link.b) for link in export.sorted_links(network_map)])
         fill_table(self.hosts_table, export.host_rows(network_map), ip_columns={1},
@@ -533,12 +580,49 @@ class NetworkMapTab(QWidget):
         else:
             self.view.show_host(self.network_map.hosts[item.data_object])
 
+    # ----------------------------------------------------------------- Find (Ctrl+F), local to each sub-tab
+
+    def focus_find(self):
+        """Ctrl+F: the find box, for whichever sub-tab is showing."""
+        self.find_input.setFocus()
+        self.find_input.selectAll()
+
+    def on_subtab_changed(self, _index):
+        self.find_texts[self.find_owner] = self.find_input.text()
+        self.find_owner = self.tabs.currentWidget()
+        self.find_input.blockSignals(True)  # The table it now belongs to is already filtered by its own text
+        self.find_input.setText(self.find_texts.get(self.find_owner, ""))
+        self.find_input.blockSignals(False)
+        self.set_find_placeholder()
+        self.update_buttons()
+
+    def set_find_placeholder(self):
+        here = self.tabs.currentWidget()
+        if here in self.table_names:
+            text = f"Filter the {self.table_names[here].lower()}: words in any column (Ctrl+F)"
+        elif here is self.crawl_progress.tab:
+            text = "Find in the crawl log (Enter for the next) (Ctrl+F)"
+        elif here is self.l3_view:
+            text = "Find a router, subnet or hop: name or address (Ctrl+F)"
+        else:
+            text = "Find a device or host: name, IP, MAC or vendor (Ctrl+F)"
+        self.find_input.setPlaceholderText(text)
+
+    def on_find_text(self, text):
+        here = self.tabs.currentWidget()
+        if here in self.table_filters:
+            self.table_filters[here].set_text(text)  # Tables filter as you type
+
     def find(self):
         text = self.find_input.text().strip()
-        if not text:
+        here = self.tabs.currentWidget()
+        if not text or here in self.table_filters:
+            return
+        if here is self.crawl_progress.tab:
+            if not self.crawl_progress.find(text):
+                set_hint(self.status_label, f"'{text}' isn't in the crawl log.", "warning")
             return
         view = self.current_view()
-        self.tabs.setCurrentWidget(view)
         if not view.find(text):
             set_hint(self.status_label, f"Nothing on the map matches '{text}'.", "warning")
 
@@ -550,19 +634,18 @@ class NetworkMapTab(QWidget):
                         "over SNMP, then theirs, until the whole network (within the scope) is mapped.</p>"
                         "<p>Double-click a switch to show its hosts by port, with each one's VLAN (or tick Show "
                         "Hosts for every switch). Right-click a device for SSH, ping, SNMP and more.</p>"
-                        "<p>Drag the background to select several devices and move them together; drag with the "
-                        "middle button, or hold Space and drag, to move the view.</p>")
+                        "<p>Drag the background to move around. Hold Shift and drag to draw a box round several "
+                        "devices, then drag any of them to move them together.</p>")
             else:
                 text = "<p>Select a device to see its details.</p>"
             self.details.setHtml(text)
             return
         if selection[0] == "many":
             self.details.setHtml(f"<p>{selection[1]} selected. Drag any of them to move them all.</p>"
-                                 "<p>Drag the background to select a group, Ctrl+click to add or remove one, and "
-                                 "Ctrl+A to select everything. To move the view, drag with the middle button or "
-                                 "hold Space and drag.</p>")
+                                 "<p>Shift and drag the background to select a group, Ctrl+click to add or remove "
+                                 "one, and Ctrl+A to select everything.</p>")
         elif selection[0] == "device":
-            self.details.setHtml(device_html(network_map, selection[1]))
+            self.details.setHtml(device_html(network_map, selection[1], self.monitor.status(selection[1])))
         elif selection[0] == "node":
             node = self.l3_nodes.get(selection[1])
             if node is not None:
@@ -636,7 +719,8 @@ class NetworkMapTab(QWidget):
             return
         if any(widget.isRowHidden(row) for row in rows):
             self.table_filters[widget].clear()  # A filter was hiding it
-            rows = sorted({row for key in keys for row in self.table_rows(widget, key)})
+        if any(widget.isRowHidden(row) for row in rows):
+            self.find_input.setText("")  # Its find box's words, then (the box is this table's now)
         mode = widget.selectionMode()
         widget.setSelectionMode(QAbstractItemView.MultiSelection)  # So selectRow adds rather than replaces
         for row in rows:
@@ -822,6 +906,44 @@ class NetworkMapTab(QWidget):
         self.show_map(self.network_map, self.map_path, fit=True)
         self.save_positions()
 
+    # ----------------------------------------------------------------- Monitoring
+
+    def on_monitor_toggled(self, on):
+        if on and self.network_map is None:
+            self.monitor_check.setChecked(False)
+            return
+        if on:
+            self.monitor.start(self.interval_combo.currentData())
+        else:
+            self.monitor.stop()
+        self.show_statuses()
+
+    def show_statuses(self):
+        """After a poll: the dots on both maps, the Status column, the summary and the details showing."""
+        for view in (self.view, self.l3_view):
+            view.set_statuses(self.monitor.status)
+        summary = self.monitor.summary()
+        self.monitor_label.setText(summary)
+        self.monitor_label.setStyleSheet(f"color: {COLORS['error' if ' down' in summary else 'success']};")
+        if self.network_map is not None:
+            column = export.DEVICE_COLUMNS.index("Status")
+            for row in range(self.devices_table.rowCount()):
+                item = self.devices_table.item(row, column)
+                key = self.devices_table.item(row, 0).data_object
+                if item is not None and item.text() != self.monitor.status_text(key):
+                    item.setText(self.monitor.status_text(key))
+            self.table_filters[self.devices_table].apply()  # A filter on Status follows the changes
+            selected = self.current_view().scene().selectedItems()
+            if len(selected) == 1 and getattr(selected[0], "device", None) is not None:
+                self.show_details(("device", selected[0].key))
+
+    def keep_history(self, entries):
+        """Status changes go into the map's history, saved with it."""
+        if self.network_map is None:
+            return
+        self.network_map.status_log = (self.network_map.status_log + entries)[-monitor.HISTORY_LIMIT:]
+        self.save_timer.start()
+
     # ----------------------------------------------------------------- Comparing
 
     def fill_compare_menu(self):
@@ -948,7 +1070,8 @@ class NetworkMapTab(QWidget):
         self.window.show_status(f"Saved {path}. Open it in draw.io (or import it into Visio).")
 
     def export_csv(self, which):
-        columns, rows = {"devices": (export.DEVICE_COLUMNS, export.device_rows),
+        columns, rows = {"devices": (export.DEVICE_COLUMNS,
+                                     lambda network_map: export.device_rows(network_map, self.monitor.status_text)),
                          "links": (export.LINK_COLUMNS, export.link_rows),
                          "hosts": (export.HOST_COLUMNS, export.host_rows)}[which]
         path = self.export_path(f"Export {which.title()}", f" {which}.csv", "CSV files (*.csv)")
@@ -970,8 +1093,11 @@ class NetworkMapTab(QWidget):
             widget.setEnabled(has_map and not running)  # Not while the map is being drawn from a crawl
         for widget in (self.open_button, self.recent_button):
             widget.setEnabled(not running)
-        for widget in (self.fit_button, self.find_input, self.hosts_check):
+        for widget in (self.fit_button, self.hosts_check):
             widget.setEnabled(has_map or running)
+        self.monitor_check.setEnabled(has_map or self.monitor_check.isChecked())
+        here = self.tabs.currentWidget()
+        self.find_input.setEnabled(has_map or running or here is self.crawl_progress.tab)
 
 
 def fill_table(table, rows, ip_columns=(), keys=None):
@@ -985,7 +1111,8 @@ def fill_table(table, rows, ip_columns=(), keys=None):
     table.setSortingEnabled(True)
 
 
-def device_html(network_map, key):
+def device_html(network_map, key, state=None):
+    """state: the device's monitor.DeviceStatus while it's monitored."""
     device = network_map.devices.get(key)
     if device is None:
         return ""
@@ -993,7 +1120,8 @@ def device_html(network_map, key):
     parts = [f"<h3>{escape(device.label)}</h3>",
              f"<p>{escape(KIND_NAMES.get(device.kind, device.kind))}"
              + (f" &middot; {escape(device.platform)}" if device.platform else "") + "</p><table>"]
-    rows = [("Management IP", device.mgmt_ip), ("Found by", SOURCE_NAMES.get(device.source, device.source)),
+    rows = [("Status", monitor_status_text(state)), ("Management IP", device.mgmt_ip),
+            ("Found by", SOURCE_NAMES.get(device.source, device.source)),
             ("Hops from start", str(device.hops)), ("Addresses", ", ".join(device.addresses)),
             ("Problem", device.error)]
     for label, value in rows:
@@ -1034,6 +1162,18 @@ def device_html(network_map, key):
     if device.sys_descr:
         parts.append(f"<h4>Description</h4><p>{escape(device.sys_descr).replace(chr(10), '<br>')}</p>")
     return "".join(parts)
+
+
+def monitor_status_text(state):
+    if state is None:
+        return ""
+    if state.status == monitor.UNKNOWN:
+        return "Being checked"
+    since = datetime.datetime.fromtimestamp(state.since).strftime("%H:%M:%S")
+    if state.status == monitor.DOWN:
+        return f"Down for {monitor.duration_text(time.time() - state.since)} (since {since})"
+    rtt = f", {'<1' if state.rtt < 1 else state.rtt} ms" if state.rtt is not None else ""
+    return f"Up{rtt} (since {since})"
 
 
 def subnet_html(network_map, subnet):

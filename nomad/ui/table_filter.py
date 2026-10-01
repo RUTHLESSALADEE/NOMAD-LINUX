@@ -1,15 +1,16 @@
-"""Excel-style filters for a table's columns: a button in each column header opens a list of the column's values to
-tick, with a search box and sorting. Filters on several columns combine."""
+"""Excel-style filters for a table's columns: a filter button in each column header (or right-clicking the header)
+opens a list of the column's values to tick, with a search box and sorting. Filters on several columns combine."""
 import re
 
-from PyQt5.QtCore import QPoint, QRect, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor
-from PyQt5.QtWidgets import QHBoxLayout, QHeaderView, QLineEdit, QListWidget, QListWidgetItem, QMenu, QPushButton, \
-    QVBoxLayout, QWidget, QWidgetAction
+from PyQt5.QtCore import QEvent, QPoint, QRect, QRectF, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
+from PyQt5.QtWidgets import QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, \
+    QPushButton, QToolTip, QVBoxLayout, QWidget, QWidgetAction
 
 from .theme import COLORS
 
-BUTTON_WIDTH = 16
+BUTTON_WIDTH = 22  # The filter button at the left of each column header (the style puts the sort arrow right)
+BUTTON_MARGIN = 4
 BLANK = "(Blanks)"
 SELECT_ALL = "(Select All)"
 
@@ -19,38 +20,108 @@ def natural_key(text):
     return [(0, int(part), "") if part.isdigit() else (1, 0, part.lower()) for part in re.split(r"(\d+)", text)]
 
 
+def funnel(rect):
+    """A filter (funnel) shape filling rect."""
+    left, top, width, height = rect.left(), rect.top(), rect.width(), rect.height()
+    middle = left + width / 2
+    path = QPainterPath()
+    path.moveTo(left, top)
+    path.lineTo(left + width, top)
+    path.lineTo(middle + width * 0.14, top + height * 0.5)
+    path.lineTo(middle + width * 0.14, top + height)
+    path.lineTo(middle - width * 0.14, top + height * 0.82)
+    path.lineTo(middle - width * 0.14, top + height * 0.5)
+    path.closeSubpath()
+    return path
+
+
 class FilterHeader(QHeaderView):
-    """A horizontal header with a filter button at the left of each column (clear of the sort arrow)."""
+    """A horizontal header with a filter button at the left of each column. Clicking the button (or right-clicking
+    anywhere on the header) opens the column's filter; clicking the rest of the header sorts, as usual."""
     filter_requested = pyqtSignal(int, QPoint)  # Column, where to open the list
 
     def __init__(self, parent=None):
         super().__init__(Qt.Horizontal, parent)
-        self.active = set()  # Filtered columns, whose buttons are drawn in the accent colour
+        self.active = set()  # Filtered columns, whose buttons are drawn filled in the accent colour
+        self.hovered = -1  # Column whose button the mouse is over
         self.setSectionsClickable(True)
         self.setHighlightSections(False)
-        self.setStyleSheet(f"QHeaderView::section {{ padding-left: {BUTTON_WIDTH + 4}px; }}")
+        self.setMouseTracking(True)
+        self.setStyleSheet(f"QHeaderView::section {{ padding-left: {BUTTON_WIDTH + BUTTON_MARGIN * 2}px; }}")
+
+    def section_rect(self, index):
+        return QRect(self.sectionViewportPosition(index), 0, self.sectionSize(index), self.height())
 
     def button_rect(self, section_rect):
-        return QRect(section_rect.left() + 3, section_rect.top(), BUTTON_WIDTH, section_rect.height())
+        return QRect(section_rect.left() + BUTTON_MARGIN, section_rect.top() + BUTTON_MARGIN,
+                     BUTTON_WIDTH, section_rect.height() - BUTTON_MARGIN * 2)
+
+    def button_at(self, position):
+        """The column whose filter button is at position, or -1."""
+        index = self.logicalIndexAt(position)
+        if index >= 0 and self.button_rect(self.section_rect(index)).adjusted(-3, -BUTTON_MARGIN, 3,
+                                                                              BUTTON_MARGIN).contains(position):
+            return index
+        return -1
 
     def paintSection(self, painter, rect, index):
         painter.save()
         super().paintSection(painter, rect, index)
         painter.restore()
         painter.save()
-        painter.setPen(QColor(COLORS["accent"] if index in self.active else COLORS["muted"]))
-        painter.drawText(self.button_rect(rect), Qt.AlignCenter, "▼" if index in self.active else "▾")
+        painter.setRenderHint(QPainter.Antialiasing)
+        button = QRectF(self.button_rect(rect))
+        active, hovered = index in self.active, index == self.hovered
+        if active or hovered:
+            painter.setPen(QPen(QColor(COLORS["accent"] if active else COLORS["border"]), 1))
+            painter.setBrush(QColor(COLORS["accent_dim"] if active else COLORS["hover"]))
+            painter.drawRoundedRect(button.adjusted(0.5, 0.5, -0.5, -0.5), 3, 3)
+        icon = funnel(button.adjusted(5, max(4, (button.height() - 11) / 2), -5, -max(4, (button.height() - 11) / 2)))
+        color = QColor(COLORS["accent_hover"] if active else COLORS["text"] if hovered else COLORS["muted"])
+        painter.setPen(QPen(color, 1.2))
+        painter.setBrush(color if active else Qt.NoBrush)
+        painter.drawPath(icon)
         painter.restore()
 
+    def mouseMoveEvent(self, event):
+        hovered = self.button_at(event.pos())
+        if hovered != self.hovered:
+            self.hovered = hovered
+            self.viewport().update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        self.hovered = -1
+        self.viewport().update()
+        super().leaveEvent(event)
+
+    def event(self, event):
+        if event.type() == QEvent.ToolTip:
+            index = self.button_at(event.pos())
+            if index >= 0:
+                name = self.model().headerData(index, Qt.Horizontal) if self.model() else ""
+                QToolTip.showText(event.globalPos(), f"Filter {name}" + (" (filtered)" if index in self.active
+                                                                         else ""), self)
+                return True
+        return super().event(event)
+
+    def open_filter(self, index):
+        rect = self.section_rect(index)
+        self.filter_requested.emit(index, self.mapToGlobal(QPoint(rect.left(), self.height())))
+
     def mousePressEvent(self, event):
-        index = self.logicalIndexAt(event.pos())
+        index = self.button_at(event.pos())
         if index >= 0 and event.button() == Qt.LeftButton:
-            rect = QRect(self.sectionViewportPosition(index), 0, self.sectionSize(index), self.height())
-            if self.button_rect(rect).contains(event.pos()):
-                self.filter_requested.emit(index, self.mapToGlobal(QPoint(rect.left(), self.height())))
-                event.accept()
-                return  # A filter, not a sort
+            self.open_filter(index)
+            event.accept()
+            return  # A filter, not a sort
         super().mousePressEvent(event)
+
+    def contextMenuEvent(self, event):
+        index = self.logicalIndexAt(event.pos())
+        if index >= 0:
+            self.open_filter(index)
+            event.accept()
 
 
 class TableFilter:
@@ -60,6 +131,7 @@ class TableFilter:
     def __init__(self, table, changed=lambda shown, total: None):
         self.table, self.changed = table, changed
         self.filters = {}  # Column -> set of allowed cell texts
+        self.words = []  # From a quick filter box: rows must contain each of them, in any column
         stretch_last = table.horizontalHeader().stretchLastSection()
         self.header = FilterHeader(table)
         table.setHorizontalHeader(self.header)  # Deletes the old header
@@ -76,7 +148,12 @@ class TableFilter:
         return item.text() if item is not None else ""
 
     def passes(self, row, skip=None):
-        return all(self.text(row, column) in allowed for column, allowed in self.filters.items() if column != skip)
+        if not all(self.text(row, column) in allowed for column, allowed in self.filters.items() if column != skip):
+            return False
+        if self.words:
+            line = " ".join(self.text(row, column) for column in range(self.table.columnCount())).lower()
+            return all(word in line for word in self.words)
+        return True
 
     def apply(self):
         total = self.table.rowCount()
@@ -97,13 +174,19 @@ class TableFilter:
             self.filters[column] = set(allowed)
         self.apply()
 
+    def set_text(self, text):
+        """Show only rows containing every word of text, in any column (on top of the column filters)."""
+        self.words = text.lower().split()
+        self.apply()
+
     def clear(self):
+        """Clear the column filters (the quick filter's text belongs to its box, so it stays)."""
         self.filters = {}
         self.apply()
 
     @property
     def active(self):
-        return bool(self.filters)
+        return bool(self.filters or self.words)
 
     def values(self, column):
         """{text: count} for the column, over the rows the other columns' filters let through (as Excel does)."""
@@ -131,18 +214,14 @@ class FilterPopup(QMenu):
         super().__init__(parent)
         self.table_filter, self.column = table_filter, column
         name = table_filter.table.horizontalHeaderItem(column).text()
-        self.addAction("Sort A to Z", lambda: table_filter.sort(column, Qt.AscendingOrder))
-        self.addAction("Sort Z to A", lambda: table_filter.sort(column, Qt.DescendingOrder))
-        self.addSeparator()
-        if column in table_filter.filters:
-            self.addAction(f'Clear Filter from "{name}"', lambda: table_filter.set_filter(column, None))
-        if len(table_filter.filters) > 1 or (table_filter.active and column not in table_filter.filters):
-            self.addAction("Clear All Filters", table_filter.clear)
-        self.addSeparator()
-
         box = QWidget()
         layout = QVBoxLayout(box)
-        layout.setContentsMargins(8, 4, 8, 8)
+        layout.setContentsMargins(8, 8, 8, 8)
+        title = QLabel(f"Show rows where {name} is:")
+        bold = QFont(title.font())
+        bold.setBold(True)
+        title.setFont(bold)
+        layout.addWidget(title)
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search")
         self.search.setClearButtonEnabled(True)
@@ -173,6 +252,13 @@ class FilterPopup(QMenu):
         action = QWidgetAction(self)
         action.setDefaultWidget(box)
         self.addAction(action)
+        self.addSeparator()
+        if column in table_filter.filters:
+            self.addAction(f'Clear Filter from "{name}"', lambda: table_filter.set_filter(column, None))
+        if len(table_filter.filters) > 1 or (table_filter.filters and column not in table_filter.filters):
+            self.addAction("Clear All Filters", table_filter.clear)
+        self.addAction("Sort A to Z", lambda: table_filter.sort(column, Qt.AscendingOrder))
+        self.addAction("Sort Z to A", lambda: table_filter.sort(column, Qt.DescendingOrder))
 
         self.search.textChanged.connect(self.on_search)
         self.list.itemChanged.connect(self.on_item_changed)

@@ -192,6 +192,15 @@ class CrawlProgress(QObject):
                                                                                   now - started))):
                 table.setItem(row, column, SortableTableItem(text, key))
 
+    def find(self, text):
+        """Select the next place text is in the log, going round to the top. Returns False if it isn't there."""
+        if self.log_view.find(text):
+            return True
+        cursor = self.log_view.textCursor()
+        cursor.movePosition(cursor.Start)
+        self.log_view.setTextCursor(cursor)
+        return self.log_view.find(text)
+
     def save_log(self):
         path, _ = QFileDialog.getSaveFileName(self.tab, "Save Crawl Log", "Network map crawl.txt",
                                               "Text files (*.txt)")
