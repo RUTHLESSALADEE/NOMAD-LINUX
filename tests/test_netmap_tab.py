@@ -176,8 +176,8 @@ def test_compare_with_an_older_map(tab, crawled, tmp_path):
 
 def test_scope_dialog_values(app):
     from nomad.ui.netmap_dialogs import ScopeDialog
-    dialog = ScopeDialog(["10.0.0.0/8"], 4, 100, True, False)
-    assert dialog.values() == (["10.0.0.0/8"], 4, 100, True, False)
+    dialog = ScopeDialog(["10.0.0.0/8"], 4, 100, True, False, 24)
+    assert dialog.values() == (["10.0.0.0/8"], 4, 100, True, False, 24)
 
 
 def test_host_dialog_checks_what_is_entered(tab, crawled):
@@ -543,3 +543,25 @@ def test_monitoring_resumes_at_startup(tab, crawled, tmp_path):
     other.restore_settings(settings)
     assert other.monitor_check.isChecked() and other.monitor.running
     other.shutdown()
+
+
+def test_crawl_from_here_updates_the_map_open(tab, tmp_path):
+    network = build_network()
+    first = Crawler(CrawlSettings(seeds=["10.0.0.1"], scope=["10.0.0.0/30"], trace=False),
+                    client_factory=network.client, pinger=network.ping, echo=network.echo).run()
+    tab.on_crawled(first)
+    path, maps = tab.map_path, sorted(tmp_path.glob("*.nomadmap"))
+    tab.view.items_by_key["core"].setPos(3000, 3000)
+    tab.save_positions()
+
+    tab.extending = True  # As crawl_from sets it
+    network = build_network()
+    newer = Crawler(CrawlSettings(seeds=["10.0.0.11"], trace=False), client_factory=network.client,
+                    pinger=network.ping, echo=network.echo, known=tab.network_map).run()
+    tab.on_crawled(newer)
+    assert tab.network_map is first and tab.map_path == path  # The same map, in the same file
+    assert sorted(tmp_path.glob("*.nomadmap")) == maps  # No new map saved
+    assert tab.network_map.devices["acc1"].source == "snmp"
+    assert tab.view.items_by_key["core"].pos().x() == 3000  # Left where it was
+    assert store.load(path).devices["acc1"].source == "snmp"
+    assert "added 0 devices to this map (1 read over SNMP for the first time)" in tab.status_label.text()

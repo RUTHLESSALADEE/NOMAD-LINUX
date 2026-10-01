@@ -23,6 +23,9 @@ Q_FDB_ENTRY = "1.3.6.1.2.1.17.7.1.2.2.1"  # Q-BRIDGE-MIB dot1qTpFdbTable: index 
 BASE_PORT_IFINDEX = "1.3.6.1.2.1.17.1.4.1.2"
 CDP_CACHE_ENTRY = "1.3.6.1.4.1.9.9.23.1.2.1.1"
 VTP_VLAN_STATE = "1.3.6.1.4.1.9.9.46.1.3.1.1.2"
+VM_VLAN = "1.3.6.1.4.1.9.9.68.1.2.2.1.2"  # CISCO-VLAN-MEMBERSHIP-MIB vmVlan: an access port's VLAN (index ifIndex)
+VM_VOICE_VLAN = "1.3.6.1.4.1.9.9.68.1.5.1.1.1"  # vmVoiceVlanId: a port's voice VLAN
+TRUNK_NATIVE_VLAN = "1.3.6.1.4.1.9.9.46.1.6.1.1.5"  # vlanTrunkPortNativeVlan
 LLDP_LOC_PORT_ENTRY = "1.0.8802.1.1.2.1.3.7.1"
 LLDP_REM_ENTRY = "1.0.8802.1.1.2.1.4.1.1"
 LLDP_REM_MAN_ADDR_IF_SUBTYPE = "1.0.8802.1.1.2.1.4.2.1.3"
@@ -78,6 +81,8 @@ class DeviceTables:
     own_macs: set = field(default_factory=set)
     lag_parents: dict = field(default_factory=dict)  # Member ifIndex -> aggregate ifIndex
     routes: list = field(default_factory=list)  # [(destination, next hop, ifIndex, protocol)]
+    timings: dict = field(default_factory=dict)  # Step -> seconds, for the crawl log
+    notes: list = field(default_factory=list)  # Worth a line in the crawl log
     routes_truncated: bool = False
     warnings: list = field(default_factory=list)
 
@@ -243,6 +248,17 @@ def vlans(rows):
     for index, value in column(rows, VTP_VLAN_STATE).items():
         if len(index) == 2 and value.value == 1 and index[1] not in RESERVED_VLANS:
             found.add(index[1])
+    return sorted(found)
+
+
+def vlans_in_use(access_rows, voice_rows=(), native_rows=()):
+    """The VLANs a Catalyst's ports use: access ports' VLANs, voice VLANs and trunks' native VLANs. Hosts are on
+    these, so they're the only MAC tables worth reading (a VTP domain can list hundreds the switch doesn't carry)."""
+    found = set()
+    for rows, root in ((access_rows, VM_VLAN), (voice_rows, VM_VOICE_VLAN), (native_rows, TRUNK_NATIVE_VLAN)):
+        for value in column(rows, root).values():
+            if isinstance(value.value, int) and 1 <= value.value <= 4094 and value.value not in RESERVED_VLANS:
+                found.add(value.value)
     return sorted(found)
 
 

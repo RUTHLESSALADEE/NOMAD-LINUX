@@ -1,15 +1,16 @@
-"""Network Map settings: the SNMP community strings to try, and how far the crawl may go."""
+"""Network Map settings: the SNMP community strings to try, and how far the crawl may go; and the dialogs for
+hosts added by hand and for sites and buildings."""
 import ipaddress
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, \
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QTableWidget, \
-    QTableWidgetItem, QVBoxLayout
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QRadioButton, QSpinBox, \
+    QTableWidget, QTableWidgetItem, QVBoxLayout
 
 from ..netmap import diff
-from ..netmap.crawl import parse_networks
-from ..netmap.model import Host, port_sort_key, short_port
+from ..netmap.crawl import MAX_WORKERS, WORKERS, parse_networks
+from ..netmap.model import BUILDING, SITE, Host, port_sort_key, short_port
 from ..oui import format_mac, vendor
 from ..snmp import VERSIONS, community_is_valid
 from .theme import COLORS
@@ -115,7 +116,7 @@ class CommunitiesDialog(QDialog):
 
 
 class ScopeDialog(QDialog):
-    def __init__(self, scope, max_hops, max_devices, collect_hosts, trace, parent=None):
+    def __init__(self, scope, max_hops, max_devices, collect_hosts, trace, workers=WORKERS, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Crawl Scope")
         self.resize(460, 380)
@@ -146,6 +147,12 @@ class ScopeDialog(QDialog):
         self.trace_check.setChecked(trace)
         form.addRow("Hops:", self.hops_input)
         form.addRow("Devices to ask, at most:", self.devices_input)
+        self.workers_input = QSpinBox()
+        self.workers_input.setRange(1, MAX_WORKERS)
+        self.workers_input.setValue(workers)
+        self.workers_input.setToolTip("How many devices to read at the same time. More is faster on a big network; "
+                                      "fewer is gentler on slow links and busy devices.")
+        form.addRow("Devices read at once:", self.workers_input)
         form.addRow(self.hosts_check)
         form.addRow(self.trace_check)
         layout.addLayout(form)
@@ -155,11 +162,12 @@ class ScopeDialog(QDialog):
         layout.addWidget(buttons)
 
     def values(self):
-        """(scope lines, max hops, max devices, collect hosts, trace). Raises ValueError for a bad subnet."""
+        """(scope lines, max hops, max devices, collect hosts, trace, devices at once). Raises ValueError for a bad
+        subnet."""
         lines = [line.strip() for line in self.scope_input.toPlainText().splitlines() if line.strip()]
         parse_networks(lines)
         return (lines, self.hops_input.value(), self.devices_input.value(), self.hosts_check.isChecked(),
-                self.trace_check.isChecked())
+                self.trace_check.isChecked(), self.workers_input.value())
 
     def accept(self):
         try:
@@ -318,6 +326,74 @@ class HostDialog(QDialog):
         if self.host is not None:
             host.platform = self.host.platform
         return host
+
+    def accept(self):
+        try:
+            self.values()
+        except ValueError as error:
+            QMessageBox.warning(self, self.windowTitle(), str(error))
+            return
+        super().accept()
+
+
+class GroupDialog(QDialog):
+    """New site or building for the devices selected, or renaming one."""
+
+    def __init__(self, network_map, group=None, count=0, site="", parent=None):
+        super().__init__(parent)
+        self.network_map, self.group = network_map, group
+        self.setWindowTitle(f"Rename {'Building' if group.kind == BUILDING else 'Site'}" if group else "New Group")
+        self.resize(380, 0)
+        layout = QVBoxLayout(self)
+        if group is None:
+            note = QLabel(f"Put the {count} device{'' if count == 1 else 's'} selected in a new site or building. "
+                          "It's drawn as a box round them; drag devices into or out of the box to change what's "
+                          "in it.")
+            note.setWordWrap(True)
+            layout.addWidget(note)
+        form = QFormLayout()
+        self.name_input = QLineEdit(group.name if group else "")
+        self.name_input.setPlaceholderText("Such as Head Office, or Building 2")
+        form.addRow("Name:", self.name_input)
+        self.site_radio = QRadioButton("Site")
+        self.building_radio = QRadioButton("Building")
+        self.site_combo = QComboBox()
+        self.site_combo.addItem("(Not in a site)", "")
+        for item in sorted((item for item in network_map.groups if item.kind == SITE),
+                           key=lambda item: item.name.lower()):
+            self.site_combo.addItem(item.name, item.key)
+        if group is None:
+            kinds = QHBoxLayout()
+            kinds.addWidget(self.site_radio)
+            kinds.addWidget(self.building_radio)
+            kinds.addStretch(1)
+            form.addRow("Kind:", kinds)
+            form.addRow("In site:", self.site_combo)
+            self.site_combo.setCurrentIndex(max(0, self.site_combo.findData(site)))
+            (self.building_radio if site else self.site_radio).setChecked(True)
+            self.site_radio.toggled.connect(lambda: self.site_combo.setEnabled(self.building_radio.isChecked()))
+            self.site_combo.setEnabled(self.building_radio.isChecked())
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self):
+        """(name, kind, site key). Raises ValueError for a name that's missing or taken."""
+        name = self.name_input.text().strip()
+        if not name:
+            raise ValueError("Enter a name for it.")
+        if self.group is not None:
+            kind, site = self.group.kind, self.group.parent
+        else:
+            kind = BUILDING if self.building_radio.isChecked() else SITE
+            site = self.site_combo.currentData() if kind == BUILDING else ""
+        for other in self.network_map.groups:
+            if other is not self.group and other.parent == site and other.name.lower() == name.lower():
+                where = f" in {self.network_map.group(site).name}" if site else ""
+                raise ValueError(f"There's already a group called {other.name}{where}.")
+        return name, kind, site
 
     def accept(self):
         try:

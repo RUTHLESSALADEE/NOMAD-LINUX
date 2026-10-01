@@ -248,6 +248,12 @@ def build_network():
     acc1.cdp(5, 2, "SEP00AABBCCDDEE", "Port 1", "10.10.0.22", "Cisco IP Phone 8845", 0x90)
     acc1.vlan(1)
     acc1.vlan(10)
+    for unused in (20, 30, 40):  # In the VTP domain, not on any of acc1's ports: their MAC tables aren't read
+        acc1.vlan(unused)
+    acc1.set(collect.VM_VLAN, 5, number(10))  # Access ports' VLANs, from CISCO-VLAN-MEMBERSHIP-MIB
+    acc1.set(collect.VM_VLAN, 7, number(10))
+    acc1.set(collect.VM_VOICE_VLAN, 5, number(10))
+    acc1.set(collect.TRUNK_NATIVE_VLAN, 1, number(1))
     acc1.learned(CORE_MAC, 1, 1, vlan=1)
     acc1.learned(PC1_MAC, 5, 5, vlan=10)
     acc1.learned(PHONE_MAC, 5, 5, vlan=10)

@@ -22,7 +22,10 @@ from .model import AP, HOST, KIND_NAMES, NETWORK_KINDS, NO_SNMP, PHONE, SNMP, UN
 
 log = logging.getLogger(__name__)
 
-WORKERS = 8
+WORKERS = 16  # Devices read at once (Scope can change it)
+MAX_WORKERS = 64
+BULK_ROWS = 50  # Rows asked for in each SNMP GETBULK: fewer round trips than the usual 25
+VLAN_WORKERS = 4  # A Catalyst's per-VLAN MAC tables read at once
 STOPPED = "Stopped"
 LIVE_INTERVAL = 1.5  # Seconds between snapshots of the map for drawing it while it's crawled
 ROUTE_ROWS = 20000  # Per column: a core with the full internet table shouldn't take all day
@@ -60,7 +63,7 @@ def parse_networks(lines):
 
 class Crawler:
     def __init__(self, settings, client_factory=SnmpClient, pinger=None, should_stop=lambda: False,
-                 progress=lambda message: None, echo=None, events=lambda kind, *details: None):
+                 progress=lambda message: None, echo=None, events=lambda kind, *details: None, known=None):
         """events(kind, *details) reports progress for a live view, from the crawl's own and its worker threads:
             ("started", address, key or None)  a device is being read
             ("step", address, text)            what it's doing now (the table, the VLAN, the community)
@@ -69,6 +72,7 @@ class Crawler:
             ("counts", {...})                  read, reading, queued, found, no_snmp, unreachable
             ("map", NetworkMap)                a copy of the map so far (devices and links), every LIVE_INTERVAL
             ("phase", text)                    hosts, traceroute
+        known: a map this crawl adds to (Crawl from Here). Devices it read aren't read again, and keep their keys.
         """
         self.settings = settings
         self.events = events
@@ -88,6 +92,17 @@ class Crawler:
         self.tables = {}  # Device key -> DeviceTables, for placing hosts at the end
         self.asked = set()  # Addresses already asked (or queued)
         self.capabilities = {}  # Device key -> what its neighbors' CDP/LLDP say it is (router, switch...)
+        self.known = known
+        if known is not None:
+            for key, device in known.devices.items():
+                if device.source == SNMP:  # Already read: recognize it, but don't ask it again
+                    for address in [device.mgmt_ip] + list(device.addresses):
+                        if address:
+                            self.aliases.setdefault(address, key)
+                            self.asked.add(address)
+                    if device.name:
+                        self.aliases.setdefault(normalize_name(device.name), key)
+            self.asked -= set(settings.seeds)  # Except where it starts from
 
     # ----------------------------------------------------------------- Scope
 
@@ -217,6 +232,7 @@ class Crawler:
 
     def visit(self, address):
         """Read one device. Returns (DeviceTables or None, error). Runs on a worker thread."""
+        started = time.monotonic()
         client = info = None
         communities = self.communities_for(address)
         for number, community in enumerate(communities, start=1):
@@ -239,70 +255,112 @@ class Crawler:
                 return None, "Answers ping but not SNMP: check the community string and the device's SNMP ACL."
             return None, "No answer to SNMP or ping."
         tables = collect.DeviceTables(info=info)
+        tables.timings["Finding the community string"] = time.monotonic() - started
         self.read_tables(client, tables, community)
+        tables.timings["total"] = time.monotonic() - started
         return tables, ""
 
-    def walk(self, client, root, tables, what, limit=None):
+    def walk(self, client, root, tables, what, limit=None, timing=None):
+        """Walk one table (or column), noting the time it took under timing (or what) for the crawl log."""
         self.events("step", client.host, what)
+        started = time.monotonic()
         try:
-            if limit:
-                return list(client.walk(parse_oid(root), should_stop=self.should_stop, limit=limit))
-            return list(client.walk(parse_oid(root), should_stop=self.should_stop))
+            options = {"limit": limit} if limit else {}
+            return list(client.walk(parse_oid(root), max_repetitions=BULK_ROWS, should_stop=self.should_stop,
+                                    **options))
         except (SnmpError, OSError) as problem:
             tables.warnings.append(f"{what}: {problem}")
             return []
+        finally:
+            step = timing or what
+            tables.timings[step] = tables.timings.get(step, 0) + time.monotonic() - started
 
     def read_tables(self, client, tables, community):
-        tables.interfaces = collect.interface_names(self.walk(client, collect.IF_NAME, tables, "Interface names"),
-                                                    self.walk(client, collect.IF_DESCR, tables, "Interfaces"))
+        tables.interfaces = collect.interface_names(
+            self.walk(client, collect.IF_NAME, tables, "Interface names", timing="Interfaces"),
+            self.walk(client, collect.IF_DESCR, tables, "Interfaces"))
         tables.addresses = collect.ip_addresses(self.walk(client, collect.IP_ADDR_ENTRY, tables, "IP addresses"))
-        tables.neighbors = collect.cdp_neighbors(self.walk(client, collect.CDP_CACHE_ENTRY, tables, "CDP"),
-                                                 tables.interfaces)
-        lldp_rows = self.walk(client, collect.LLDP_REM_ENTRY, tables, "LLDP")
+        tables.neighbors = collect.cdp_neighbors(self.walk(client, collect.CDP_CACHE_ENTRY, tables, "CDP",
+                                                           timing="Neighbors"), tables.interfaces)
+        lldp_rows = self.walk(client, collect.LLDP_REM_ENTRY, tables, "LLDP", timing="Neighbors")
         if lldp_rows:
-            local_ports = collect.lldp_local_ports(self.walk(client, collect.LLDP_LOC_PORT_ENTRY, tables, "LLDP"))
+            local_ports = collect.lldp_local_ports(self.walk(client, collect.LLDP_LOC_PORT_ENTRY, tables, "LLDP",
+                                                             timing="Neighbors"))
             addresses = collect.lldp_management_addresses(
-                self.walk(client, collect.LLDP_REM_MAN_ADDR_IF_SUBTYPE, tables, "LLDP"))
+                self.walk(client, collect.LLDP_REM_MAN_ADDR_IF_SUBTYPE, tables, "LLDP", timing="Neighbors"))
             tables.neighbors += collect.lldp_neighbors(lldp_rows, local_ports, tables.interfaces, addresses)
-        tables.arp = collect.arp(self.walk(client, collect.ARP_PHYS_ADDRESS, tables, "ARP"))
+        tables.arp = collect.arp(self.walk(client, collect.ARP_PHYS_ADDRESS, tables, "ARP", timing="ARP table"))
         route_rows = []
         for column in (5, 6, 7):  # ifIndex, type, protocol: the index holds destination, mask and next hop
-            route_rows += self.walk(client, f"{collect.CIDR_ROUTE_ENTRY}.{column}", tables, "Routes", ROUTE_ROWS)
+            route_rows += self.walk(client, f"{collect.CIDR_ROUTE_ENTRY}.{column}", tables, "Routes", ROUTE_ROWS,
+                                    timing="Routing table")
         old_rows = []
         if not route_rows:
             for column in (2, 7, 8, 9, 11):
-                old_rows += self.walk(client, f"{collect.IP_ROUTE_ENTRY}.{column}", tables, "Routes", ROUTE_ROWS)
+                old_rows += self.walk(client, f"{collect.IP_ROUTE_ENTRY}.{column}", tables, "Routes", ROUTE_ROWS,
+                                      timing="Routing table")
         tables.routes = collect.routes(route_rows, old_rows)
         tables.routes_truncated = len(route_rows) >= 3 * ROUTE_ROWS or len(old_rows) >= 5 * ROUTE_ROWS
         if not self.settings.collect_hosts:
             return
         tables.own_macs = collect.own_macs(self.walk(client, collect.IF_PHYS_ADDRESS, tables, "Interfaces"))
-        tables.lag_parents = collect.lag_parents(self.walk(client, collect.IF_STACK_STATUS, tables, "Port-channels"),
-                                                 self.walk(client, collect.LAG_ATTACHED, tables, "Port-channels"))
+        tables.lag_parents = collect.lag_parents(
+            self.walk(client, collect.IF_STACK_STATUS, tables, "Port-channels", timing="Interfaces"),
+            self.walk(client, collect.LAG_ATTACHED, tables, "Port-channels", timing="Interfaces"))
         info = tables.info
-        vlan_list = collect.vlans(self.walk(client, collect.VTP_VLAN_STATE, tables, "VLANs")) \
+        vlan_list = collect.vlans(self.walk(client, collect.VTP_VLAN_STATE, tables, "VLANs", timing="MAC tables")) \
             if info.object_id.startswith(collect.CISCO + ".") else []
         if vlan_list and "nx-os" not in info.descr.lower():
-            # Catalyst IOS keeps a MAC table per VLAN, read with community@vlan
-            for number, vlan in enumerate(vlan_list, start=1):
-                if self.should_stop():
-                    return
-                self.events("step", client.host, f"MAC table, VLAN {vlan} ({number} of {len(vlan_list)})")
-                try:
-                    vlan_client = self.client_factory(client.host, f"{community}@{vlan}", self.settings.version,
-                                                      timeout=self.settings.timeout, retries=self.settings.retries)
-                    entries = list(vlan_client.walk(parse_oid(collect.FDB_ENTRY), should_stop=self.should_stop))
-                    ports = list(vlan_client.walk(parse_oid(collect.BASE_PORT_IFINDEX), should_stop=self.should_stop))
-                except (SnmpError, OSError):
-                    continue  # A VLAN with no ports here doesn't answer on some models
-                tables.fdb += collect.fdb(entries, ports, vlan)
+            self.read_vlan_tables(client, tables, community, vlan_list)
         else:
-            base_ports = self.walk(client, collect.BASE_PORT_IFINDEX, tables, "MAC table")
+            base_ports = self.walk(client, collect.BASE_PORT_IFINDEX, tables, "MAC table", timing="MAC tables")
             q_rows = []
             for column in (2, 3):  # Port and status: the index holds the VLAN and the MAC
-                q_rows += self.walk(client, f"{collect.Q_FDB_ENTRY}.{column}", tables, "MAC table by VLAN")
-            tables.fdb = collect.fdb_by_vlan(q_rows, base_ports) or \
-                collect.fdb(self.walk(client, collect.FDB_ENTRY, tables, "MAC table"), base_ports)
+                q_rows += self.walk(client, f"{collect.Q_FDB_ENTRY}.{column}", tables, "MAC table by VLAN",
+                                    timing="MAC tables")
+            if not collect.fdb_by_vlan(q_rows, base_ports):
+                for column in (2, 3):
+                    q_rows += self.walk(client, f"{collect.FDB_ENTRY}.{column}", tables, "MAC table",
+                                        timing="MAC tables")
+            tables.fdb = collect.fdb_by_vlan(q_rows, base_ports) or collect.fdb(q_rows, base_ports)
+
+    def read_vlan_tables(self, client, tables, community, vlan_list):
+        """Catalyst IOS keeps a MAC table per VLAN, read with community@vlan. Only the VLANs its ports use (a VTP
+        domain can list hundreds the switch doesn't carry), several at once."""
+        in_use = collect.vlans_in_use(
+            self.walk(client, collect.VM_VLAN, tables, "VLANs in use", timing="MAC tables"),
+            self.walk(client, collect.VM_VOICE_VLAN, tables, "VLANs in use", timing="MAC tables"),
+            self.walk(client, collect.TRUNK_NATIVE_VLAN, tables, "VLANs in use", timing="MAC tables"))
+        chosen = [vlan for vlan in vlan_list if vlan in in_use] if in_use else vlan_list
+        if len(chosen) < len(vlan_list):
+            tables.notes.append(f"MAC tables for the {len(chosen)} of {len(vlan_list)} VLANs its ports use "
+                                f"({', '.join(str(vlan) for vlan in chosen[:12])}{'...' if len(chosen) > 12 else ''})")
+        started = time.monotonic()
+        done = [0]
+
+        def read(vlan):
+            if self.should_stop():
+                return []
+            try:
+                vlan_client = self.client_factory(client.host, f"{community}@{vlan}", self.settings.version,
+                                                  timeout=self.settings.timeout, retries=self.settings.retries)
+                rows = []
+                for column in (2, 3):  # Port and status: the MAC is in the index
+                    rows += list(vlan_client.walk(parse_oid(f"{collect.FDB_ENTRY}.{column}"),
+                                                  max_repetitions=BULK_ROWS, should_stop=self.should_stop))
+                ports = list(vlan_client.walk(parse_oid(collect.BASE_PORT_IFINDEX), max_repetitions=BULK_ROWS,
+                                              should_stop=self.should_stop))
+            except (SnmpError, OSError):
+                return []  # A VLAN with no ports here doesn't answer on some models
+            finally:
+                done[0] += 1
+                self.events("step", client.host, f"MAC tables: {done[0]} of {len(chosen)} VLANs read")
+            return collect.fdb(rows, ports, vlan)
+
+        with ThreadPoolExecutor(max_workers=VLAN_WORKERS) as executor:
+            for entries in executor.map(read, chosen):
+                tables.fdb += entries
+        tables.timings["MAC tables"] = tables.timings.get("MAC tables", 0) + time.monotonic() - started
 
     # ----------------------------------------------------------------- Putting results on the map
 
@@ -357,7 +415,7 @@ class Crawler:
 
         info = tables.info
         existing = self.find(address, info.name)
-        if existing and self.map.devices[existing].source == SNMP:
+        if existing and existing in self.map.devices and self.map.devices[existing].source == SNMP:
             self.aliases[address] = existing
             self.events("finished", address, "again")
             self.events("log", f"{address} is {self.map.devices[existing].label} again (another of its addresses)")
@@ -391,7 +449,10 @@ class Crawler:
         self.tables[key] = tables
         self.counts["read"] += 1
         self.events("finished", address, SNMP)
-        self.events("log", f"Read {device.label} ({address}): {collect_summary(device, tables)}")
+        self.events("log", f"Read {device.label} ({address}){timing_summary(tables.timings)}: "
+                           f"{collect_summary(device, tables)}")
+        for note in tables.notes:
+            self.events("log", f"{device.label}: {note}")
 
         next_visits = []
         for neighbor in tables.neighbors:
@@ -401,11 +462,14 @@ class Crawler:
             other = self.find(neighbor.address, neighbor.name) or normalize_name(neighbor.name)
             if other == key:
                 continue
-            known = other in self.map.devices
+            fresh = other not in self.map.devices
+            on_map = self.known is not None and other in self.known.devices  # From the map being added to
+            known = not fresh or on_map
             other_device = self.add_device(other, name=display_name(neighbor.name), mgmt_ip=neighbor.address,
                                            platform=neighbor.platform)
-            if not known:
-                other_device.kind, other_device.hops = kind, hops + 1
+            if fresh:  # What the map says it is, if it's on it (an access point's port isn't an uplink)
+                other_device.kind = self.known.devices[other].kind if on_map else kind
+                other_device.hops = hops + 1
             self.capabilities.setdefault(other, set()).update(neighbor.capabilities)
             self.map.add_link(Link(key, short_port(neighbor.local_port), other, short_port(neighbor.port),
                                    [neighbor.protocol]))
@@ -506,6 +570,19 @@ class Crawler:
                 port = tables.interfaces.get(tables.lag_parents.get(if_index, if_index), str(if_index))
                 uplinks.add(port_key(port))
         return uplinks
+
+
+def timing_summary(timings):
+    """ " in 14.2 s (slowest: MAC tables 9.8 s)" for the crawl log."""
+    total = timings.get("total")
+    if total is None:
+        return ""
+    steps = {step: seconds for step, seconds in timings.items() if step != "total"}
+    text = f" in {total:.1f} s"
+    if steps and total >= 1:
+        slowest = max(steps, key=steps.get)
+        text += f" (slowest: {slowest} {steps[slowest]:.1f} s)"
+    return text
 
 
 def collect_summary(device, tables):
