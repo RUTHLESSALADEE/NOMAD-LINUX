@@ -4,7 +4,7 @@ Devices with a single link (access points, a lone router) sit in a small grid un
 switch with thirty access points doesn't make its layer thirty wide. Positions are the centers of the devices.
 
 The same layers can run left to right, or the devices go in a grid or in rings round the top device; with groups
-(sites and buildings), each group is laid out on its own and the groups' boxes are tiled. Align and distribute
+(sites, buildings and rooms), each group is laid out on its own and the groups' boxes are tiled. Align and distribute
 line up devices the user chose.
 """
 import math
@@ -279,7 +279,7 @@ def pack(sizes, gap=GROUP_GAP):
 
 
 def arrange(nodes, edges, style=TOP_DOWN, root=None, weight=lambda node: 0, path_of=None, order=lambda key: key):
-    """{node: (x, y)} in an arrangement. With path_of (node -> [site, building], or fewer, of group keys) each
+    """{node: (x, y)} in an arrangement. With path_of (node -> [site, building, room], or fewer, of group keys) each
     group is arranged on its own inside a box (GROUP_PAD round it, GROUP_TITLE above) and the boxes are tiled,
     the devices in no group first and then the groups in order(key) order."""
     path_of = path_of or {}

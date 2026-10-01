@@ -1,12 +1,13 @@
-"""The IP Addresses page: selecting each kind of subnet shows it without errors."""
+"""The IP Addresses page: selecting each kind of subnet shows it without errors, and SSH/SCP to an address."""
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
-from PyQt5.QtWidgets import QApplication, QTreeWidgetItemIterator, QWidget  # noqa: E402
+from PyQt5.QtWidgets import QApplication, QMenu, QTreeWidgetItemIterator, QWidget  # noqa: E402
 
 from nomad.ipam.store import USED, IpamStore  # noqa: E402
+from nomad.terminal.sessions import Session  # noqa: E402
 from nomad.ui.ipam_tab import LOCAL, IpamTab  # noqa: E402
 
 
@@ -87,4 +88,41 @@ def test_search_by_network_and_kind(app, tmp_path):
     store.delete_network(second.id)
     tab.fill_networks()
     assert tab.search_network_combo.currentText() == "All networks"
+    store.close()
+
+
+class SessionPage:
+    def __init__(self, matches):
+        self.matches, self.opened = matches, []
+
+    def saved_matches(self, host, aliases=(), protocol="SSH"):
+        self.asked = (host, list(aliases))
+        return self.matches
+
+    def open_address(self, host, protocol="SSH", aliases=(), name="", folder="", use_saved=True):
+        self.opened.append((host, list(aliases), name, folder, use_saved))
+
+
+def test_ssh_and_scp_use_the_saved_session(app, tmp_path):
+    store = IpamStore(str(tmp_path / "ipam.db"), user="tester")
+    network = store.add_network("Lab")
+    store.add_subnet(network.id, "10.0.0.0/24", "Core / Mgmt")
+    store.set_address(network.id, "10.0.0.5", USED, "core-sw1")
+    window = Window()
+    window.terminal_tab = SessionPage([Session("Core-SW1", host="core-sw1", username="admin")])
+    window.scp_tab = SessionPage([])
+    tab = IpamTab(window)
+    tab.local_store, tab.source, tab.network_id = store, LOCAL, network.id
+    tab.fill_tree()
+    tab.tree.setCurrentItem(tab.tree.topLevelItem(0))
+    tab.show_subnet()
+    menu = QMenu()
+    tab.add_session_actions(menu, "10.0.0.5")
+    actions = {action.text(): action for action in menu.actions()}
+    assert list(actions) == ["SSH (Core-SW1)", "SSH as a New Session", "SCP"]
+    assert window.terminal_tab.asked == ("10.0.0.5", ["core-sw1"])
+    actions["SSH (Core-SW1)"].trigger()
+    actions["SCP"].trigger()
+    assert window.terminal_tab.opened == [("10.0.0.5", ["core-sw1"], "core-sw1", "Lab/Core - Mgmt", True)]
+    assert window.scp_tab.opened == [("10.0.0.5", ["core-sw1"], "core-sw1", "Lab/Core - Mgmt", True)]
     store.close()

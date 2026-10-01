@@ -1,9 +1,10 @@
 """A page of session tabs beside the saved-session sidebar, with pop-out windows: the base of the Terminal and SCP
 pages."""
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QHBoxLayout, QLabel, QMenu, QMessageBox, QSplitter, QStackedWidget, QToolButton,     QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMenu, \
+    QMessageBox, QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget
 
-from ..terminal.sessions import SSH, parse_quick_connect
+from ..terminal.sessions import SERIAL, SSH, normalize_folder, parse_quick_connect
 from .session_dialog import SessionDialog
 from .session_manager import SessionManager
 from .session_tabs import SessionTabs, SessionWindow
@@ -252,13 +253,37 @@ class SessionPage(QWidget):
         view.connect_session()
         return view
 
-    def open_address(self, text, protocol=SSH):
-        """Quick connect from another page, such as Sweep's "Open SSH Session"."""
+    def saved_matches(self, host, aliases=(), protocol=SSH):
+        """The saved sessions for a host from another page (aliases: its other addresses and names)."""
+        if self.protocols is not None and protocol not in self.protocols:
+            return []
+        return self.store.matching([host, *aliases], protocol)
+
+    def open_address(self, text, protocol=SSH, aliases=(), name="", folder="", use_saved=True):
+        """Connect from another page, such as the Network Map's "Open SSH Session": with the saved session for the
+        host if there is one (asking which if there are several), so its user name and saved password are used.
+        Otherwise a quick connection, named name and suggesting folder when it's saved. aliases: the host's other
+        addresses and names, which a saved session may use instead."""
         try:
             session = parse_quick_connect(text, protocol)
         except ValueError as error:
             QMessageBox.warning(self, "Connect", str(error))
             return None
+        if use_saved and session.protocol != SERIAL:
+            matches = self.store.matching([session.host, *aliases], session.protocol, session.username)
+            if not matches:
+                chosen = session
+            elif len(matches) == 1:
+                chosen = matches[0]
+            else:
+                chosen = choose_saved_session(self, session, matches)
+            if chosen is None:
+                return None
+            if chosen is not session:
+                return self.open_session(chosen)
+        if name and not session.username:
+            session.name = name.replace("/", "-")
+        session.folder = normalize_folder(folder)
         return self.open_session(session, saved=True)
 
     def new_window(self):
@@ -291,3 +316,33 @@ class SessionPage(QWidget):
             self.store.link_recent(dialog.session)
             view.session = dialog.session
             self.manager.fill_tree(select=dialog.session.id)
+
+
+def choose_saved_session(parent, session, matches):
+    """Ask which of several saved sessions to open for a host. Returns one of them, session for a new connection
+    that doesn't use them, or None if cancelled."""
+    dialog = QDialog(parent)
+    dialog.setWindowTitle("Open Session")
+    layout = QVBoxLayout(dialog)
+    label = QLabel(f"There are {len(matches)} saved sessions for {session.host}. Which one?")
+    label.setWordWrap(True)
+    layout.addWidget(label)
+    choices = QListWidget()
+    for match in matches:
+        item = QListWidgetItem(f"{match.path}    ({match.target()})")
+        item.setData(Qt.UserRole, match)
+        choices.addItem(item)
+    new_item = QListWidgetItem(f"New connection to {session.host} (not a saved session)")
+    new_item.setData(Qt.UserRole, session)
+    choices.addItem(new_item)
+    choices.setCurrentRow(0)
+    choices.itemDoubleClicked.connect(dialog.accept)
+    layout.addWidget(choices)
+    buttons = QDialogButtonBox(QDialogButtonBox.Open | QDialogButtonBox.Cancel)
+    buttons.accepted.connect(dialog.accept)
+    buttons.rejected.connect(dialog.reject)
+    layout.addWidget(buttons)
+    dialog.resize(460, 260)
+    if not dialog.exec_() or choices.currentItem() is None:
+        return None
+    return choices.currentItem().data(Qt.UserRole)
