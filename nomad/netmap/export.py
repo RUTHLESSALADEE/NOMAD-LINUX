@@ -5,8 +5,8 @@ from xml.sax.saxutils import quoteattr
 from .layout import NODE_HEIGHT, NODE_WIDTH
 from .model import KIND_NAMES, SOURCE_NAMES
 
-DEVICE_COLUMNS = ["Name", "Status", "Management IP", "Kind", "Platform", "Found by", "Links", "Hosts", "Addresses",
-                  "Description", "Problem"]
+DEVICE_COLUMNS = ["Name", "Status", "Management IP", "Kind", "Group", "Platform", "Found by", "Links", "Hosts",
+                  "Addresses", "Description", "Problem"]
 LINK_COLUMNS = ["Device", "Port", "Neighbor", "Neighbor Port", "Seen by"]
 HOST_COLUMNS = ["MAC Address", "IP Address", "Vendor", "Name", "Switch", "Port", "VLAN", "Found by", "Note"]
 
@@ -16,6 +16,10 @@ DRAWIO_STYLES = {
     "firewall": "fillColor=#ffe6cc;strokeColor=#d79b00;",
     "ap": "fillColor=#e1d5e7;strokeColor=#9673a6;",
     "subnet": "fillColor=#f5f5f5;strokeColor=#6c8ebf;arcSize=50;",
+}
+DRAWIO_GROUP_STYLES = {
+    "site": "rounded=1;arcSize=4;fillColor=#f8f9fb;strokeColor=#7d8ba3;",
+    "building": "rounded=1;arcSize=4;fillColor=#eef4fb;strokeColor=#6c8ebf;dashed=1;",
 }
 
 
@@ -27,7 +31,8 @@ def device_rows(network_map, status_of=lambda key: ""):
     rows = []
     for device in sorted(network_map.devices.values(), key=lambda device: device.label.lower()):
         rows.append([device.label, status_of(device.key), device.mgmt_ip, KIND_NAMES.get(device.kind, device.kind),
-                     device.platform, SOURCE_NAMES.get(device.source, device.source),
+                     network_map.device_group_label(device.key), device.platform,
+                     SOURCE_NAMES.get(device.source, device.source),
                      str(len(network_map.links_of(device.key))), str(hosts.get(device.key, "")),
                      ", ".join(device.addresses), device.sys_descr.splitlines()[0] if device.sys_descr else "",
                      device.error])
@@ -60,19 +65,26 @@ def write_csv(path, columns, rows):
         writer.writerows(rows)
 
 
-def drawio(network_map, positions):
-    """An uncompressed draw.io (mxGraph) file with each device where it is on the map and a labelled edge per
-    link."""
+def drawio(network_map, positions, boxes=()):
+    """An uncompressed draw.io (mxGraph) file with each device where it is on the map, a labelled edge per link, and
+    boxes [(Group, (left, top, width, height))] for sites and buildings, outermost first."""
     nodes = []
     for device in sorted(network_map.devices.values(), key=lambda device: device.key):
         label = device.label + (f"\n{device.mgmt_ip}" if device.mgmt_ip and device.mgmt_ip != device.label else "")
         nodes.append((device.key, label, device.kind, device.source != "snmp"))
-    return drawio_graph(nodes, network_map.links, positions)
+    return drawio_graph(nodes, network_map.links, positions, boxes=boxes)
 
 
-def drawio_graph(nodes, links, positions, name="Network map"):
-    """draw.io XML for [(key, label, kind, dashed)] and Links, with nodes centred on positions."""
+def drawio_graph(nodes, links, positions, name="Network map", boxes=()):
+    """draw.io XML for [(key, label, kind, dashed)] and Links, with nodes centred on positions, and any group
+    boxes behind them."""
     cells = ['<mxCell id="0"/>', '<mxCell id="1" parent="0"/>']
+    for number, (group, (left, top, width, height)) in enumerate(boxes):
+        style = ("whiteSpace=wrap;html=0;verticalAlign=top;align=left;spacingLeft=8;fontStyle=1;"
+                 + DRAWIO_GROUP_STYLES.get(group.kind, ""))
+        cells.append(f'<mxCell id="g{number}" value={quoteattr(group.name)} style={quoteattr(style)} vertex="1" '
+                     f'parent="1"><mxGeometry x="{left:.0f}" y="{top:.0f}" width="{width:.0f}" '
+                     f'height="{height:.0f}" as="geometry"/></mxCell>')
     ids = {}
     for number, (key, label, kind, dashed) in enumerate(nodes):
         ids[key] = f"d{number}"

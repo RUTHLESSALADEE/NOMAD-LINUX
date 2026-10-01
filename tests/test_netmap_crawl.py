@@ -1,3 +1,4 @@
+import re
 import threading
 
 from netmap_fakes import (ACC1_MAC, CORE_MAC, FW_MAC, LAB_MACS, PC1_MAC, PHONE_MAC, PRINTER_MAC, FakeAgentClient,
@@ -53,6 +54,8 @@ def test_per_vlan_community_used_on_catalyst_only():
     crawl(network)
     communities = {community for host, community in network.requests}
     assert {"public@10", "public@1"} <= communities
+    acc1 = {community for host, community in network.requests if host == "10.0.0.11"}
+    assert not acc1 & {"public@20", "public@30", "public@40"}  # VLANs none of its ports use
     assert not any(community.startswith("secret@") for community in communities)  # acc2 is NX-OS
 
 
@@ -143,11 +146,13 @@ def test_progress_events():
     counts = [event[1] for event in events if event[0] == "counts"][-1]
     assert counts["read"] == 4 and counts["no_snmp"] == 1 and counts["reading"] == 0 and counts["queued"] == 0
     steps = {event[2] for event in events if event[0] == "step" and event[1] == "10.0.0.11"}
-    assert {"Trying community 1 of 1", "CDP", "MAC table, VLAN 10 (2 of 2)"} <= steps
+    assert {"Trying community 1 of 1", "CDP", "MAC tables: 2 of 2 VLANs read"} <= steps
     log_lines = [event[1] for event in events if event[0] == "log"]
     assert any(line.startswith("Found acc1.corp.example (10.0.0.11) through CDP on core.corp.example Te1/0/1")
                for line in log_lines)
-    assert any(line.startswith("Read core.corp.example (10.0.0.1): switch, 4 neighbors") for line in log_lines)
+    assert any(re.match(r"Read core\.corp\.example \(10\.0\.0\.1\) in \d+\.\d s.*: switch, 4 neighbors", line)
+               for line in log_lines)
+    assert "acc1.corp.example: MAC tables for the 2 of 5 VLANs its ports use (1, 10)" in log_lines
     assert any("no answer with community 1 of 1" in line for line in log_lines)  # rtr1
     assert not any("secret" in line or "public" in line for line in log_lines)  # Communities stay out of the log
     snapshots = [event[1] for event in events if event[0] == "map"]
@@ -161,3 +166,38 @@ def test_log_says_why_devices_are_not_asked():
     assert "Not asking acc2 (10.0.0.12): it's outside the scope" in log_lines
     _, events = crawl_with_events(max_devices=2)
     assert any(event[1].startswith("Reached the limit of 2 devices") for event in events if event[0] == "log")
+
+
+def test_crawl_from_here_adds_to_a_map():
+    from nomad.netmap.model import Host
+    first = crawl(build_network(), scope=["10.0.0.0/30"])  # Only the core read; the rest seen as neighbors
+    assert first.devices["acc1"].source != SNMP
+    first.hosts.append(Host(mac="", device="acc1", port="Gi1/0/20", name="old-printer", manual=True))
+    core_hosts = [host for host in first.hosts if host.device == "core"]
+
+    network = build_network()
+    settings = CrawlSettings(seeds=["10.0.0.11"], overrides=[("10.0.0.12/32", "secret")], trace=False)
+    newer = Crawler(settings, client_factory=network.client, pinger=network.ping, echo=network.echo,
+                    known=first).run()
+    assert not any(host == "10.0.0.1" for host, _ in network.requests)  # The core was read already
+    assert newer.devices["acc1"].source == SNMP and "core" in newer.devices  # Same key, not a second core
+
+    links_before = len(first.links)
+    added, read = first.merge_crawl(newer)
+    assert read == {"acc1"} and added == []  # acc1 was already on the map, as a neighbor
+    assert first.devices["acc1"].source == SNMP and first.devices["core"].source == SNMP
+    assert len(first.links) == links_before  # The core-acc1 link, seen from both ends, is one link
+    acc1_hosts = {host.port for host in first.hosts if host.device == "acc1"}
+    assert {"Gi1/0/5", "Gi1/0/7", "Gi1/0/20"} <= acc1_hosts  # Found ones, and the one added by hand
+    assert [host for host in first.hosts if host.device == "core"] == core_hosts
+
+
+def test_preview_leaves_the_map_alone():
+    first = crawl(build_network(), scope=["10.0.0.0/30"])
+    network = build_network()
+    newer = Crawler(CrawlSettings(seeds=["10.0.0.11"], trace=False), client_factory=network.client,
+                    pinger=network.ping, echo=network.echo, known=first).run()
+    sources = {key: device.source for key, device in first.devices.items()}
+    preview = first.preview_with(newer)
+    assert preview.devices["acc1"].source == SNMP
+    assert {key: device.source for key, device in first.devices.items()} == sources

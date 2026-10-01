@@ -2,6 +2,10 @@
 
 Devices with a single link (access points, a lone router) sit in a small grid under the device they hang off, so a
 switch with thirty access points doesn't make its layer thirty wide. Positions are the centers of the devices.
+
+The same layers can run left to right, or the devices go in a grid or in rings round the top device; with groups
+(sites and buildings), each group is laid out on its own and the groups' boxes are tiled. Align and distribute
+line up devices the user chose.
 """
 import math
 
@@ -13,6 +17,19 @@ COMPONENT_GAP = 160
 SWEEPS = 4
 PEER_SHARE = 0.6  # Share of the top device's links a neighbor needs to sit beside it
 PEER_MIN_LINKS = 3
+RING_GAP = 230  # Between a circle's rings
+GRID_ROW = NODE_HEIGHT + 50  # Leaves room for a switch's hosts badge
+GROUP_PAD = 24  # Space inside a group's box round what's in it
+GROUP_TITLE = 26  # A group's title bar
+GROUP_GAP = 90  # Between groups' boxes when arranged by group
+DISTRIBUTE_MIN_GAP = 20
+
+# Arrangements
+TOP_DOWN, LEFT_RIGHT, GRID, CIRCLE = "top-down", "left-right", "grid", "circle"
+STYLE_NAMES = {TOP_DOWN: "Top to Bottom", LEFT_RIGHT: "Left to Right", GRID: "Grid", CIRCLE: "Circle"}
+# Lining up
+LEFT, CENTER, RIGHT, TOP, MIDDLE, BOTTOM = "left", "center", "right", "top", "middle", "bottom"
+HORIZONTAL, VERTICAL = "horizontal", "vertical"
 
 
 def leaf_block(count):
@@ -122,7 +139,41 @@ def layout_component(group, adjacent, root=None, weight=lambda node: 0):
     return positions, width
 
 
-def layout(nodes, edges, root=None, weight=lambda node: 0):
+def circle_component(group, adjacent, root=None, weight=lambda node: 0):
+    """Rings round the top device by hops from it, each device near the ones it links to on the ring inside.
+    Returns ({node: (x, y)}, width) with the top-left corner near (0, 0)."""
+    if root not in group:
+        root = max(group, key=lambda node: (len(adjacent[node]), weight(node), node))
+    depth, order = {root: 0}, [root]
+    for node in order:
+        for other in sorted(adjacent[node]):
+            if other not in depth:
+                depth[other] = depth[node] + 1
+                order.append(other)
+    rings = {}
+    for node in order:
+        rings.setdefault(depth[node], []).append(node)
+    angles, radii, radius = {root: -math.pi / 2}, [0], 0
+    for level in range(1, len(rings)):
+        ring = rings[level]
+        wanted = {}
+        for node in ring:  # The circular mean of where its links on the ring inside are
+            inside = [angles[other] for other in adjacent[node] if other in angles]
+            wanted[node] = math.atan2(sum(map(math.sin, inside)), sum(map(math.cos, inside))) if inside else 0
+        ring.sort(key=lambda node: (wanted[node] + math.pi / 2) % (2 * math.pi))
+        radius = max(radius + RING_GAP, len(ring) * (NODE_WIDTH + H_GAP) / (2 * math.pi))
+        radii.append(radius)
+        # The first ring starts at the top; two go either side, as the boxes are wider than they're tall
+        start = wanted[ring[0]] if level > 1 else -math.pi / 2 + (math.pi / 2 if len(ring) == 2 else 0)
+        for number, node in enumerate(ring):
+            angles[node] = start + 2 * math.pi * number / len(ring)
+    center = (radius + NODE_WIDTH / 2, radius + NODE_HEIGHT / 2)
+    positions = {node: (center[0] + radii[depth[node]] * math.cos(angles[node]),
+                        center[1] + radii[depth[node]] * math.sin(angles[node])) for node in order}
+    return positions, 2 * radius + NODE_WIDTH
+
+
+def layout(nodes, edges, root=None, weight=lambda node: 0, component=layout_component):
     """{node: (x, y)} for every node: connected groups side by side, largest first, lone devices in a row after."""
     adjacent = neighbors_of(nodes, edges)
     positions, x = {}, 0
@@ -131,7 +182,7 @@ def layout(nodes, edges, root=None, weight=lambda node: 0):
         if len(group) == 1:
             lone.append(group[0])
             continue
-        placed, width = layout_component(group, adjacent, root, weight)
+        placed, width = component(group, adjacent, root, weight)
         for node, (node_x, node_y) in placed.items():
             positions[node] = (node_x + x, node_y)
         x += width + COMPONENT_GAP
@@ -170,4 +221,144 @@ def merge_positions(nodes, edges, saved, root=None, weight=lambda node: 0):
         while overlaps(point, result.values()):
             point = (point[0] + NODE_WIDTH + H_GAP, point[1])
         result[node] = point
+    return result
+
+
+# ----------------------------------------------------------------- Arranging
+
+
+def arrange_flat(nodes, edges, style=TOP_DOWN, root=None, weight=lambda node: 0):
+    """{node: (x, y)} in one of the arrangements, ignoring groups."""
+    if style == CIRCLE:
+        return layout(nodes, edges, root, weight, component=circle_component)
+    positions = layout(nodes, edges, root, weight)
+    if style == LEFT_RIGHT:  # The layers turned on their side, spaced for boxes that are wider than tall
+        stretch = (NODE_WIDTH + H_GAP) / (NODE_HEIGHT + LEAF_GAP)
+        return {node: (y * stretch, x / stretch) for node, (x, y) in positions.items()}
+    if style == GRID:  # In the order the layers had them, so linked devices stay near each other
+        order = sorted(positions, key=lambda node: (positions[node][1], positions[node][0], node))
+        columns = max(1, round(math.sqrt(len(order) * 1.6 * GRID_ROW / (NODE_WIDTH + H_GAP))))
+        return {node: (NODE_WIDTH / 2 + (number % columns) * (NODE_WIDTH + H_GAP),
+                       NODE_HEIGHT / 2 + (number // columns) * GRID_ROW) for number, node in enumerate(order)}
+    return positions
+
+
+def normalized(positions):
+    """The positions moved so the boxes' top-left corner is at (0, 0), and the (width, height) they take up."""
+    if not positions:
+        return {}, 0, 0
+    left = min(x for x, _ in positions.values()) - NODE_WIDTH / 2
+    top = min(y for _, y in positions.values()) - NODE_HEIGHT / 2
+    moved = {node: (x - left, y - top) for node, (x, y) in positions.items()}
+    return (moved, max(x for x, _ in moved.values()) + NODE_WIDTH / 2,
+            max(y for _, y in moved.values()) + NODE_HEIGHT / 2)
+
+
+def pack(sizes, gap=GROUP_GAP):
+    """Tile blocks of [(width, height)] in rows, in order, about as wide as they're tall (a bit wider, like a
+    screen), each row centered under the widest. Returns the top-left corner of each and the (width, height) of
+    the lot."""
+    if not sizes:
+        return [], 0, 0
+    area = sum((width + gap) * (height + gap) for width, height in sizes)
+    limit = max(max(width for width, _ in sizes), math.sqrt(area * 1.6))
+    rows, x, y, row_height = [[]], 0, 0, 0  # Rows of [index, x, y]
+    for index, (width, height) in enumerate(sizes):
+        if x and x + width > limit:
+            rows.append([])
+            x, y, row_height = 0, y + row_height + gap, 0
+        rows[-1].append((index, x, y))
+        row_height = max(row_height, height)
+        x += width + gap
+    widths = [max(x + sizes[index][0] for index, x, _ in row) for row in rows]
+    corners = [None] * len(sizes)
+    for row, row_width in zip(rows, widths):
+        for index, x, y in row:
+            corners[index] = (x + (max(widths) - row_width) / 2, y)
+    return corners, max(widths), y + row_height
+
+
+def arrange(nodes, edges, style=TOP_DOWN, root=None, weight=lambda node: 0, path_of=None, order=lambda key: key):
+    """{node: (x, y)} in an arrangement. With path_of (node -> [site, building], or fewer, of group keys) each
+    group is arranged on its own inside a box (GROUP_PAD round it, GROUP_TITLE above) and the boxes are tiled,
+    the devices in no group first and then the groups in order(key) order."""
+    path_of = path_of or {}
+    if not any(path_of.get(node) for node in nodes):
+        return arrange_flat(nodes, edges, style, root, weight)
+
+    def place(members, level):
+        direct = [node for node in members if len(path_of.get(node) or ()) <= level]
+        inner = {}
+        for node in members:
+            if len(path_of.get(node) or ()) > level:
+                inner.setdefault(path_of[node][level], []).append(node)
+        blocks = []  # (positions, width, height)
+        if direct:
+            blocks.append(normalized(arrange_flat(direct, edges, style, root if root in direct else None, weight)))
+        for key in sorted(inner, key=order):
+            positions, width, height = place(inner[key], level + 1)
+            blocks.append(({node: (x + GROUP_PAD, y + GROUP_PAD + GROUP_TITLE) for node, (x, y) in positions.items()},
+                           width + 2 * GROUP_PAD, height + 2 * GROUP_PAD + GROUP_TITLE))
+        corners, width, height = pack([(width, height) for _, width, height in blocks])
+        placed = {}
+        for (positions, _, _), (left, top) in zip(blocks, corners):
+            placed.update({node: (x + left, y + top) for node, (x, y) in positions.items()})
+        return placed, width, height
+
+    return place(list(nodes), 0)[0]
+
+
+def arrange_in_place(positions, edges, style=TOP_DOWN, root=None, weight=lambda node: 0, path_of=None,
+                     order=lambda key: key):
+    """Arrange just these devices ({node: (x, y)} where they are now), keeping the top-left corner of the lot
+    where it was."""
+    if not positions:
+        return {}
+    left = min(x for x, _ in positions.values()) - NODE_WIDTH / 2
+    top = min(y for _, y in positions.values()) - NODE_HEIGHT / 2
+    placed, _, _ = normalized(arrange(list(positions), edges, style, root, weight, path_of, order))
+    return {node: (x + left, y + top) for node, (x, y) in placed.items()}
+
+
+def align(positions, how, sizes=None):
+    """Line up {node: (x, y)} by their left, center or right edges, or top, middle or bottom. sizes: {node:
+    (width, height)} where they aren't all device-sized."""
+    if not positions:
+        return {}
+    sizes = sizes or {}
+
+    def half(node, axis):
+        return sizes.get(node, (NODE_WIDTH, NODE_HEIGHT))[axis] / 2
+
+    axis = 0 if how in (LEFT, CENTER, RIGHT) else 1
+    low = min(point[axis] - half(node, axis) for node, point in positions.items())
+    high = max(point[axis] + half(node, axis) for node, point in positions.items())
+    result = {}
+    for node, point in positions.items():
+        if how in (LEFT, TOP):
+            value = low + half(node, axis)
+        elif how in (RIGHT, BOTTOM):
+            value = high - half(node, axis)
+        else:
+            value = (low + high) / 2
+        result[node] = (value, point[1]) if axis == 0 else (point[0], value)
+    return result
+
+
+def distribute(positions, direction, sizes=None):
+    """Space {node: (x, y)} evenly across (horizontal) or down (vertical) between the first and the last, at
+    least DISTRIBUTE_MIN_GAP apart so ones lined up on top of each other spread out."""
+    if len(positions) < 2:
+        return dict(positions)
+    sizes = sizes or {}
+    axis = 0 if direction == HORIZONTAL else 1
+    nodes = sorted(positions, key=lambda node: (positions[node][axis], positions[node][1 - axis], node))
+    extent = [sizes.get(node, (NODE_WIDTH, NODE_HEIGHT))[axis] for node in nodes]
+    start = positions[nodes[0]][axis] - extent[0] / 2
+    end = positions[nodes[-1]][axis] + extent[-1] / 2
+    gap = max(DISTRIBUTE_MIN_GAP, (end - start - sum(extent)) / (len(nodes) - 1))
+    result, edge = {}, start
+    for node, size in zip(nodes, extent):
+        result[node] = (edge + size / 2, positions[node][1]) if axis == 0 else (positions[node][0], edge + size / 2)
+        edge += size + gap
     return result

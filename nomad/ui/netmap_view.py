@@ -1,5 +1,6 @@
-"""The drawing on the Network Map page: devices as boxes you can drag, links with the port at each end, and each
-switch's hosts behind a badge that opens into one box per port."""
+"""The drawing on the Network Map page: devices as boxes you can drag, links with the port at each end, each
+switch's hosts behind a badge that opens into one box per port, and sites and buildings as boxes round their
+devices that can be collapsed into one."""
 import math
 import time
 
@@ -8,10 +9,10 @@ from PyQt5.QtGui import QColor, QFont, QFontMetrics, QImage, QKeySequence, QPain
 from PyQt5.QtWidgets import QGraphicsItem, QGraphicsScene, QGraphicsView, QStyleOptionGraphicsItem
 
 from ..netmap.l3 import HOP, STAR, SUBNET
-from ..netmap.layout import NODE_HEIGHT, NODE_WIDTH
+from ..netmap.layout import GROUP_PAD, GROUP_TITLE, NODE_HEIGHT, NODE_WIDTH
 from ..netmap.monitor import DOWN, UNKNOWN, UP, duration_text
-from ..netmap.model import AP, FIREWALL, KIND_NAMES, NO_SNMP, ROUTER, SHARED_PORT_HOSTS, SNMP, SOURCE_NAMES, SWITCH, \
-    UNREACHABLE
+from ..netmap.model import AP, BUILDING, FIREWALL, GROUP_KINDS, KIND_NAMES, NO_SNMP, ROUTER, SHARED_PORT_HOSTS, SNMP, \
+    SOURCE_NAMES, SWITCH, UNREACHABLE
 from .theme import COLORS
 
 KIND_COLORS = {SWITCH: COLORS["link"], ROUTER: COLORS["accent"], FIREWALL: "#ff9f43", AP: "#c792ea"}
@@ -29,6 +30,8 @@ PROTOCOL_NAMES = {"cdp": "CDP", "lldp": "LLDP", "l3": "address on the subnet", "
 ZOOM_STEP = 1.15
 MIN_ZOOM, MAX_ZOOM = 0.05, 4.0
 LABEL_MIN_ZOOM = 0.5  # Port labels are left off below this zoom
+COLLAPSED_WIDTH, COLLAPSED_HEIGHT = 200, 64
+GROUP_TAGS = {BUILDING: "BLDG"}
 
 
 def small_font(scale=0.85, bold=False):
@@ -77,6 +80,7 @@ class NodeItem(QGraphicsItem):
         self.host_count = 0
         self.expanded = False
         self.highlight = None  # Colour of a ring drawn round it (Compare's added and changed devices)
+        self.group_item = None  # The GroupItem it's directly in
         self.setFlags(QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemIsSelectable
                       | QGraphicsItem.ItemSendsGeometryChanges)
         self.setZValue(2)
@@ -94,13 +98,27 @@ class NodeItem(QGraphicsItem):
             painter.setPen(QPen(color, 4))
             painter.drawPath(ring)
 
+    def center(self):
+        return self.pos()
+
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemPositionHasChanged:
             for link in self.links:
                 link.update_position()
+            if self.group_item is not None and not self.view.groups_suspended:
+                self.group_item.update_rect()
         elif change == QGraphicsItem.ItemSelectedHasChanged:
             self.update()
         return super().itemChange(change, value)
+
+    def mousePressEvent(self, event):
+        super().mousePressEvent(event)
+        if event.button() == Qt.LeftButton:
+            self.view.begin_node_drag(self)
+
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        self.view.node_dragged(self)
 
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
@@ -234,6 +252,8 @@ class DeviceItem(NodeItem):
                     self.port_items.append(item)
                 top += row_height + PORT_GAP
         self.update()
+        if self.group_item is not None:
+            self.group_item.update_rect()
 
     def clear_space(self, width, height):
         """How far below the device (in its coordinates) a block of port boxes fits without covering other
@@ -366,31 +386,252 @@ class SimpleNodeItem(NodeItem):
                          elided(node.detail, detail, self.rect.width() - 10))
 
 
+class GroupItem(QGraphicsItem):
+    """A site or building: a box round its devices (and a site's buildings) with its name on a title bar, or when
+    collapsed one box standing for all of them. Drag the title bar to move everything in it; double-click it to
+    collapse or expand. Clicks inside the box (off the title bar) go to the background, so it can still be dragged
+    to move around."""
+
+    def __init__(self, group, view):
+        super().__init__()
+        self.group, self.key, self.view = group, group.key, view
+        self.members = []  # DeviceItems directly in it
+        self.children = []  # The GroupItems of a site's buildings
+        self.parent_group = None
+        self.links = []  # LinkItems drawn to it while it's collapsed
+        self.rect = QRectF()
+        self.frozen = False  # Kept still while devices are dragged, so they can be dropped out of it
+        self.drop_target = False
+        self.drag_from = None
+        self.dragged = False
+        self.setFlag(QGraphicsItem.ItemIsSelectable)
+        self.setZValue(-1 if group.kind == BUILDING else -2)
+
+    @property
+    def label(self):
+        return self.group.name
+
+    def all_members(self):
+        """Its devices and its buildings' devices."""
+        return self.members + [item for child in self.children for item in child.all_members()]
+
+    def center(self):
+        return self.rect.center()
+
+    def member_rect(self, item):
+        rect = item.sceneBoundingRect()
+        if item.port_items:  # Its hosts' boxes, while they're showing
+            rect = rect.united(item.mapRectToScene(item.childrenBoundingRect()))
+        return rect
+
+    def expanded_rect(self):
+        """The box round everything in it, as if it weren't collapsed."""
+        area = QRectF()
+        for item in self.members:
+            area = area.united(self.member_rect(item))
+        for child in self.children:
+            area = area.united(child.expanded_rect() if not child.group.collapsed else child.rect)
+        if area.isNull():
+            return area
+        return area.adjusted(-GROUP_PAD, -GROUP_PAD - GROUP_TITLE, GROUP_PAD, GROUP_PAD)
+
+    def update_rect(self, propagate=True):
+        if self.frozen:
+            return
+        if self.group.collapsed:
+            items = self.all_members()
+            area = QRectF()
+            for item in items:
+                area = area.united(QRectF(item.pos().x() - NODE_WIDTH / 2, item.pos().y() - NODE_HEIGHT / 2,
+                                          NODE_WIDTH, NODE_HEIGHT))
+            rect = QRectF(0, 0, COLLAPSED_WIDTH, COLLAPSED_HEIGHT)
+            rect.moveCenter(area.center())
+        else:
+            rect = self.expanded_rect()
+        if rect != self.rect:
+            self.prepareGeometryChange()
+            self.rect = rect
+            for link in self.links:
+                link.update_position()
+        if propagate and self.parent_group is not None:
+            self.parent_group.update_rect()
+
+    def title_rect(self):
+        return self.rect if self.group.collapsed else QRectF(self.rect.left(), self.rect.top(), self.rect.width(),
+                                                             GROUP_TITLE)
+
+    def shape(self):
+        path = QPainterPath()
+        path.addRect(self.title_rect())
+        return path
+
+    def boundingRect(self):
+        return self.rect.adjusted(-8, -8, 8, 8)
+
+    def set_drop_target(self, on):
+        if on != self.drop_target:
+            self.drop_target = on
+            self.update()
+
+    def summary(self):
+        members = self.all_members()
+        down = sum(1 for item in members if item.monitor_state is not None and item.monitor_state.status == DOWN)
+        text = f"{len(members)} device{'' if len(members) == 1 else 's'}"
+        if self.children:
+            text += f", {len(self.children)} building{'' if len(self.children) == 1 else 's'}"
+        return text, down
+
+    def paint(self, painter, option, widget=None):
+        if self.rect.isNull():
+            return
+        painter.setRenderHint(QPainter.Antialiasing)
+        building = self.group.kind == BUILDING
+        color = QColor(COLORS["link"] if building else COLORS["accent"])
+        selected = self.isSelected()
+        text, down = self.summary()
+        if self.group.collapsed:
+            self.paint_collapsed(painter, color, selected, text, down)
+            return
+        path = QPainterPath()
+        path.addRoundedRect(self.rect, 10, 10)
+        fill = QColor(color)
+        fill.setAlpha(22 if building else 14)
+        painter.fillPath(path, fill)
+        border = QColor(COLORS["success"] if self.drop_target else COLORS["accent_hover"] if selected else color)
+        if not (self.drop_target or selected):
+            border.setAlpha(150)
+        pen = QPen(border, 2.5 if self.drop_target or selected else 1.4)
+        if self.drop_target:
+            pen.setStyle(Qt.DashLine)
+        painter.setPen(pen)
+        painter.drawPath(path)
+        title = self.title_rect()
+        bar = QPainterPath()
+        bar.addRoundedRect(title, 10, 10)
+        painter.save()
+        painter.setClipRect(title)
+        fill.setAlpha(60 if building else 45)
+        painter.fillPath(bar, fill)
+        painter.restore()
+        name_font = small_font(0.95, bold=True)
+        painter.setFont(name_font)
+        painter.setPen(QColor(COLORS["text"]))
+        name = f"▾ {self.group.name}"
+        name_width = min(QFontMetrics(name_font).horizontalAdvance(name) + 4, title.width() - 20)
+        painter.drawText(QRectF(title.left() + 10, title.top(), name_width, title.height()),
+                         Qt.AlignLeft | Qt.AlignVCenter, elided(name, name_font, name_width))
+        detail = small_font(0.78)
+        painter.setFont(detail)
+        rest = QRectF(title.left() + 18 + name_width, title.top(), title.width() - name_width - 28, title.height())
+        painter.setPen(QColor(COLORS["muted"]))
+        painter.drawText(rest, Qt.AlignLeft | Qt.AlignVCenter,
+                         elided(f"{GROUP_KINDS.get(self.group.kind, '')}  ·  {text}", detail, rest.width()))
+        if down:
+            painter.setPen(QColor(COLORS["error"]))
+            painter.drawText(rest, Qt.AlignRight | Qt.AlignVCenter, f"{down} down")
+
+    def paint_collapsed(self, painter, color, selected, text, down):
+        """A stack of boxes: the top one names the group and says what's in it."""
+        for offset in (8, 4):
+            back = QPainterPath()
+            back.addRoundedRect(self.rect.translated(offset, offset), 8, 8)
+            painter.fillPath(back, QColor(COLORS["panel_alt"]))
+            painter.setPen(QPen(QColor(COLORS["border"]), 1))
+            painter.drawPath(back)
+        path = QPainterPath()
+        path.addRoundedRect(self.rect, 8, 8)
+        painter.fillPath(path, QColor(COLORS["panel"]))
+        strip_rect = QRectF(self.rect.left(), self.rect.top(), STRIP_WIDTH + 6, self.rect.height())
+        strip = QPainterPath()
+        strip.addRoundedRect(strip_rect, 8, 8)
+        faded = QColor(color)
+        faded.setAlpha(60)
+        painter.save()
+        painter.setClipRect(strip_rect)
+        painter.fillPath(strip, faded)
+        painter.restore()
+        if down:
+            tint = QColor(COLORS["error"])
+            tint.setAlpha(45)
+            painter.fillPath(path, tint)
+        painter.setPen(QPen(QColor(COLORS["accent_hover"]) if selected else color, 3 if selected else 1.8))
+        painter.drawPath(path)
+        painter.setPen(color)
+        painter.setFont(small_font(0.72, bold=True))
+        painter.drawText(strip_rect, Qt.AlignCenter, GROUP_TAGS.get(self.group.kind, "SITE"))
+        left = strip_rect.right() + 6
+        width = self.rect.right() - left - 6
+        name_font = small_font(0.95, bold=True)
+        painter.setFont(name_font)
+        painter.setPen(QColor(COLORS["text"]))
+        painter.drawText(QRectF(left, self.rect.top() + 5, width, 18), Qt.AlignLeft | Qt.AlignVCenter,
+                         elided(self.group.name, name_font, width))
+        detail = small_font(0.8)
+        painter.setFont(detail)
+        painter.setPen(QColor(COLORS["muted"]))
+        painter.drawText(QRectF(left, self.rect.top() + 24, width, 15), Qt.AlignLeft | Qt.AlignVCenter,
+                         elided(text, detail, width))
+        painter.setPen(QColor(COLORS["error"] if down else COLORS["muted"]))
+        painter.drawText(QRectF(left, self.rect.top() + 40, width, 15), Qt.AlignLeft | Qt.AlignVCenter,
+                         f"{down} down" if down else "▸ double-click to expand")
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            event.ignore()
+            return
+        if not event.modifiers() & Qt.ControlModifier:
+            self.scene().clearSelection()
+        self.setSelected(not self.isSelected() if event.modifiers() & Qt.ControlModifier else True)
+        self.drag_from, self.dragged = event.scenePos(), False
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self.drag_from is None:
+            return
+        delta = event.scenePos() - self.drag_from
+        self.drag_from = event.scenePos()
+        self.dragged = True
+        self.view.move_group(self, delta)
+
+    def mouseReleaseEvent(self, event):
+        self.drag_from = None
+        if self.dragged:
+            self.view.on_item_moved()
+
+    def mouseDoubleClickEvent(self, event):
+        self.view.set_collapsed(self, not self.group.collapsed)
+        event.accept()
+
+
 class LinkItem(QGraphicsItem):
     """The links between two devices: one line, with the ports at each end (and "×2" for a port-channel's
-    members)."""
+    members). Either end can be a collapsed group, standing in for the devices in it."""
 
-    def __init__(self, a_item, b_item, links):
+    def __init__(self, a_item, b_item, links, ends, label_of):
+        """ends: for each link, its (device on a_item's side, device on b_item's side)."""
         super().__init__()
-        self.a_item, self.b_item, self.links = a_item, b_item, links
+        self.a_item, self.b_item, self.links, self.ends = a_item, b_item, links, ends
         self.line = QLineF()
         self.setZValue(0)
-        a, b = a_item.key, b_item.key
         self.traced = all(link.protocols == ["icmp"] for link in links)
         self.setToolTip("\n".join(
-            f"{a_item.label} {link.port_on(a)}  —  {b_item.label} {link.port_on(b)}  "
-            f"({' + '.join(PROTOCOL_NAMES.get(protocol, protocol) for protocol in link.protocols)})" for link in links))
+            f"{label_of(a)} {link.port_on(a)}  —  {label_of(b)} {link.port_on(b)}  "
+            f"({' + '.join(PROTOCOL_NAMES.get(protocol, protocol) for protocol in link.protocols)})"
+            for link, (a, b) in zip(links, ends)))
         a_item.links.append(self)
         b_item.links.append(self)
         self.update_position()
 
     def ports_text(self, item):
-        ports = [port for port in (link.port_on(item.key) for link in self.links) if port]
+        if isinstance(item, GroupItem):
+            return ""  # Which device in it is in the tooltip
+        side = 0 if item is self.a_item else 1
+        ports = [port for port in (link.port_on(ends[side]) for link, ends in zip(self.links, self.ends)) if port]
         return ", ".join(ports) if len(ports) <= 2 else f"{len(ports)} ports"
 
     def update_position(self):
         self.prepareGeometryChange()
-        self.line = QLineF(self.a_item.pos(), self.b_item.pos())
+        self.line = QLineF(self.a_item.center(), self.b_item.center())
 
     def boundingRect(self):
         return QRectF(self.line.p1(), self.line.p2()).normalized().adjusted(-90, -20, 90, 20)
@@ -443,6 +684,9 @@ class MapView(QGraphicsView):
     positions_changed = pyqtSignal()
     context_requested = pyqtSignal(str, object)  # Node key, global position
     port_context_requested = pyqtSignal(str, str, object)  # Switch key, port, global position
+    group_context_requested = pyqtSignal(str, object)  # Group key, global position
+    groups_changed = pyqtSignal()  # A group was collapsed or expanded here
+    devices_dropped = pyqtSignal(object)  # {device key: group key, or "" for none} after a drag in or out of one
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -457,6 +701,11 @@ class MapView(QGraphicsView):
         self.setBackgroundBrush(QColor(COLORS["background"]))
         self.items_by_key = {}
         self.link_items = []
+        self.links = []
+        self.group_items = {}
+        self.groups_suspended = False  # Moving many devices at once: the groups' boxes are updated after
+        self.groups_editable = True  # Dragging devices in and out of groups (not while crawling)
+        self.drag = None  # Devices being dragged: {"moving": set of items, "start": {item: position}}
         self.network_map = None
         self.fit_pending = False
         self.auto_fit = False  # Fitted automatically and not zoomed or panned since: refit when resized
@@ -464,38 +713,219 @@ class MapView(QGraphicsView):
 
     def set_map(self, network_map, positions):
         self.scene().clear()
-        self.items_by_key, self.link_items = {}, []
-        self.network_map = network_map
+        self.items_by_key, self.link_items, self.group_items, self.drag = {}, [], {}, None
+        self.network_map, self.links = network_map, network_map.links
+        self.groups_suspended = True
         for key, device in network_map.devices.items():
             item = DeviceItem(device, network_map.hosts_by_port(key), self)
             item.setPos(*positions.get(key, (0, 0)))
             self.scene().addItem(item)
             self.items_by_key[key] = item
-        self.add_links(network_map.links)
+        self.groups_suspended = False
+        self.rebuild_groups()
         self.update_scene_rect()
 
     def set_graph(self, nodes, links, positions):
         """Show the logical view: l3.L3Nodes (devices drawn as on the physical view) and the links between them."""
         self.scene().clear()
-        self.items_by_key, self.link_items = {}, []
-        self.network_map = None
+        self.items_by_key, self.link_items, self.group_items, self.drag = {}, [], {}, None
+        self.network_map, self.links = None, links
         for key, node in nodes.items():
             item = DeviceItem(node.device, {}, self) if node.device is not None else SimpleNodeItem(node, self)
             item.setPos(*positions.get(key, (0, 0)))
             self.scene().addItem(item)
             self.items_by_key[key] = item
-        self.add_links(links)
+        self.rebuild_links()
         self.update_scene_rect()
 
-    def add_links(self, links):
+    def rebuild_links(self):
+        """One line per pair of things showing: a device, or the collapsed group standing in for it."""
+        for item in self.link_items:
+            self.scene().removeItem(item)
+        for item in list(self.items_by_key.values()) + list(self.group_items.values()):
+            item.links = []
+        self.link_items = []
         pairs = {}
-        for link in links:
-            if link.a in self.items_by_key and link.b in self.items_by_key:
-                pairs.setdefault(tuple(sorted((link.a, link.b))), []).append(link)
-        for (a, b), grouped in pairs.items():
-            item = LinkItem(self.items_by_key[a], self.items_by_key[b], grouped)
+        for link in self.links:
+            if link.a not in self.items_by_key or link.b not in self.items_by_key:
+                continue
+            a_item, b_item = self.representative(link.a), self.representative(link.b)
+            if a_item is b_item:
+                continue  # Inside a collapsed group
+            if id(a_item) > id(b_item):
+                a_item, b_item = b_item, a_item
+            ends = (link.a, link.b) if self.representative(link.a) is a_item else (link.b, link.a)
+            entry = pairs.setdefault((id(a_item), id(b_item)), (a_item, b_item, [], []))
+            entry[2].append(link)
+            entry[3].append(ends)
+        for a_item, b_item, links, ends in pairs.values():
+            item = LinkItem(a_item, b_item, links, ends, lambda key: self.items_by_key[key].label)
             self.scene().addItem(item)
             self.link_items.append(item)
+
+    # ----------------------------------------------------------------- Groups
+
+    def rebuild_groups(self):
+        """Draw the map's sites and buildings again (after they changed), and the links to collapsed ones."""
+        for item in self.group_items.values():
+            self.scene().removeItem(item)
+        self.group_items, self.drag = {}, None
+        for item in self.items_by_key.values():
+            item.group_item = None
+        if self.network_map is not None:
+            for group in self.network_map.groups:
+                item = GroupItem(group, self)
+                self.scene().addItem(item)
+                self.group_items[group.key] = item
+            for item in self.group_items.values():
+                item.parent_group = self.group_items.get(item.group.parent)
+                if item.parent_group is not None:
+                    item.parent_group.children.append(item)
+            for key, group_key in self.network_map.group_of.items():
+                item, group_item = self.items_by_key.get(key), self.group_items.get(group_key)
+                if item is not None and group_item is not None:
+                    item.group_item = group_item
+                    group_item.members.append(item)
+        self.apply_collapsed()
+
+    def representative(self, key):
+        """What's drawn for a device: itself, or the outermost collapsed group it's in."""
+        item = self.items_by_key[key]
+        shown, group = item, item.group_item
+        while group is not None:
+            if group.group.collapsed:
+                shown = group
+            group = group.parent_group
+        return shown
+
+    def apply_collapsed(self):
+        for key, item in self.items_by_key.items():
+            visible = self.representative(key) is item
+            if not visible:
+                item.setSelected(False)
+            item.setVisible(visible)
+        for item in self.group_items.values():
+            parent = item.parent_group
+            item.setVisible(parent is None or not parent.group.collapsed)
+            # Collapsed, it stands in for a device: over the links to it rather than under everything
+            item.setZValue(2 if item.group.collapsed else -1 if item.group.kind == BUILDING else -2)
+        self.rebuild_links()
+        self.update_groups()
+
+    def set_collapsed(self, group_item, collapsed):
+        group_item.group.collapsed = collapsed
+        self.apply_collapsed()
+        self.update_scene_rect()
+        self.groups_changed.emit()
+
+    def set_all_collapsed(self, collapsed):
+        for item in self.group_items.values():
+            item.group.collapsed = collapsed
+        self.apply_collapsed()
+        self.update_scene_rect()
+        self.groups_changed.emit()
+
+    def update_groups(self):
+        """Fit every group's box round what's in it: buildings first, then the sites round them."""
+        for item in sorted(self.group_items.values(), key=lambda item: item.parent_group is None):
+            item.update_rect(propagate=False)
+
+    def reveal(self, key):
+        """Expand the collapsed groups hiding a device. Returns True if any were."""
+        item = self.items_by_key.get(key)
+        group = item.group_item if item is not None else None
+        opened = False
+        while group is not None:
+            if group.group.collapsed:
+                group.group.collapsed, opened = False, True
+            group = group.parent_group
+        if opened:
+            self.apply_collapsed()
+            self.update_scene_rect()
+            self.groups_changed.emit()
+        return opened
+
+    def move_group(self, group_item, delta):
+        self.groups_suspended = True
+        for item in group_item.all_members():
+            item.moveBy(delta.x(), delta.y())
+        self.groups_suspended = False
+        self.update_groups()
+
+    def move_to(self, positions):
+        """Move devices to {key: (x, y)}, as when the user drags them (the layout's saved)."""
+        self.groups_suspended = True
+        for key, (x, y) in positions.items():
+            if key in self.items_by_key:
+                self.items_by_key[key].setPos(x, y)
+        self.groups_suspended = False
+        self.update_groups()
+        self.update_scene_rect()
+        self.positions_changed.emit()
+
+    def selected_keys(self):
+        """The devices selected (on the logical view, any node), in the order they're drawn."""
+        return [key for key, item in self.items_by_key.items() if item.isSelected() and item.isVisible()]
+
+    def selected_group(self):
+        groups = [item for item in self.scene().selectedItems() if isinstance(item, GroupItem)]
+        return groups[0].key if len(groups) == 1 else None
+
+    def sizes(self, keys):
+        return {key: (self.items_by_key[key].rect.width(), self.items_by_key[key].rect.height()) for key in keys}
+
+    def group_boxes(self):
+        """[(group, (left, top, width, height))] for each group as if expanded (for draw.io), sites first."""
+        boxes = []
+        for item in sorted(self.group_items.values(), key=lambda item: item.parent_group is not None):
+            rect = item.expanded_rect()
+            if not rect.isNull():
+                boxes.append((item.group, (rect.left(), rect.top(), rect.width(), rect.height())))
+        return boxes
+
+    def begin_node_drag(self, item):
+        """Devices are about to be dragged: groups they're not all of stay still, so they can be dropped out."""
+        if not self.group_items or not self.groups_editable:
+            self.drag = None
+            return
+        moving = {other for other in self.scene().selectedItems() if isinstance(other, NodeItem)} | {item}
+        self.drag = {"moving": moving, "start": {other: QPointF(other.pos()) for other in moving}}
+        for group_item in self.group_items.values():
+            group_item.frozen = not set(group_item.all_members()) <= moving
+
+    def drop_target(self, point):
+        """The innermost group showing whose box (as it was when the drag started) holds the point."""
+        found = [item for item in self.group_items.values()
+                 if item.frozen and item.isVisible() and not item.group.collapsed and item.rect.contains(point)]
+        return min(found, key=lambda item: item.rect.width() * item.rect.height(), default=None)
+
+    def node_dragged(self, item):
+        if self.drag is None:
+            return
+        target = self.drop_target(item.pos())
+        for group_item in self.group_items.values():
+            group_item.set_drop_target(group_item is target and target is not item.group_item)
+
+    def end_node_drag(self):
+        """Devices dropped: into a group's box puts them in it, out of their group's box takes them out."""
+        drag, self.drag = self.drag, None
+        if drag is None:
+            return {}
+        changes = {}
+        for item in drag["moving"]:
+            if item.pos() == drag["start"][item] or not isinstance(item, DeviceItem):
+                continue
+            current = item.group_item
+            if current is not None and not current.frozen:
+                continue  # Its whole group moved with it
+            target = self.drop_target(item.pos())
+            if target is not current:
+                changes[item.key] = target.key if target is not None else ""
+        for group_item in self.group_items.values():
+            group_item.frozen = False
+            group_item.set_drop_target(False)
+        self.update_groups()
+        return changes
 
     def set_statuses(self, status_of):
         """Monitoring: status_of(key) gives a device's monitor.DeviceStatus, or None if it isn't monitored."""
@@ -505,6 +935,8 @@ class MapView(QGraphicsView):
                 if state is not item.monitor_state or state is not None:
                     item.monitor_state = state
                     item.update()
+        for item in self.group_items.values():
+            item.update()  # How many in it are down
 
     def set_highlights(self, colors):
         """Ring the items in {key: colour}; clear the rest."""
@@ -579,7 +1011,7 @@ class MapView(QGraphicsView):
     def keyPressEvent(self, event):
         if event.matches(QKeySequence.SelectAll):
             for item in self.items_by_key.values():
-                item.setSelected(True)
+                item.setSelected(item.isVisible())
             event.accept()
         else:
             super().keyPressEvent(event)
@@ -605,6 +1037,7 @@ class MapView(QGraphicsView):
         item = self.items_by_key.get(key)
         if item is None:
             return False
+        self.reveal(key)
         self.auto_fit = False
         self.scene().clearSelection()
         item.setSelected(True)
@@ -616,6 +1049,8 @@ class MapView(QGraphicsView):
         items = [self.items_by_key[key] for key in keys if key in self.items_by_key]
         if not items:
             return False
+        for key in keys:
+            self.reveal(key)
         self.auto_fit = False
         self.scene().clearSelection()
         area = QRectF()
@@ -629,11 +1064,28 @@ class MapView(QGraphicsView):
             self.centerOn(area.center())
         return True
 
+    def show_group(self, key):
+        item = self.group_items.get(key)
+        if item is None:
+            return False
+        parent = item.parent_group
+        if parent is not None and parent.group.collapsed:
+            parent.group.collapsed = False
+            self.apply_collapsed()
+            self.groups_changed.emit()
+        self.auto_fit = False
+        self.scene().clearSelection()
+        item.setSelected(True)
+        self.ensureVisible(item.rect, 40, 40)
+        self.centerOn(item.rect.center())
+        return True
+
     def show_host(self, host):
         """Open the host's switch and select its port."""
         item = self.items_by_key.get(host.device)
         if item is None:
             return False
+        self.reveal(host.device)
         item.set_expanded(True)
         self.auto_fit = False
         for port_item in item.port_items:
@@ -657,6 +1109,9 @@ class MapView(QGraphicsView):
                 return self.show_device(key)
         if self.network_map is None:
             return False
+        for group_item in self.group_items.values():
+            if text in group_item.group.name.lower():
+                return self.show_group(group_item.key)
         for host in self.network_map.hosts:
             mac = host.mac.replace("-", "").lower()
             if (len(compact) >= 4 and compact in mac) or any(text in value.lower() for value in (host.ip, host.name,
@@ -679,8 +1134,11 @@ class MapView(QGraphicsView):
             self.update_scene_rect()
 
     def on_item_moved(self):
+        changes = self.end_node_drag()
         self.update_scene_rect()
         self.positions_changed.emit()
+        if changes:
+            self.devices_dropped.emit(changes)
 
     def on_selection_changed(self):
         try:
@@ -690,8 +1148,10 @@ class MapView(QGraphicsView):
         nodes = [item for item in selected if isinstance(item, NodeItem)]
         if not selected:
             self.selection_changed.emit(None)
-        elif len(nodes) > 1:
+        elif len(nodes) > 1 or (nodes and len(selected) > len(nodes)):
             self.selection_changed.emit(("many", len(nodes)))
+        elif isinstance(selected[0], GroupItem):
+            self.selection_changed.emit(("group", selected[0].key))
         elif isinstance(selected[0], DeviceItem):
             self.selection_changed.emit(("device", selected[0].key))
         elif isinstance(selected[0], SimpleNodeItem):
@@ -706,6 +1166,12 @@ class MapView(QGraphicsView):
                 self.scene().clearSelection()
                 item.setSelected(True)
             self.port_context_requested.emit(item.parentItem().key, item.port, event.globalPos())
+            return
+        if isinstance(item, GroupItem):
+            if not item.isSelected():
+                self.scene().clearSelection()
+                item.setSelected(True)
+            self.group_context_requested.emit(item.key, event.globalPos())
             return
         while item is not None and not isinstance(item, NodeItem):
             item = item.parentItem()

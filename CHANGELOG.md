@@ -6,6 +6,19 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-10-01
+
+### Changed
+
+- Network Map: Crawl from Here adds what it finds to the map open (in the same file, keeping the layout, hosts added by hand and monitoring history) instead of making a new map. It reads that device and what's beyond it, not the devices already read; Start still makes a new map.
+- Network Map: faster crawls. 16 devices are read at once instead of 8 (Scope > Devices read at once, up to 64), each SNMP request asks for 50 rows instead of 25, and MAC tables are read by their port and status columns only. On Catalyst IOS, MAC tables are read only for the VLANs the switch's access, voice and native trunk ports use (a VTP domain can list hundreds it doesn't carry), four at a time, and for every VLAN if the switch doesn't say.
+
+### Added
+
+- Network Map: sites and buildings. Select devices, right-click > Group > New Site or Building... to draw a labelled box round them; a building can be in a site. Drag devices into a box to add them or out of it to take them out, and drag a box's title to move everything in it. Double-click the title to collapse a group into one box that keeps its links to the rest of the map (finding a device in it opens it). Selecting a group shows its devices, how many are down and its links out; right-click its title to arrange, rename, move a building to another site, or ungroup. Groups are saved with the map and carried over when you map again, the Devices tab and its CSV have a Group column, and draw.io exports include the boxes.
+- Network Map: more ways to arrange. Re-arrange's arrow offers Top to Bottom (as before), Left to Right, Grid and Circle (rings round the core), remembered for next time; with Keep Sites and Buildings Together (on by default) each group is laid out in its own box and the boxes are tiled. Arrange the devices selected where they are, or Align them (left, center, right, top, middle, bottom) and Distribute them evenly across or down, from the arrow or by right-clicking them. Put at the Top uses the arrangement chosen.
+- Network Map: the Crawl log says how long each device took and its slowest step (such as "Read core-1 in 14.2 s (slowest: MAC tables 9.8 s)"), and which VLANs' MAC tables were read on each Catalyst.
+
 ## [1.10.1] - 2026-09-30
 
 ### Added

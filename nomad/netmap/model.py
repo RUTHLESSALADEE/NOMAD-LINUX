@@ -18,6 +18,10 @@ NO_SNMP = "no-snmp"  # Answers ping but not SNMP (wrong community or an ACL)
 UNREACHABLE = "unreachable"  # Answered neither SNMP nor ping
 SOURCE_NAMES = {SNMP: "SNMP", NEIGHBOR: "Seen as a neighbor", NO_SNMP: "Pings, no SNMP", UNREACHABLE: "Unreachable"}
 
+# Groups of devices on the map: sites, which can hold buildings
+SITE, BUILDING = "site", "building"
+GROUP_KINDS = {SITE: "Site", BUILDING: "Building"}
+
 SHARED_PORT_HOSTS = 8  # More MACs than this on a port with no neighbor: probably an unmanaged switch or a hypervisor
 
 PORT_PREFIXES = [  # Longest first, so TenGigabitEthernet isn't taken for GigabitEthernet
@@ -129,6 +133,17 @@ class Trace:
 
 
 @dataclass
+class Group:
+    """A site or building drawn as a box round its devices. A building can be in a site; a site can't be in
+    anything."""
+    key: str
+    name: str
+    kind: str = SITE
+    parent: str = ""  # A building's site ("" if it isn't in one)
+    collapsed: bool = False  # Drawn as one box, with its links to the rest of the map
+
+
+@dataclass
 class NetworkMap:
     devices: dict = field(default_factory=dict)  # key -> Device
     links: list = field(default_factory=list)
@@ -142,6 +157,8 @@ class NetworkMap:
     traces: list = field(default_factory=list)  # [Trace]
     l3_positions: dict = field(default_factory=dict)  # Node key -> [x, y] on the logical (L3) view
     status_log: list = field(default_factory=list)  # Monitoring: [[time, device key, label, up/down, text]]
+    groups: list = field(default_factory=list)  # [Group]
+    group_of: dict = field(default_factory=dict)  # Device key -> key of the group it's directly in
 
     def add_link(self, link):
         """Add a link, merging it with the same link seen from the other end (or by the other protocol)."""
@@ -153,6 +170,48 @@ class NetworkMap:
                 return existing
         self.links.append(link)
         return link
+
+    def merge_crawl(self, newer, hosts=True):
+        """Add a crawl from part of the network (Crawl from Here) to this map. Devices it read replace what this map
+        had for them; ones it only saw as neighbors don't replace devices this map read. Its links are added, and
+        the switches it read get its hosts (hand-added ones stay, or give their name and note to the host found).
+        Returns (new device keys, keys of devices it read)."""
+        added = [key for key in newer.devices if key not in self.devices]
+        read = {key for key, device in newer.devices.items() if device.source == SNMP}
+        for key, device in newer.devices.items():
+            old = self.devices.get(key)
+            if old is None or device.source == SNMP or (old.source != SNMP and device.source != NEIGHBOR):
+                self.devices[key] = device
+        for link in newer.links:
+            self.add_link(Link(link.a, link.a_port, link.b, link.b_port, list(link.protocols)))
+        if hosts:
+            found_macs = {host.mac for host in newer.hosts if host.mac}
+            kept = [host for host in self.hosts
+                    if host.manual or (host.device not in read and host.mac not in found_macs)]
+            new_hosts = list(newer.hosts)
+            for manual in [host for host in kept if host.manual]:
+                found = next((host for host in new_hosts if host.same_as(manual)), None)
+                if found is not None:
+                    found.name, found.note = found.name or manual.name, found.note or manual.note
+                    kept.remove(manual)
+            self.hosts = [host for host in kept + new_hosts if host.device in self.devices]
+            self.hosts.sort(key=lambda host: (self.devices[host.device].label.lower(), port_key(host.port), host.mac))
+            traces = {item.target: item for item in self.traces}
+            traces.update({item.target: item for item in newer.traces})
+            self.traces = list(traces.values())
+            self.finished, self.stopped = newer.finished, newer.stopped
+        return added, read
+
+    def preview_with(self, newer):
+        """This map with a crawl's devices and links so far added (for drawing Crawl from Here as it goes), leaving
+        this map as it was."""
+        preview = NetworkMap(seeds=self.seeds, started=self.started, positions=dict(self.positions), root=self.root)
+        preview.devices = dict(self.devices)
+        preview.links = [Link(link.a, link.a_port, link.b, link.b_port, list(link.protocols)) for link in self.links]
+        preview.hosts = list(self.hosts)
+        preview.groups, preview.group_of = self.groups, dict(self.group_of)
+        preview.merge_crawl(newer, hosts=False)
+        return preview
 
     def carry_manual_hosts(self, older):
         """Bring the hosts added by hand to an earlier map of the network over to this one. One that has since
@@ -170,6 +229,91 @@ class NetworkMap:
                 dropped.append(manual)
         self.hosts.sort(key=lambda host: (self.devices[host.device].label.lower(), port_key(host.port), host.mac))
         return dropped
+
+    # ----------------------------------------------------------------- Groups
+
+    def group(self, key):
+        return next((group for group in self.groups if group.key == key), None)
+
+    def new_group(self, name, kind=SITE, parent=""):
+        used = {group.key for group in self.groups}
+        number = 1
+        while f"g{number}" in used:
+            number += 1
+        group = Group(f"g{number}", name, kind, parent if kind == BUILDING else "")
+        self.groups.append(group)
+        return group
+
+    def subgroups(self, key):
+        return [group for group in self.groups if group.parent == key]
+
+    def group_path(self, device_key):
+        """The groups a device is in, outermost first: [], [site], [building] or [site, building]."""
+        path = []
+        group = self.group(self.group_of.get(device_key, ""))
+        while group is not None and group not in path:
+            path.insert(0, group)
+            group = self.group(group.parent)
+        return path
+
+    def group_label(self, group):
+        """"Site / Building", or just the group's name if it's a site or isn't in one."""
+        parent = self.group(group.parent)
+        return f"{parent.name} / {group.name}" if parent is not None else group.name
+
+    def device_group_label(self, device_key):
+        path = self.group_path(device_key)
+        return self.group_label(path[-1]) if path else ""
+
+    def members(self, key, deep=True):
+        """Keys of the devices in a group (and, deep, in its buildings)."""
+        keys = {key} | ({group.key for group in self.subgroups(key)} if deep else set())
+        return [device for device, group in self.group_of.items() if group in keys]
+
+    def set_group(self, device_keys, key):
+        """Put devices in a group, or take them out of theirs with key "". Empty groups are removed."""
+        for device in device_keys:
+            if key:
+                self.group_of[device] = key
+            else:
+                self.group_of.pop(device, None)
+        self.prune_groups()
+
+    def remove_group(self, key):
+        """Ungroup: a building's devices go to its site; a site's buildings stand on their own and its devices
+        are left in no group."""
+        group = self.group(key)
+        if group is None:
+            return
+        for building in self.subgroups(key):
+            building.parent = ""
+        for device in self.members(key, deep=False):
+            if group.parent:
+                self.group_of[device] = group.parent
+            else:
+                del self.group_of[device]
+        self.groups.remove(group)
+        self.prune_groups()
+
+    def prune_groups(self):
+        """Forget devices no longer on the map and groups with nothing in them."""
+        keys = {group.key for group in self.groups}
+        sites = {group.key for group in self.groups if group.kind == SITE}
+        self.group_of = {device: group for device, group in self.group_of.items()
+                         if device in self.devices and group in keys}
+        for group in self.groups:
+            if group.kind != BUILDING or group.parent not in sites:
+                group.parent = ""
+        used = set(self.group_of.values())
+        buildings = [group for group in self.groups if group.kind == BUILDING and group.key in used]
+        used |= {group.parent for group in buildings}
+        self.groups = [group for group in self.groups if group.key in used]
+
+    def carry_groups(self, older):
+        """Bring an earlier map's sites and buildings over, with the devices still on this map in them."""
+        self.groups = [Group(**asdict(group)) for group in older.groups]
+        self.group_of = dict(older.group_of)
+        self.prune_groups()
 
     def links_of(self, key):
         return [link for link in self.links if key in (link.a, link.b)]
@@ -205,6 +349,9 @@ class NetworkMap:
         network_map.traces = [_build(Trace, item) for item in data.get("traces", [])]
         network_map.l3_positions = {key: tuple(value) for key, value in data.get("l3_positions", {}).items()}
         network_map.status_log = [list(entry) for entry in data.get("status_log", [])]
+        network_map.groups = [_build(Group, item) for item in data.get("groups", [])]
+        network_map.group_of = dict(data.get("group_of", {}))
+        network_map.prune_groups()
         return network_map
 
 
