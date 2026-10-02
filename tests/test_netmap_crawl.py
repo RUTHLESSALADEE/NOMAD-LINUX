@@ -201,3 +201,17 @@ def test_preview_leaves_the_map_alone():
     preview = first.preview_with(newer)
     assert preview.devices["acc1"].source == SNMP
     assert {key: device.source for key, device in first.devices.items()} == sources
+
+
+def test_deleted_devices_are_left_out_and_not_crawled_through():
+    network = build_network()
+    network_map = crawl(network, deleted={"acc2": ["10.0.0.12"]})
+    assert "acc2" not in network_map.devices
+    assert not any("acc2" in (link.a, link.b) for link in network_map.links)
+    assert not any(host == "10.0.0.12" for host, _ in network.requests)  # Not crawled through
+    assert {"core", "acc1", "rtr1", "pa-fw1"} <= set(network_map.devices)
+
+
+def test_a_deleted_device_the_crawl_starts_from_is_mapped():
+    network_map = crawl(build_network(), seeds=["10.0.0.12"], deleted={"acc2": ["10.0.0.12"]})
+    assert "acc2" in network_map.devices

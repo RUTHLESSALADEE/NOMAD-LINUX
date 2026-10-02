@@ -4,7 +4,7 @@ Speaks the protocol directly (BER encoding over UDP), so nothing extra needs ins
 """
 import os
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 SNMP_PORT = 161
@@ -16,6 +16,10 @@ INTEGER, OCTET_STRING, NULL, OBJECT_ID, SEQUENCE = 0x02, 0x04, 0x05, 0x06, 0x30
 IP_ADDRESS, COUNTER32, GAUGE32, TIMETICKS, OPAQUE, COUNTER64 = 0x40, 0x41, 0x42, 0x43, 0x44, 0x46
 NO_SUCH_OBJECT, NO_SUCH_INSTANCE, END_OF_MIB_VIEW = 0x80, 0x81, 0x82
 GET, GET_NEXT, RESPONSE, GET_BULK = 0xA0, 0xA1, 0xA2, 0xA5
+TRAP_V1, INFORM, TRAP_V2 = 0xA4, 0xA6, 0xA7
+TRAP_PORT = 162
+SNMP_TRAP_OID = (1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0)  # snmpTrapOID.0: which trap a v2c trap is
+SNMP_TRAPS = (1, 3, 6, 1, 6, 3, 1, 1, 5)  # coldStart.1, warmStart.2, linkDown.3, linkUp.4, ...: v1 generic traps + 1
 TYPE_NAMES = {INTEGER: "Integer", OCTET_STRING: "String", NULL: "Null", OBJECT_ID: "OID", IP_ADDRESS: "IpAddress",
               COUNTER32: "Counter32", GAUGE32: "Gauge32", TIMETICKS: "Timeticks", OPAQUE: "Opaque",
               COUNTER64: "Counter64", NO_SUCH_OBJECT: "No such object", NO_SUCH_INSTANCE: "No such instance",
@@ -250,6 +254,93 @@ def parse_response(data, request_id=None):
         return error_status, error_index, results
     except IndexError:
         raise ValueError("Truncated response.") from None
+
+
+# ----------------------------------------------------------------- Traps
+
+@dataclass
+class Trap:
+    """A trap (or inform) a device sent."""
+    version: int
+    community: str
+    trap_oid: tuple  # Which trap: linkUp is 1.3.6.1.6.3.1.1.5.4 whichever version sent it
+    agent: str = ""  # The address a v1 trap says it's from ("" for v2c: use the sender's address)
+    varbinds: list = field(default_factory=list)  # [(oid, Value)]
+    inform: bool = False
+    request_id: int = 0
+
+
+def _varbinds(raw):
+    results, offset = [], 0
+    while offset < len(raw):
+        _, varbind, offset = read_tlv(raw, offset)
+        _, oid_raw, inner = read_tlv(varbind, 0)
+        value_tag, value_raw, _ = read_tlv(varbind, inner)
+        results.append((decode_oid(oid_raw), decode_value(value_tag, value_raw)))
+    return results
+
+
+def parse_trap(data):
+    """A v1 Trap-PDU, v2c SNMPv2-Trap or inform. Raises ValueError if it isn't one."""
+    try:
+        tag, message, _ = read_tlv(data, 0)
+        if tag != SEQUENCE:
+            raise ValueError("Not an SNMP message.")
+        _, version_raw, offset = read_tlv(message, 0)
+        _, community, offset = read_tlv(message, offset)
+        pdu_type, pdu, _ = read_tlv(message, offset)
+        version = int.from_bytes(version_raw, "big") if version_raw else 0
+        community = bytes(community).decode("utf-8", "replace")
+        if pdu_type == TRAP_V1:
+            _, enterprise, offset = read_tlv(pdu, 0)
+            agent_tag, agent_raw, offset = read_tlv(pdu, offset)
+            fields = []
+            for _ in range(3):  # Generic trap, specific trap, time stamp
+                _, raw, offset = read_tlv(pdu, offset)
+                fields.append(int.from_bytes(raw, "big") if raw else 0)
+            _, varbinds, _ = read_tlv(pdu, offset)
+            generic, specific, _ = fields
+            trap_oid = decode_oid(enterprise) + (0, specific) if generic == 6 else SNMP_TRAPS + (generic + 1,)
+            agent = socket.inet_ntoa(agent_raw) if len(agent_raw) == 4 else ""
+            return Trap(version, community, trap_oid, agent, _varbinds(varbinds))
+        if pdu_type in (TRAP_V2, INFORM):
+            _, request_raw, offset = read_tlv(pdu, 0)
+            _, _, offset = read_tlv(pdu, offset)  # Error status
+            _, _, offset = read_tlv(pdu, offset)  # Error index
+            _, varbinds, _ = read_tlv(pdu, offset)
+            pairs = _varbinds(varbinds)
+            trap_oid = next((value.value for oid, value in pairs if oid == SNMP_TRAP_OID), ())
+            return Trap(version, community, tuple(trap_oid or ()), "", pairs, pdu_type == INFORM,
+                        int.from_bytes(request_raw, "big", signed=True) if request_raw else 0)
+        raise ValueError("Not an SNMP trap.")
+    except IndexError:
+        raise ValueError("Truncated trap.") from None
+
+
+def inform_response(data):
+    """The reply an inform expects: the same message as a Response."""
+    _, message, _ = read_tlv(data, 0)
+    _, _, offset = read_tlv(message, 0)
+    _, _, offset = read_tlv(message, offset)
+    _, pdu, _ = read_tlv(message, offset)
+    return tlv(SEQUENCE, message[:offset] + tlv(RESPONSE, pdu))
+
+
+def build_trap(community, trap_oid, varbinds=(), version=V2C, request_id=1, uptime=0):
+    """A v2c trap (for tests, and for sending a test trap)."""
+    def encode(value):
+        if isinstance(value, Value) and value.tag == OCTET_STRING:
+            return tlv(OCTET_STRING, value.value)
+        if isinstance(value, Value) and value.tag == INTEGER:
+            return encode_integer(value.value)
+        if isinstance(value, Value) and value.tag == OBJECT_ID:
+            return encode_oid(value.value)
+        return tlv(NULL, b"")
+    pairs = [((1, 3, 6, 1, 2, 1, 1, 3, 0), None), (SNMP_TRAP_OID, Value(OBJECT_ID, tuple(trap_oid)))] + list(varbinds)
+    body = b"".join(tlv(SEQUENCE, encode_oid(oid) + (encode_integer(uptime, TIMETICKS) if value is None
+                                                     else encode(value))) for oid, value in pairs)
+    pdu = tlv(TRAP_V2, encode_integer(request_id) + encode_integer(0) + encode_integer(0) + tlv(SEQUENCE, body))
+    return tlv(SEQUENCE, encode_integer(version) + tlv(OCTET_STRING, community.encode("utf-8")) + pdu)
 
 
 # ----------------------------------------------------------------- Talking to a device

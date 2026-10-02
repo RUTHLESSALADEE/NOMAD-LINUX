@@ -1,6 +1,7 @@
 """Network Map settings: the SNMP community strings to try, and how far the crawl may go; and the dialogs for
 hosts added by hand and for sites, buildings and rooms."""
 import ipaddress
+from dataclasses import replace
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor
@@ -10,8 +11,8 @@ from PyQt5.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QDialog, QD
 
 from ..netmap import diff
 from ..netmap.crawl import MAX_WORKERS, WORKERS, parse_networks
-from ..netmap.model import AP, FIREWALL, GROUP_KINDS, KIND_NAMES, PARENT_KIND, ROUTER, SITE, SWITCH, UNCHECKED, \
-    UNKNOWN, Device, Host, Link, normalize_name, port_sort_key, short_port
+from ..netmap.model import AP, CORRECTED_NAMES, FIREWALL, GROUP_KINDS, KIND_NAMES, PARENT_KIND, ROUTER, SERVER, \
+    SITE, SWITCH, UNCHECKED, UNKNOWN, Device, Host, Link, normalize_name, port_sort_key, short_port
 from ..oui import format_mac, vendor
 from ..snmp import VERSIONS, community_is_valid
 from .theme import COLORS
@@ -238,6 +239,43 @@ class CompareDialog(QDialog):
             self.show_change.emit(change)
 
 
+class DeletedDevicesDialog(QDialog):
+    """The devices the crawl found that were deleted from the map, to pick some to bring back."""
+
+    def __init__(self, deleted, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Deleted Devices")
+        self.resize(520, 360)
+        layout = QVBoxLayout(self)
+        label = QLabel("Mapping again leaves these off the map, and doesn't crawl through them. Select the ones to "
+                       "bring back: they're on the map again after the next crawl that reaches them.")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        self.keys = sorted(deleted, key=lambda key: deleted[key][0].lower())
+        self.table = QTableWidget(len(self.keys), 2)
+        self.table.setHorizontalHeaderLabels(["Device", "Addresses"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        for row, key in enumerate(self.keys):
+            name, addresses = deleted[key]
+            self.table.setItem(row, 0, QTableWidgetItem(name))
+            self.table.setItem(row, 1, QTableWidgetItem(", ".join(addresses)))
+        layout.addWidget(self.table, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        self.bring_back_button = buttons.addButton("Bring Back", QDialogButtonBox.AcceptRole)
+        self.bring_back_button.setEnabled(False)
+        self.table.itemSelectionChanged.connect(lambda: self.bring_back_button.setEnabled(bool(self.chosen())))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def chosen(self):
+        return [self.keys[row] for row in sorted({index.row() for index in self.table.selectionModel().selectedRows()})]
+
+
 class HostDialog(QDialog):
     """Add a host by hand (one that's off or unplugged while mapping), or edit one."""
 
@@ -362,9 +400,17 @@ def port_combo(network_map, key, text=""):
     return combo
 
 
+def shown_value(attribute, value):
+    """How a value the crawl found reads: a kind's name, or "nothing"."""
+    if attribute == "kind":
+        return KIND_NAMES.get(value, value)
+    return value or "nothing"
+
+
 class DeviceDialog(QDialog):
-    """Add a device by hand (an unmanaged switch, or one the crawl can't reach), or edit one added by hand. Adding,
-    it can be linked to a device already on the map."""
+    """Add a device by hand (an unmanaged switch, or one the crawl can't reach), or edit one: one added by hand, or
+    correct one the crawl found (an address CDP didn't give or got wrong, the wrong kind). Adding, it can be linked to
+    a device already on the map."""
 
     def __init__(self, network_map, device=None, linked_to="", parent=None):
         super().__init__(parent)
@@ -378,14 +424,26 @@ class DeviceDialog(QDialog):
                           "SNMP with the map's community strings, and pinged while monitoring, like the others.")
             note.setWordWrap(True)
             layout.addWidget(note)
+        elif not device.manual:
+            text = ("Found by the crawl. What you correct here is kept when you map again, over what the crawl "
+                    "finds. With an address, the crawl asks it there over SNMP, and monitoring pings it there.")
+            if device.corrected:
+                text += "\n\nCorrected so far: " + "; ".join(
+                    f"{CORRECTED_NAMES[attribute].lower()} (the crawl found {shown_value(attribute, found)})"
+                    for attribute, (found, _) in device.corrected.items())
+            note = QLabel(text)
+            note.setWordWrap(True)
+            layout.addWidget(note)
         form = QFormLayout()
         self.name_input = QLineEdit(device.name if device else "")
         self.name_input.setPlaceholderText("Such as closet-sw3")
         self.ip_input = QLineEdit(device.mgmt_ip if device else "")
         self.ip_input.setPlaceholderText("To ping and check over SNMP (optional)")
         self.kind_combo = QComboBox()
-        for kind in (SWITCH, ROUTER, FIREWALL, AP, UNKNOWN):
+        for kind in (SWITCH, ROUTER, FIREWALL, AP, SERVER, UNKNOWN):
             self.kind_combo.addItem(KIND_NAMES[kind], kind)
+        if device is not None and self.kind_combo.findData(device.kind) < 0:  # Kept as it is unless changed
+            self.kind_combo.addItem(KIND_NAMES.get(device.kind, device.kind), device.kind)
         self.kind_combo.setCurrentIndex(max(0, self.kind_combo.findData(device.kind if device else SWITCH)))
         self.platform_input = QLineEdit(device.platform if device else "")
         self.platform_input.setPlaceholderText("Such as Netgear GS108 (optional)")
@@ -437,6 +495,14 @@ class DeviceDialog(QDialog):
                 raise ValueError(f"There's already a device called {other.label} on the map.")
         key = self.device.key if self.device else ""
         old = self.device
+        if old is not None and not old.manual:  # Found by the crawl: corrected, not replaced
+            device = replace(old, addresses=list(old.addresses), corrected=dict(old.corrected))
+            entered = {"name": name, "mgmt_ip": ip, "kind": self.kind_combo.currentData(),
+                       "platform": self.platform_input.text().strip(), "note": self.note_input.text().strip()}
+            for attribute, value in entered.items():
+                if value != getattr(old, attribute):
+                    device.correct(attribute, value)
+            return device, None
         device = Device(key=key, name=name, mgmt_ip=ip, kind=self.kind_combo.currentData(),
                         platform=self.platform_input.text().strip(), note=self.note_input.text().strip(),
                         manual=True, source=UNCHECKED)

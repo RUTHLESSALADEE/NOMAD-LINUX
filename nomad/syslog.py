@@ -227,3 +227,63 @@ def format_line(message):
     if message.app:
         parts.append(message.app + ":")
     return " ".join(parts + [message.message])
+
+
+class SyslogHub:
+    """One receiver per port, shared by whoever in NOMAD wants the messages (the Syslog page and the Map Watcher),
+    so they don't fight over port 514. Thread-safe."""
+
+    def __init__(self, receiver_class=SyslogReceiver):
+        self.receiver_class = receiver_class
+        self.lock = threading.Lock()
+        self.ports = {}  # Port -> [receiver, address, tcp, {callback: wants TCP}]
+
+    def subscribe(self, callback, port=SYSLOG_PORT, address="0.0.0.0", tcp=False):
+        """Start getting messages on port. Raises OSError if it can't be listened on. A port already listened on
+        is shared (on every address if two subscribers asked for different ones, and with TCP if either did)."""
+        with self.lock:
+            entry = self.ports.get(port)
+            if entry is None:
+                receiver = self._start(port, address, tcp)
+                self.ports[port] = [receiver, address, tcp, {callback: tcp}]
+                return
+            receiver, current_address, current_tcp, callbacks = entry
+            wanted_address = current_address if current_address == address else "0.0.0.0"
+            if (tcp and not current_tcp) or wanted_address != current_address:
+                receiver.stop()
+                try:
+                    receiver = self._start(port, wanted_address, tcp or current_tcp)
+                except OSError:
+                    entry[0] = self._start(port, current_address, current_tcp)  # Back as it was
+                    raise
+                entry[:3] = [receiver, wanted_address, tcp or current_tcp]
+            callbacks[callback] = tcp
+
+    def unsubscribe(self, callback, port=SYSLOG_PORT):
+        with self.lock:
+            entry = self.ports.get(port)
+            if entry is None or callback not in entry[3]:
+                return
+            del entry[3][callback]
+            if not entry[3]:
+                entry[0].stop()
+                del self.ports[port]
+
+    def listening(self, port=SYSLOG_PORT):
+        return port in self.ports
+
+    def _start(self, port, address, tcp):
+        receiver = self.receiver_class(lambda message: self._dispatch(port, message), address, port, tcp)
+        receiver.start()
+        return receiver
+
+    def _dispatch(self, port, message):
+        entry = self.ports.get(port)
+        for callback in list(entry[3]) if entry else []:
+            try:
+                callback(message)
+            except Exception:  # One listener's bug shouldn't starve the others
+                log.exception("Handling a syslog message failed")
+
+
+hub = SyslogHub()

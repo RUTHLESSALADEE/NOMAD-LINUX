@@ -44,16 +44,25 @@ class UiPrompter(Prompter):
     def __init__(self, view):
         self.view = view
         self.pending = []
+        self.cancelled = False  # The connection was closed: every question, now or later, goes unanswered
 
     def ask(self, kind, *arguments):
         request = _Request(kind, arguments)
         self.pending.append(request)
-        self.view.question.emit(request)
-        request.done.wait()
-        self.pending.remove(request)
-        return request.result
+        try:
+            if self.cancelled:
+                return None
+            try:
+                self.view.question.emit(request)
+            except RuntimeError:  # The view has been deleted (its tab closed)
+                return None
+            request.done.wait()
+            return request.result
+        finally:
+            self.pending.remove(request)
 
     def cancel_all(self):
+        self.cancelled = True
         for request in list(self.pending):
             request.result = None
             request.done.set()

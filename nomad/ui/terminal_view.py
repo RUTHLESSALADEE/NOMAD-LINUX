@@ -12,7 +12,7 @@ from ..terminal.model import LogCleaner, Position, TerminalModel, encode_key, en
 from ..terminal.highlight import COLORS as KEYWORD_COLORS
 from ..terminal.sessions import SERIAL, decode_escapes
 from ..terminal.transports import ConnectionFailed, make_transport
-from .common import StoppableThread
+from .common import StoppableThread, release_thread
 from .prompts import PromptAnswers, UiPrompter
 from .theme import COLORS
 
@@ -463,6 +463,9 @@ class ConnectionThread(StoppableThread):
             log.exception("Unexpected error connecting")
             self.failed.emit(f"Couldn't connect: {error}")
             return
+        if self.stopping:  # Closed while connecting: don't keep a connection nobody is looking at
+            self.transport.close()
+            return
         self.connected.emit(self.transport.description, self.transport.notice)
         while True:
             chunk = self.transport.read()
@@ -581,6 +584,7 @@ class SessionView(PromptAnswers, QWidget):
             return
         self.reconnect_timer.stop()
         self.set_state(CONNECTING)
+        self.prompter = UiPrompter(self)  # A fresh one: the last connection's was cancelled when it closed
         target = self.session.target()
         self.note(f"Connecting to {target} ({self.session.protocol})...", NOTE_COLOR)
         self.transport = make_transport(self.session, self.prompter, (self.model.columns, self.model.rows),
@@ -671,7 +675,8 @@ class SessionView(PromptAnswers, QWidget):
         if self.transport is not None:
             self.transport.close()
         if self.thread is not None:
-            self.thread.wait(3000)
+            # Still connecting can mean stuck for a while (no answer, or a password prompt): don't keep the UI waiting
+            release_thread(self.thread, 3000 if self.state == CONNECTED else 200)
             self.thread = None
         self.transport = None
 

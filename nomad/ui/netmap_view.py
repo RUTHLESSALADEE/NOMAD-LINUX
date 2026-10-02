@@ -12,15 +12,17 @@ from PyQt5.QtWidgets import QGraphicsItem, QGraphicsLineItem, QGraphicsScene, QG
 from ..netmap.l3 import HOP, STAR, SUBNET
 from ..netmap.layout import GROUP_PAD, GROUP_TITLE, NODE_HEIGHT, NODE_WIDTH
 from ..netmap.monitor import DOWN, UNKNOWN, UP, duration_text
-from ..netmap.model import AP, BUILDING, FIREWALL, GROUP_KINDS, KIND_NAMES, NO_SNMP, ROOM, ROUTER, SHARED_PORT_HOSTS, \
-    SITE, SNMP, SOURCE_NAMES, SWITCH, UNREACHABLE
+from ..netmap.model import AP, BUILDING, FIREWALL, GROUP_KINDS, KIND_NAMES, NO_SNMP, ROOM, ROUTER, SERVER, \
+    SHARED_PORT_HOSTS, SITE, SNMP, SOURCE_NAMES, SWITCH, UNREACHABLE
 from .theme import COLORS
 
-KIND_COLORS = {SWITCH: COLORS["link"], ROUTER: COLORS["accent"], FIREWALL: "#ff9f43", AP: "#c792ea"}
+KIND_COLORS = {SWITCH: COLORS["link"], ROUTER: COLORS["accent"], FIREWALL: "#ff9f43", AP: "#c792ea",
+               SERVER: "#4ecdc4"}
 STATUS_COLORS = {UP: COLORS["success"], DOWN: COLORS["error"], UNKNOWN: COLORS["muted"]}
-KIND_TAGS = {SWITCH: "SW", ROUTER: "RTR", FIREWALL: "FW", AP: "AP"}
+KIND_TAGS = {SWITCH: "SW", ROUTER: "RTR", FIREWALL: "FW", AP: "AP", SERVER: "SRV"}
 STRIP_WIDTH = 34
 BADGE_HEIGHT = 20
+NEWS_HEIGHT = 15  # The NEW tag over a device found by watching
 PORT_WIDTH = 210
 PORT_HEADER = 18
 LINE_HEIGHT = 14
@@ -34,6 +36,7 @@ LABEL_MIN_ZOOM = 0.5  # Port labels are left off below this zoom
 COLLAPSED_WIDTH, COLLAPSED_HEIGHT = 200, 64
 GROUP_TAGS = {BUILDING: "BLDG", ROOM: "ROOM"}
 GROUP_Z = {SITE: -3, BUILDING: -2, ROOM: -1}  # Inner groups' boxes over the ones they're in
+GROUP_BOX = "group:"  # Starts a group's key among devices' keys when arranging or lining them up together
 NODE_RECT = QRectF(-NODE_WIDTH / 2, -NODE_HEIGHT / 2, NODE_WIDTH, NODE_HEIGHT)
 
 
@@ -156,6 +159,7 @@ class DeviceItem(NodeItem):
         super().__init__(device.key, device.label, view)
         self.device, self.host_ports = device, host_ports
         self.monitor_state = None  # A monitor.DeviceStatus while the device is monitored
+        self.news_text = ""  # "NEW", or "2 new hosts": found by watching and not looked at yet
         self.rect = QRectF(-NODE_WIDTH / 2, -NODE_HEIGHT / 2, NODE_WIDTH, NODE_HEIGHT)
         self.host_count = sum(len(hosts) for hosts in host_ports.values())
         self.badge = QRectF(-45, NODE_HEIGHT / 2 + 4, 90, BADGE_HEIGHT) if self.host_count else QRectF()
@@ -166,18 +170,38 @@ class DeviceItem(NodeItem):
         self.setToolTip("\n".join(part for part in tip if part))
 
     def boundingRect(self):
-        return self.rect.adjusted(-9, -9, 9, 9).united(self.badge.adjusted(-2, -2, 2, 2))
+        return self.rect.adjusted(-9, -9 - NEWS_HEIGHT, 9, 9).united(self.badge.adjusted(-2, -2, 2, 2))
 
     def footprint(self):
         return [self.rect, self.badge] if self.host_count else [self.rect]
 
+    def set_news(self, text):
+        if text != self.news_text:
+            self.news_text = text
+            self.update()
+
+    def draw_news(self, painter):
+        """A green tag over the top right corner: new to the map, or has new hosts."""
+        font = small_font(0.7, bold=True)
+        width = QFontMetrics(font).horizontalAdvance(self.news_text) + 12
+        tag = QRectF(self.rect.right() - width + 4, self.rect.top() - NEWS_HEIGHT + 3, width, NEWS_HEIGHT)
+        path = QPainterPath()
+        path.addRoundedRect(tag, NEWS_HEIGHT / 2, NEWS_HEIGHT / 2)
+        painter.fillPath(path, QColor(COLORS["success"]))
+        painter.setFont(font)
+        painter.setPen(QColor(COLORS["panel"]))
+        painter.drawText(tag, Qt.AlignCenter, self.news_text)
+
     def paint(self, painter, option, widget=None):
         device = self.device
+        state = self.monitor_state
         color = QColor(KIND_COLORS.get(device.kind, COLORS["muted"]))
         painter.setRenderHint(QPainter.Antialiasing)
         self.draw_highlight(painter, self.rect, 7)
         outline = QColor(COLORS["error"]) if device.source == UNREACHABLE else color
-        pen = QPen(outline, 3 if self.isSelected() else 1.6)
+        if state is not None:  # Monitored: up/down outranks the device type, which the tag still names
+            outline = QColor(STATUS_COLORS[state.status])
+        pen = QPen(outline, 3 if self.isSelected() else 2.6 if state is not None else 1.6)
         if self.isSelected():
             pen.setColor(QColor(COLORS["accent_hover"]))
         if device.source != SNMP:
@@ -190,17 +214,16 @@ class DeviceItem(NodeItem):
         painter.save()
         painter.setClipRect(QRectF(self.rect.left(), self.rect.top(), STRIP_WIDTH, self.rect.height()))
         faded = QColor(outline)
-        faded.setAlpha(60)
+        faded.setAlpha(60 if state is None else 140)
         painter.fillPath(strip, faded)
         painter.restore()
         painter.setPen(pen)
         painter.drawPath(path)
 
-        painter.setPen(QColor(outline))
+        painter.setPen(QColor(outline if state is None else COLORS["text"]))
         painter.setFont(small_font(0.75, bold=True))
         painter.drawText(QRectF(self.rect.left(), self.rect.top(), STRIP_WIDTH, self.rect.height()), Qt.AlignCenter,
                          KIND_TAGS.get(device.kind, "?"))
-        state = self.monitor_state
         if state is not None and state.status == DOWN:  # Tint the box: it's the one to look at
             tint = QColor(COLORS["error"])
             tint.setAlpha(45)
@@ -234,6 +257,8 @@ class DeviceItem(NodeItem):
 
         if state is not None:
             self.draw_status_dot(painter, state)
+        if self.news_text:
+            self.draw_news(painter)
 
         if self.host_count:
             painter.setPen(QPen(QColor(COLORS["border"]), 1))
@@ -257,7 +282,7 @@ class DeviceItem(NodeItem):
         color = QColor(STATUS_COLORS[state.status])
         painter.setPen(QPen(color, 1.5))
         painter.setBrush(color if state.status != UNKNOWN else Qt.NoBrush)
-        painter.drawEllipse(center, 4.5, 4.5)
+        painter.drawEllipse(center, 5.5, 5.5)
         painter.setBrush(Qt.NoBrush)
 
     def set_expanded(self, expanded):
@@ -349,8 +374,14 @@ class HostPortItem(QGraphicsItem):
         regular, vlan_font = small_font(0.74), small_font(0.7, bold=True)
         vlan_width = QFontMetrics(vlan_font).horizontalAdvance("VLAN 4094") + 4
         top = self.rect.top() + PORT_HEADER
+        new_hosts = self.parentItem().view.new_hosts
         for host in self.hosts[:HOST_LINES]:
             name, vlan = host_line(host)
+            if host.mac in new_hosts:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(COLORS["success"]))
+                painter.drawEllipse(QPointF(left - 3, top + LINE_HEIGHT / 2), 2.5, 2.5)
+                painter.setBrush(Qt.NoBrush)
             font = QFont(regular)
             font.setItalic(host.manual)  # Added by hand
             painter.setFont(font)
@@ -618,9 +649,12 @@ class GroupItem(QGraphicsItem):
         if event.button() != Qt.LeftButton:
             event.ignore()
             return
-        if not event.modifiers() & Qt.ControlModifier:
+        if event.modifiers() & Qt.ControlModifier:
+            self.setSelected(not self.isSelected())
+        elif not self.isSelected():
             self.scene().clearSelection()
-        self.setSelected(not self.isSelected() if event.modifiers() & Qt.ControlModifier else True)
+            self.setSelected(True)
+        # Already selected: keep what's selected with it, so dragging moves them all
         self.drag_from, self.dragged = event.scenePos(), False
         event.accept()
 
@@ -630,12 +664,19 @@ class GroupItem(QGraphicsItem):
         delta = event.scenePos() - self.drag_from
         self.drag_from = event.scenePos()
         self.dragged = True
-        self.view.move_group(self, delta)
+        if self.isSelected():
+            self.view.move_selection(delta)
+        else:
+            self.view.move_group(self, delta)
 
     def mouseReleaseEvent(self, event):
+        clicked = self.drag_from is not None and not self.dragged
         self.drag_from = None
         if self.dragged:
             self.view.on_item_moved()
+        elif clicked and not event.modifiers() & Qt.ControlModifier:  # A click on one of several: just this one
+            self.scene().clearSelection()
+            self.setSelected(True)
 
     def mouseDoubleClickEvent(self, event):
         self.view.set_collapsed(self, not self.group.collapsed)
@@ -752,6 +793,7 @@ class MapView(QGraphicsView):
         self.setViewportUpdateMode(QGraphicsView.BoundingRectViewportUpdate)
         self.setBackgroundBrush(QColor(COLORS["background"]))
         self.items_by_key = {}
+        self.new_hosts = set()  # MACs of hosts found by watching, not looked at yet
         self.link_items = []
         self.links = []
         self.group_items = {}
@@ -762,6 +804,7 @@ class MapView(QGraphicsView):
         self.fit_pending = False
         self.auto_fit = False  # Fitted automatically and not zoomed or panned since: refit when resized
         self.drawing = None  # Drawing a link by hand: (DeviceItem it starts from, the rubber line)
+        self.last_found = None  # (text, match) Find showed last, so Enter again goes on to the next
         self.scene().selectionChanged.connect(self.on_selection_changed)
 
     def set_map(self, network_map, positions):
@@ -929,8 +972,76 @@ class MapView(QGraphicsView):
         groups = [item for item in self.scene().selectedItems() if isinstance(item, GroupItem)]
         return groups[0].key if len(groups) == 1 else None
 
+    def selected_groups(self):
+        """The group keys selected, leaving out ones inside another selected group (they move with it)."""
+        chosen = {item for item in self.group_items.values() if item.isSelected() and item.isVisible()}
+        found = []
+        for key, item in self.group_items.items():
+            parent = item.parent_group
+            while parent is not None and parent not in chosen:
+                parent = parent.parent_group
+            if item in chosen and parent is None:
+                found.append(key)
+        return found
+
     def sizes(self, keys):
         return {key: (self.items_by_key[key].rect.width(), self.items_by_key[key].rect.height()) for key in keys}
+
+    def boxes(self, keys, groups=()):
+        """{key: (center x, center y, width, height)} for devices and groups to arrange or line up together: a
+        group's key starts with GROUP_BOX, and devices in one of the groups are left out (they go with it)."""
+        found, inside = {}, set()
+        for group_key in groups:
+            item = self.group_items.get(group_key)
+            if item is not None and not item.rect.isNull():
+                rect = item.rect
+                found[GROUP_BOX + group_key] = (rect.center().x(), rect.center().y(), rect.width(), rect.height())
+                inside.update(member.key for member in item.all_members())
+        for key in keys:
+            item = self.items_by_key.get(key)
+            if item is not None and key not in inside:
+                found[key] = (item.pos().x(), item.pos().y(), item.rect.width(), item.rect.height())
+        return found
+
+    def box_links(self, boxes):
+        """(a, b) for each pair of the boxes a link joins (a group's box standing for the devices in it)."""
+        box_of = {key: key for key in boxes}
+        for box in boxes:
+            item = self.group_items.get(box[len(GROUP_BOX):]) if box.startswith(GROUP_BOX) else None
+            if item is not None:
+                box_of.update((member.key, box) for member in item.all_members())
+        return [(box_of[a], box_of[b]) for a, b in ((link.a, link.b) for link in self.links)
+                if a in box_of and b in box_of and box_of[a] != box_of[b]]
+
+    def move_boxes(self, centers):
+        """Move devices and groups (from boxes()) so their centers are at {key: (x, y)}, as when the user drags them
+        (the layout's saved): a group with everything in it."""
+        self.groups_suspended = True
+        for key, (x, y) in centers.items():
+            if key.startswith(GROUP_BOX):
+                item = self.group_items.get(key[len(GROUP_BOX):])
+                if item is not None:
+                    dx, dy = x - item.rect.center().x(), y - item.rect.center().y()
+                    for member in item.all_members():
+                        member.moveBy(dx, dy)
+            elif key in self.items_by_key:
+                self.items_by_key[key].setPos(x, y)
+        self.groups_suspended = False
+        self.update_groups()
+        self.update_scene_rect()
+        self.positions_changed.emit()
+
+    def move_selection(self, delta):
+        """Dragging a group's title: move the groups selected with everything in them, and the devices selected."""
+        moving = set()
+        for key in self.selected_groups():
+            moving.update(self.group_items[key].all_members())
+        moving.update(item for item in self.scene().selectedItems() if isinstance(item, NodeItem))
+        self.groups_suspended = True
+        for item in moving:
+            item.moveBy(delta.x(), delta.y())
+        self.groups_suspended = False
+        self.update_groups()
 
     def group_boxes(self):
         """[(group, (left, top, width, height))] for each group as if expanded (for draw.io), sites first."""
@@ -947,9 +1058,12 @@ class MapView(QGraphicsView):
             self.drag = None
             return
         moving = {other for other in self.scene().selectedItems() if isinstance(other, NodeItem)} | {item}
-        self.drag = {"moving": moving, "start": {other: QPointF(other.pos()) for other in moving}}
+        # The groups selected with it go along (what's in them moved here, as Qt only moves what's selected)
+        carried = {member for key in self.selected_groups() for member in self.group_items[key].all_members()} - moving
+        self.drag = {"moving": moving, "start": {other: QPointF(other.pos()) for other in moving},
+                     "carried": carried, "last": QPointF(item.pos())}
         for group_item in self.group_items.values():
-            group_item.frozen = not set(group_item.all_members()) <= moving
+            group_item.frozen = not set(group_item.all_members()) <= moving | carried
 
     def drop_target(self, point):
         """The innermost group showing whose box (as it was when the drag started) holds the point."""
@@ -960,6 +1074,14 @@ class MapView(QGraphicsView):
     def node_dragged(self, item):
         if self.drag is None:
             return
+        if self.drag["carried"]:
+            delta = item.pos() - self.drag["last"]
+            self.drag["last"] = QPointF(item.pos())
+            self.groups_suspended = True
+            for member in self.drag["carried"]:
+                member.moveBy(delta.x(), delta.y())
+            self.groups_suspended = False
+            self.update_groups()
         target = self.drop_target(item.pos())
         for group_item in self.group_items.values():
             group_item.set_drop_target(group_item is target and target is not item.group_item)
@@ -995,6 +1117,18 @@ class MapView(QGraphicsView):
                     item.update()
         for item in self.group_items.values():
             item.update()  # How many in it are down
+
+    def set_news(self, news):
+        """Mark what watching found and nobody's looked at yet (a map's news: {"device:key" or "host:MAC": ...})."""
+        self.new_hosts = {ref[5:] for ref in news if ref.startswith("host:")}
+        new_devices = {ref[7:] for ref in news if ref.startswith("device:")}
+        for key, item in self.items_by_key.items():
+            if isinstance(item, DeviceItem):
+                hosts = sum(1 for hosts in item.host_ports.values() for host in hosts if host.mac in self.new_hosts)
+                item.set_news("NEW" if key in new_devices else f"{hosts} new host{'' if hosts == 1 else 's'}"
+                              if hosts else "")
+                for port_item in item.port_items:
+                    port_item.update()
 
     def set_highlights(self, colors):
         """Ring the items in {key: colour}; clear the rest."""
@@ -1213,28 +1347,59 @@ class MapView(QGraphicsView):
                 return True
         return self.show_device(host.device)
 
-    def find(self, text):
-        """Select the first device or host matching text (name, address, MAC, platform). Returns True if found."""
+    def find_matches(self, text):
+        """Everything matching text (name, address, MAC, platform, vendor): devices, then sites, buildings and
+        rooms, then hosts. Each is (kind, key, label), key being a device or group key, or a host's index."""
         text = text.strip().lower()
         if not text:
-            return False
+            return []
         compact = text.replace("-", "").replace(":", "").replace(".", "")
+        matches = []
         for key, item in sorted(self.items_by_key.items()):
             device = getattr(item, "device", None)
             values = [item.label] + ([device.mgmt_ip, device.platform] + device.addresses if device else [])
             if any(text in value.lower() for value in values if value):
-                return self.show_device(key)
+                matches.append(("device", key, item.label))
         if self.network_map is None:
-            return False
+            return matches
         for group_item in self.group_items.values():
             if text in group_item.group.name.lower():
-                return self.show_group(group_item.key)
-        for host in self.network_map.hosts:
+                matches.append(("group", group_item.key, group_item.group.name))
+        for index, host in enumerate(self.network_map.hosts):
             mac = host.mac.replace("-", "").lower()
             if (len(compact) >= 4 and compact in mac) or any(text in value.lower() for value in (host.ip, host.name,
                                                                                                host.vendor) if value):
-                return self.show_host(host)
-        return False
+                matches.append(("host", index, host.name or host.ip or host.mac))
+        return matches
+
+    def find(self, text, backward=False):
+        """Select the next thing matching text, after the one found last time with the same text (or before it,
+        backward), going round. Returns (position, count, label) of the one shown, or None if nothing matches."""
+        matches = self.find_matches(text)
+        if not matches:
+            self.last_found = None
+            return None
+        last_text, last_match = self.last_found or (None, None)
+        index = 0
+        if last_text == text.strip().lower() and last_match in matches:
+            index = (matches.index(last_match) + (-1 if backward else 1)) % len(matches)
+        elif backward:
+            index = len(matches) - 1
+        kind, key, label = matches[index]
+        if kind == "device":
+            self.show_device(key)
+        elif kind == "group":
+            self.show_group(key)
+        else:
+            self.show_host(self.network_map.hosts[key])
+        self.last_found = (text.strip().lower(), matches[index])
+        return index + 1, len(matches), label
+
+    def find_all(self, text):
+        """Select every device matching text at once. Returns how many."""
+        keys = [key for kind, key, _ in self.find_matches(text) if kind == "device"]
+        self.last_found = None
+        return len(keys) if self.show_devices(keys) else 0
 
     # ----------------------------------------------------------------- Items talking back
 
@@ -1262,11 +1427,11 @@ class MapView(QGraphicsView):
             selected = self.scene().selectedItems()
         except RuntimeError:  # Scene being torn down
             return
-        nodes = [item for item in selected if isinstance(item, NodeItem)]
+        boxes = [item for item in selected if isinstance(item, (NodeItem, GroupItem))]
         if not selected:
             self.selection_changed.emit(None)
-        elif len(nodes) > 1 or (nodes and len(selected) > len(nodes)):
-            self.selection_changed.emit(("many", len(nodes)))
+        elif len(boxes) > 1 or (boxes and len(selected) > len(boxes)):
+            self.selection_changed.emit(("many", len(boxes)))
         elif isinstance(selected[0], GroupItem):
             self.selection_changed.emit(("group", selected[0].key))
         elif isinstance(selected[0], DeviceItem):

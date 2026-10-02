@@ -48,6 +48,14 @@ def main():
         from nomad.ipam.service import run_service_dispatcher
         run_service_dispatcher()
         return
+    if "--map-watcher-service" in sys.argv:  # Started by Windows as the NOMAD Map Watcher service
+        from nomad.netmap.watch_service import run_service_dispatcher
+        run_service_dispatcher()
+        return
+    if "--map-watcher" in sys.argv:  # The Map Watcher in this console, for trying it out or troubleshooting
+        from nomad.netmap.watch_service import run_in_foreground
+        run_in_foreground()
+        return
     if "--ipam-server" in sys.argv:  # The IPAM server in this console, for trying it out or troubleshooting
         from nomad.ipam.server import run_in_foreground
         run_in_foreground()

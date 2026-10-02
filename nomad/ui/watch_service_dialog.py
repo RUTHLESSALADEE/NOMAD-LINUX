@@ -1,0 +1,187 @@
+"""Tools > Map Watcher Service: watch tribe maps for new devices from this computer even when NOMAD isn't open (the
+NOMAD Map Watcher Windows service)."""
+import json
+import logging
+import os
+
+from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, \
+    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QVBoxLayout
+
+from ..ipam.client import load_saved_key
+from ..netmap import watch, watch_service
+from ..netmap.monitor import duration_text
+from .common import run_in_background, set_hint
+from .theme import accent_button
+
+log = logging.getLogger(__name__)
+
+
+class MapWatcherDialog(QDialog):
+    def __init__(self, window):
+        super().__init__(window)
+        self.window = window
+        self.setWindowTitle("Map Watcher Service")
+        self.setMinimumWidth(620)
+        layout = QVBoxLayout(self)
+        intro = QLabel("Watch tribe maps for new switches, access points and hosts from this computer, even when "
+                       "nobody has NOMAD open. Use a computer that's usually on and can reach the switches over SNMP "
+                       "(the tribe server may not). It takes over watching from NOMAD left open elsewhere, and adds "
+                       "what it finds to the tribe maps, tagged NEW. Switches can send it syslog (UDP 514) and SNMP "
+                       "traps (UDP 162) so it reads a switch the moment something's plugged in.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        form = QFormLayout()
+        self.status_label = QLabel()
+        form.addRow("Service:", self.status_label)
+        self.maps_list = QListWidget()
+        self.maps_list.setMaximumHeight(140)
+        form.addRow("Maps to watch:", self.maps_list)
+        self.neighbor_combo = QComboBox()
+        for seconds in watch.NEIGHBOR_INTERVALS:
+            self.neighbor_combo.addItem(f"every {duration_text(seconds)}", seconds)
+        self.host_combo = QComboBox()
+        for seconds in watch.HOST_INTERVALS:
+            self.host_combo.addItem(f"every {duration_text(seconds)}", seconds)
+        self.listen_check = QCheckBox("Listen for syslog and SNMP traps (opens UDP 514 and 162 in Windows Firewall)")
+        form.addRow("New neighbors:", self.neighbor_combo)
+        form.addRow("New hosts:", self.host_combo)
+        form.addRow("", self.listen_check)
+        layout.addLayout(form)
+        row = QHBoxLayout()
+        self.install_button = accent_button("Install Service")
+        self.start_button = QPushButton("Start")
+        self.stop_button = QPushButton("Stop")
+        self.uninstall_button = QPushButton("Uninstall...")
+        self.folder_button = QPushButton("Open Its Folder")
+        for button in (self.install_button, self.start_button, self.stop_button, self.uninstall_button,
+                       self.folder_button):
+            row.addWidget(button)
+        row.addStretch()
+        layout.addLayout(row)
+        self.message_label = QLabel()
+        self.message_label.setWordWrap(True)
+        layout.addWidget(self.message_label)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.install_button.clicked.connect(self.install)
+        self.start_button.clicked.connect(lambda: self.run("Starting the service...", lambda: service().start(
+            watch_service.spec()), "Started."))
+        self.stop_button.clicked.connect(lambda: self.run("Stopping the service...", lambda: service().stop(
+            watch_service.spec()), "Stopped."))
+        self.uninstall_button.clicked.connect(self.uninstall)
+        self.folder_button.clicked.connect(lambda: os.startfile(watch_service.watcher_dir()))
+        self.busy = False
+        self.fill()
+        self.refresh()
+
+    def configured(self):
+        try:
+            return watch_service.load_config()
+        except (OSError, ValueError):
+            return {}
+
+    def fill(self):
+        config = self.configured()
+        chosen = set(config.get("maps", []))
+        page = self.window.netmap_tab
+        maps = page.tribe.ensure()
+        self.maps_list.clear()
+        for item in (maps.maps() if maps is not None else []):
+            entry = QListWidgetItem(item["name"])
+            entry.setData(Qt.UserRole, item["id"])
+            entry.setFlags(entry.flags() | Qt.ItemIsUserCheckable)
+            entry.setCheckState(Qt.Checked if item["id"] in chosen or (not chosen and item["id"] == page.tribe_map_id)
+                                else Qt.Unchecked)
+            self.maps_list.addItem(entry)
+        for combo, name, choices, default in ((self.neighbor_combo, "neighbor_interval", watch.NEIGHBOR_INTERVALS,
+                                               watch.NEIGHBOR_INTERVAL),
+                                              (self.host_combo, "host_interval", watch.HOST_INTERVALS,
+                                               watch.HOST_INTERVAL)):
+            seconds = config.get(name, default)
+            combo.setCurrentIndex(choices.index(seconds) if seconds in choices else choices.index(default))
+        self.listen_check.setChecked(config.get("listen", True))
+        if maps is None:
+            set_hint(self.message_label, "This computer has no tribe key: join the tribe on the IP Addresses page "
+                                         "(Tribe...) first, then share a map with the tribe on the Network Map page.",
+                     "warning")
+        elif not maps.maps():
+            set_hint(self.message_label, "There are no tribe maps yet: share one from the Network Map page "
+                                         "(Tribe > Share This Map with the Tribe).", "warning")
+
+    def chosen_maps(self):
+        return [self.maps_list.item(row).data(Qt.UserRole) for row in range(self.maps_list.count())
+                if self.maps_list.item(row).checkState() == Qt.Checked]
+
+    def refresh(self):
+        admin = getattr(self.window, "admin", False)
+        try:
+            state = watch_service.status()
+        except Exception as error:  # pywin32 missing (running from an unusual setup)
+            state = f"Unknown ({error})"
+        self.state = state
+        self.status_label.setText(state)
+        installed = state != service().NOT_INSTALLED
+        idle = admin and not self.busy
+        self.install_button.setText("Update Service" if installed else "Install Service")
+        self.install_button.setEnabled(idle and self.maps_list.count() > 0)
+        self.start_button.setEnabled(idle and state == service().STOPPED)
+        self.stop_button.setEnabled(idle and state == service().RUNNING)
+        self.uninstall_button.setEnabled(idle and installed)
+        self.folder_button.setEnabled(watch_service.watcher_dir().exists())
+        if not admin:
+            set_hint(self.message_label, "Installing the Map Watcher needs administrator rights: use File > Restart "
+                                         "as Administrator, then open this again.", "warning")
+
+    def run(self, message, action, done):
+        self.busy = True
+        set_hint(self.message_label, message, "info")
+        self.refresh()
+
+        def succeeded(_):
+            self.busy = False
+            set_hint(self.message_label, done, "success")
+            self.refresh()
+
+        def failed(error):
+            self.busy = False
+            log.warning("Map Watcher: %s failed: %s", message, error)
+            set_hint(self.message_label, str(error), "error")
+            self.refresh()
+
+        run_in_background(action, succeeded, failed)
+
+    def install(self):
+        chosen = self.chosen_maps()
+        if not chosen:
+            set_hint(self.message_label, "Tick the maps for it to watch.", "warning")
+            return
+        key = load_saved_key()
+        if key is None:
+            set_hint(self.message_label, "This computer has no tribe key: join the tribe on the IP Addresses page "
+                                         "first.", "error")
+            return
+        try:
+            config = watch_service.make_config(key, chosen, self.listen_check.isChecked(),
+                                               self.neighbor_combo.currentData(), self.host_combo.currentData())
+        except Exception as error:
+            set_hint(self.message_label, f"Couldn't prepare the service's settings: {error}", "error")
+            return
+        log.info("Installing the Map Watcher for maps %s", json.dumps(chosen))
+        self.run("Installing the service (this takes a few seconds)...", lambda: watch_service.install(config),
+                 "The Map Watcher is running. NOMAD open on other computers stands by while it watches; what it "
+                 "finds appears on the tribe maps tagged NEW.")
+
+    def uninstall(self):
+        if QMessageBox.question(self, "Uninstall the Map Watcher",
+                                "Stop and remove the Map Watcher service and its firewall rules? NOMAD left open "
+                                "with Watch ticked takes over watching.") != QMessageBox.Yes:
+            return
+        self.run("Removing the service...", watch_service.uninstall, "Removed.")
+
+
+def service():
+    from ..ipam import service as module  # pywin32 is loaded only when it's needed
+    return module

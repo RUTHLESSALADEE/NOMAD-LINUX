@@ -119,3 +119,21 @@ class StoppableThread(QThread):
     @property
     def stopping(self):
         return self.stop_event.is_set()
+
+
+_orphaned_threads = set()  # Threads let go of while still running, kept alive until they finish
+
+
+def release_thread(thread, wait_ms=3000):
+    """Wait for a stopped thread to finish; if it's still stuck (connecting, say), let it finish on its own. Its
+    signals are cut and it no longer belongs to its widget, so closing the widget can't destroy a running thread
+    (which takes the whole program down)."""
+    if thread.wait(wait_ms):
+        return
+    try:
+        thread.disconnect()  # Every signal: nothing it says now should reach the widget
+    except TypeError:
+        pass
+    thread.setParent(None)
+    _orphaned_threads.add(thread)
+    thread.finished.connect(lambda: _orphaned_threads.discard(thread))

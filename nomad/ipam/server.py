@@ -18,6 +18,17 @@ API (JSON; "Authorization: Bearer <secret>"):
                                       moment anyone changes anything
     POST /api/edit {"action": ...}    one change, checked against the version the client last saw
     POST /api/import {"plans": [...]} import prepared networks (admin only)
+
+Tribe maps (network maps shared by everyone; see nomad/netmap/shared.py), kept in maps.db:
+    GET  /api/maps/changes?since=N    maps and map items changed after map revision N
+    POST /api/maps/create             {"name", "changes": [...], "secrets": {...}}: a new shared map
+    POST /api/maps/push               {"map_id", "changes": [...]}: items changed (the latest of each wins)
+    POST /api/maps/rename             {"map_id", "name"}
+    POST /api/maps/delete             {"map_id"}
+    GET  /api/maps/secrets?map_id=N   its community strings; POST /api/maps/secrets {"map_id", "secrets"}
+    POST /api/maps/lease              {"map_id", "holder", "kind", "release", "take"}: who's watching it for new
+                                      devices (so two computers don't both poll the network)
+    /api/wait also takes maps_since, and answers when a map changes.
 """
 import datetime
 import hashlib
@@ -40,6 +51,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .. import __version__
+from ..netmap.shared import MapError, MapStore
 from .store import IpamError, IpamStore
 
 log = logging.getLogger(__name__)
@@ -54,7 +66,8 @@ TEAM, ADMIN = "team", "admin"
 ADMIN_ONLY_ACTIONS = {"add_network", "delete_network"}
 CERTIFICATE_YEARS = 20
 MAX_WAIT_SECONDS = 55
-API_LEVEL = 5  # 2 added /api/wait (instant sync), 3 /api/log (history), 4 loopback subnets, 5 sightings (last seen).
+API_LEVEL = 6  # 2 added /api/wait (instant sync), 3 /api/log (history), 4 loopback subnets, 5 sightings (last seen),
+# 6 tribe maps.
 # Clients cope with servers below this
 
 
@@ -203,6 +216,8 @@ class IpamServer:
         self.changed = threading.Condition()  # Notified after every change, to answer waiting laptops
         self.latest = self.store.revision()
         self.latest_sightings = self.store.sighting_seq()  # Sweeps' news, which laptops also wait for
+        self.maps = MapStore(self.directory / "maps.db", *_map_secret_protection())
+        self.latest_maps = self.maps.revision()
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(self.directory / "cert.pem", self.directory / "key.pem")
@@ -211,6 +226,7 @@ class IpamServer:
             self.httpd = http.server.ThreadingHTTPServer((host, self.port), handler)
         except OSError as error:
             self.store.close()
+            self.maps.close()
             raise OSError(f"Couldn't listen on port {self.port}: {error.strerror or error}. Another program may be "
                           f"using it (see which with: netstat -ano | findstr :{self.port}).") from error
         self.httpd.daemon_threads = True
@@ -233,6 +249,8 @@ class IpamServer:
             self.httpd.server_close()
             with self.store.lock:
                 self.store.close()
+            with self.maps.lock:
+                self.maps.close()
             log.info("IPAM server stopped")
 
     def stop(self):
@@ -241,23 +259,26 @@ class IpamServer:
             self.changed.notify_all()  # Let waiting requests finish
         self.httpd.shutdown()
 
-    def announce(self, revision=None, sightings=None):
-        """Tell every waiting laptop there's a new revision (or new sightings)."""
+    def announce(self, revision=None, sightings=None, maps=None):
+        """Tell every waiting laptop there's a new revision (or new sightings, or a map changed)."""
         with self.changed:
             if revision is not None:
                 self.latest = max(self.latest, revision)
             if sightings is not None:
                 self.latest_sightings = max(self.latest_sightings, sightings)
+            if maps is not None:
+                self.latest_maps = max(self.latest_maps, maps)
             self.changed.notify_all()
 
-    def wait(self, since, timeout, sightings_since=None):
-        """Block until there's a revision after `since` (or sightings after `sightings_since`, when given), the
-        timeout passes, or the server stops."""
+    def wait(self, since, timeout, sightings_since=None, maps_since=None):
+        """Block until there's a revision after `since` (or sightings after `sightings_since`, or a map revision
+        after `maps_since`, when given), the timeout passes, or the server stops."""
         timeout = max(0.0, min(float(timeout), MAX_WAIT_SECONDS))
         with self.changed:
             self.changed.wait_for(lambda: self.latest > since or self.stop_event.is_set() or
-                                  (sightings_since is not None and self.latest_sightings > sightings_since), timeout)
-            return {"revision": self.latest, "sightings": self.latest_sightings}
+                                  (sightings_since is not None and self.latest_sightings > sightings_since) or
+                                  (maps_since is not None and self.latest_maps > maps_since), timeout)
+            return {"revision": self.latest, "sightings": self.latest_sightings, "maps": self.latest_maps}
 
     # ----------------------------------------------------------------- Requests
 
@@ -276,7 +297,8 @@ class IpamServer:
         with self.store.lock:
             revision = self.store.revision()
         return {"server_id": self.config["server_id"], "name": socket.gethostname(), "version": __version__,
-                "api": API_LEVEL, "revision": revision, "sightings": self.latest_sightings, "role": role}
+                "api": API_LEVEL, "revision": revision, "sightings": self.latest_sightings, "maps": self.latest_maps,
+                "role": role}
 
     def sightings(self, since):
         with self.store.lock:
@@ -335,6 +357,50 @@ class IpamServer:
         log.info("Import of %s by %s", ", ".join(network.name for network in networks), user)
         self.announce(revision)
         return {"items": items, "revision": revision, "networks": [network.id for network in networks]}
+
+    # ----------------------------------------------------------------- Tribe maps
+
+    def map_changes(self, since):
+        with self.maps.lock:
+            payload, revision, more = self.maps.changes_since(since)
+            payload["leases"] = self.maps.leases(time.time())
+        return dict(payload, revision=revision, more=more)
+
+    def map_request(self, action, user, request):
+        """A change to the tribe's maps. Returns the reply; announces the new map revision."""
+        with self.maps.lock:
+            if action == "create":
+                map_id, revision = self.maps.create(request["name"], user, request.get("changes", []),
+                                                    request.get("secrets"))
+                reply = {"map_id": map_id}
+            elif action == "push":
+                revision = self.maps.push(request["map_id"], request.get("changes", []), user)
+                reply = {}
+            elif action == "rename":
+                revision = self.maps.rename(request["map_id"], request["name"])
+                reply = {}
+            elif action == "delete":
+                revision = self.maps.delete(request["map_id"])
+                reply = {}
+            elif action == "secrets":
+                revision = self.maps.set_secrets(request["map_id"], request.get("secrets") or {})
+                reply = {}
+            elif action == "lease":
+                computer = user.rpartition("(")[2].rstrip(")") if "(" in user else user
+                lease = self.maps.lease(request["map_id"], _clean(request["holder"], 128), computer,
+                                        _clean(request.get("kind", "gui")), time.time(),
+                                        release=bool(request.get("release")), take=bool(request.get("take")))
+                return {"lease": lease}  # Not a change anyone waits for
+            else:
+                raise RequestError(404, "No such request.")
+        if action != "push" or request.get("changes"):
+            log.info("Map %s by %s", action, user)
+        self.announce(maps=revision)
+        return dict(reply, revision=revision)
+
+    def map_secrets(self, map_id):
+        with self.maps.lock:
+            return {"secrets": self.maps.secrets(map_id)}
 
     # ----------------------------------------------------------------- Edits, each checked for conflicts
 
@@ -428,10 +494,15 @@ class IpamServer:
             finally:
                 destination.close()
         os.replace(temporary, target)
+        maps_target = folder / f"maps-{datetime.date.today().isoformat()}.db"
+        maps_temporary = maps_target.with_name(f"{maps_target.stem}.{uuid.uuid4().hex[:8]}.tmp")
+        with self.maps.lock:
+            self.maps.backup(maps_temporary)
+        os.replace(maps_temporary, maps_target)
         keep = datetime.timedelta(days=int(self.config.get("backup_keep_days", BACKUP_KEEP_DAYS)))
-        for old in folder.glob("ipam-*.db"):
+        for old in list(folder.glob("ipam-*.db")) + list(folder.glob("maps-*.db")):
             try:
-                day = datetime.date.fromisoformat(old.stem[5:])
+                day = datetime.date.fromisoformat(old.stem.partition("-")[2])
             except ValueError:
                 continue
             if datetime.date.today() - day > keep:
@@ -489,10 +560,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 return self._reply(200, app.status(role))
             if method == "GET" and url.path == "/api/wait":
                 query = parse_qs(url.query)
-                sightings_since = query.get("sightings_since")
+                sightings_since, maps_since = query.get("sightings_since"), query.get("maps_since")
                 return self._reply(200, app.wait(int(query.get("since", ["0"])[0]),
                                                  float(query.get("timeout", ["25"])[0]),
-                                                 int(sightings_since[0]) if sightings_since else None))
+                                                 int(sightings_since[0]) if sightings_since else None,
+                                                 int(maps_since[0]) if maps_since else None))
+            if method == "GET" and url.path == "/api/maps/changes":
+                return self._reply(200, app.map_changes(int(parse_qs(url.query).get("since", ["0"])[0])))
+            if method == "GET" and url.path == "/api/maps/secrets":
+                return self._reply(200, app.map_secrets(int(parse_qs(url.query)["map_id"][0])))
+            if method == "POST" and url.path.startswith("/api/maps/"):
+                return self._reply(200, app.map_request(url.path[len("/api/maps/"):], self._user(), self._body()))
             if method == "GET" and url.path == "/api/sightings":
                 return self._reply(200, app.sightings(int(parse_qs(url.query).get("since", ["0"])[0])))
             if method == "POST" and url.path == "/api/sightings":
@@ -511,6 +589,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._reply(error.status, {"error": str(error)})
         except ConflictError as error:
             self._reply(409, {"error": str(error), "conflict": True})
+        except MapError as error:
+            self._reply(422, {"error": str(error)})
         except IpamError as error:
             self._reply(422, {"error": str(error)})
         except (KeyError, TypeError, ValueError) as error:
@@ -524,6 +604,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._handle("POST")
+
+
+def _map_secret_protection():
+    """How the server keeps maps' community strings: DPAPI for this computer, so the service can read them."""
+    if sys.platform != "win32":
+        return None, None
+    from ..terminal.credentials import protect, unprotect
+    return (lambda text: protect(text, machine=True)), unprotect
 
 
 def log_to_file(directory=None):

@@ -8,14 +8,16 @@ import xml.etree.ElementTree as ElementTree  # noqa: E402
 import pytest  # noqa: E402
 from netmap_fakes import build_network  # noqa: E402
 from PyQt5.QtCore import QPointF  # noqa: E402
+from PyQt5.QtWidgets import QMenu  # noqa: E402
 
 from nomad.netmap import export, store  # noqa: E402
 from nomad.netmap.crawl import CrawlSettings, Crawler  # noqa: E402
 from nomad.netmap.layout import CIRCLE, GRID, GROUP_PAD, GROUP_TITLE, HORIZONTAL, LEFT, LEFT_RIGHT, MIDDLE, \
-    NODE_HEIGHT, NODE_WIDTH, STYLE_NAMES, TOP_DOWN, align, arrange, arrange_in_place, distribute  # noqa: E402
+    NODE_HEIGHT, NODE_WIDTH, STYLE_NAMES, TOP_DOWN, align, arrange, arrange_boxes_in_place, arrange_in_place, \
+    distribute  # noqa: E402
 from nomad.netmap.model import BUILDING, ROOM, SITE, Device, NetworkMap  # noqa: E402
 from nomad.ui.netmap_dialogs import GroupDialog  # noqa: E402
-from nomad.ui.netmap_view import GroupItem, LinkItem  # noqa: E402
+from nomad.ui.netmap_view import GROUP_BOX, GroupItem, LinkItem  # noqa: E402
 from test_netmap_tab import Window, app, tab  # noqa: E402,F401
 
 
@@ -182,6 +184,25 @@ def test_align_and_distribute():
     assert xs[0] == 0 and xs[2] == 500 and xs[1] == pytest.approx(250)
     stacked = distribute({"a": (0, 0), "b": (0, 0), "c": (0, 0)}, HORIZONTAL)  # On top of each other: spread out
     no_overlaps(stacked)
+
+
+
+@pytest.mark.parametrize("style", list(STYLE_NAMES))
+def test_arranging_boxes_of_different_sizes(style):
+    boxes = {"north": (0, 0, 600, 400), "south": (50, 20, 300, 900), "east": (10, 10, 200, 150),
+             "core": (5, 5, NODE_WIDTH, NODE_HEIGHT)}
+    edges = [("core", "north"), ("core", "south"), ("core", "east")]
+    placed = arrange_boxes_in_place({key: (x + 1000, y + 500, w, h) for key, (x, y, w, h) in boxes.items()},
+                                    edges, style)
+    rects = {key: (x - boxes[key][2] / 2, y - boxes[key][3] / 2, x + boxes[key][2] / 2, y + boxes[key][3] / 2)
+             for key, (x, y) in placed.items()}
+    keys = list(rects)
+    for index, key in enumerate(keys):
+        for other in keys[index + 1:]:
+            assert apart(rects[key], rects[other]), (style, key, other, rects)
+    left, top = min(x - w / 2 for x, _, w, _ in boxes.values()), min(y - h / 2 for _, y, _, h in boxes.values())
+    assert min(rect[0] for rect in rects.values()) == pytest.approx(1000 + left)  # The lot kept where it was
+    assert min(rect[1] for rect in rects.values()) == pytest.approx(500 + top)
 
 
 # ----------------------------------------------------------------- On the page
@@ -421,3 +442,49 @@ def test_undo_forgotten_with_another_map(tab, crawled):
     assert tab.undo_button.isEnabled()
     tab.show_map(store.load(tab.map_path), tab.map_path)
     assert not tab.undo_button.isEnabled()
+
+
+def test_arranging_and_aligning_groups(tab, crawled):
+    tab.on_crawled(crawled)
+    keys = sorted(crawled.devices)
+    first, second = make_site(tab, keys[:2], "A"), make_site(tab, keys[2:4], "B")
+    inner = make_site(tab, keys[:1], "A1", BUILDING, first.key)
+    a, b = tab.view.group_items[first.key], tab.view.group_items[second.key]
+    a.setSelected(True)
+    b.setSelected(True)
+    tab.view.group_items[inner.key].setSelected(True)  # In A: goes with it
+    assert sorted(tab.view.selected_groups()) == sorted([first.key, second.key])
+    lone = keys[4]
+    tab.view.items_by_key[lone].setSelected(True)
+    tab.view.items_by_key[keys[0]].setSelected(True)  # In A: goes with it
+    boxes = tab.view.boxes(tab.view.selected_keys(), tab.view.selected_groups())
+    assert set(boxes) == {GROUP_BOX + first.key, GROUP_BOX + second.key, lone}
+    before = {key: tab.view.items_by_key[key].pos() - a.rect.topLeft() for key in keys[:2]}
+    tab.align_selected(tab.view, tab.view.selected_keys(), LEFT, tab.view.selected_groups())
+    assert a.rect.left() == pytest.approx(b.rect.left())
+    assert tab.view.items_by_key[lone].pos().x() - NODE_WIDTH / 2 == pytest.approx(a.rect.left())
+    for key in keys[:2]:  # Moved with their group, not on their own
+        assert tab.view.items_by_key[key].pos() - a.rect.topLeft() == before[key]
+    tab.align_selected(tab.view, [], "vertical", [first.key, second.key])
+    assert a.rect.bottom() <= b.rect.top() or b.rect.bottom() <= a.rect.top()
+    for style in STYLE_NAMES:
+        tab.arrange_style = style
+        tab.arrange_selected(tab.view, [lone], [first.key, second.key])
+        lone_rect = tab.view.items_by_key[lone].sceneBoundingRect()
+        assert not a.rect.intersects(b.rect) and not a.rect.intersects(lone_rect) \
+            and not b.rect.intersects(lone_rect), style
+    assert tab.network_map.group_of[keys[0]] == inner.key  # Arranging doesn't change what's in the groups
+
+
+def test_group_menu_offers_arranging_the_selection(tab, crawled):
+    tab.on_crawled(crawled)
+    keys = sorted(crawled.devices)
+    first, second = make_site(tab, keys[:2], "A"), make_site(tab, keys[2:4], "B")
+    tab.view.group_items[first.key].setSelected(True)
+    tab.view.group_items[second.key].setSelected(True)
+    menu = QMenu()
+    tab.add_selection_actions(menu, tab.view, tab.view.selected_keys())
+    texts = [action.text() for action in menu.actions()]
+    assert texts[0].startswith("Arrange the 2 Selected Groups") and "Align" in texts
+    tab.view.move_selection(QPointF(100, 50))  # Dragging one of them moves both
+    assert tab.view.group_items[second.key].rect.isValid()

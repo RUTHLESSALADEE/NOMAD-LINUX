@@ -1,5 +1,6 @@
 """Devices and links added by hand on the Network Map: kept when mapping again, folded into what a crawl finds,
-asked over SNMP like the crawl's devices, monitored, and drawn by hand on the map."""
+asked over SNMP like the crawl's devices, monitored, and drawn by hand on the map. And devices the crawl found,
+corrected by hand."""
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -7,16 +8,19 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest  # noqa: E402
 from netmap_fakes import build_network  # noqa: E402
 from PyQt5.QtCore import QPoint, QSettings, Qt, pyqtSignal  # noqa: E402
+from PyQt5.QtGui import QKeySequence  # noqa: E402
 from PyQt5.QtTest import QTest  # noqa: E402
-from PyQt5.QtWidgets import QApplication, QDialog, QMessageBox, QWidget  # noqa: E402
+from PyQt5.QtWidgets import QApplication, QDialog, QMenu, QMessageBox, QShortcut, QWidget  # noqa: E402
 
 from nomad.netmap import export, store  # noqa: E402
 from nomad.netmap.crawl import CrawlSettings, Crawler, check_device  # noqa: E402
-from nomad.netmap.model import NO_SNMP, SNMP, SWITCH, UNCHECKED, UNKNOWN, UNREACHABLE, Device, Host, Link, \
-    NetworkMap  # noqa: E402
+from nomad.netmap.model import NEIGHBOR, NO_SNMP, ROUTER, SERVER, SNMP, SWITCH, UNCHECKED, UNKNOWN, UNREACHABLE, \
+    Device, Host, Link, NetworkMap  # noqa: E402
+from nomad.snmp import V1  # noqa: E402
 from nomad.ui import netmap_tab  # noqa: E402
 from nomad.ui.netmap_dialogs import DeviceDialog, LinkDialog  # noqa: E402
 from nomad.ui.netmap_view import LinkItem  # noqa: E402
+from nomad.ui.snmp_tab import SnmpTab  # noqa: E402
 
 SETTINGS = dict(seeds=["10.0.0.1"], overrides=[("10.0.0.12/32", "secret")])
 
@@ -151,9 +155,16 @@ def test_crawl_from_here_reads_a_hand_added_device_that_answers_snmp():
     newer = Crawler(CrawlSettings(seeds=["10.0.0.12"], overrides=[("10.0.0.12/32", "secret")], trace=False),
                     client_factory=network.client, pinger=network.ping, echo=network.echo, known=first).run()
     assert newer.devices["acc2"].source == SNMP  # Read, not taken for the hand-added one already read
-    first.merge_crawl(newer)
-    folded = first.fold_manual_devices()
+    preview = first.preview_with(newer, {**first.positions, "manual:1": (500.0, 600.0)})  # Dragged while crawling
+    assert "manual:1" not in preview.devices and preview.positions["acc2"] == (500.0, 600.0)  # Drawn in its place
+    assert "manual:1" not in preview.positions  # So a later snapshot leaves acc2 where it's drawn
+    assert "manual:1" in first.devices and "acc2" not in first.devices  # The map open is left as it was
+    assert first.hosts[-1].device == "manual:1" and preview.devices["acc2"] is not newer.devices["acc2"]
+    first.positions["acc2"] = (0.0, 2000.0)  # Where the live map drew it while crawling (at the bottom)
+    added, _ = first.merge_crawl(newer)
+    folded = first.fold_manual_devices(new=set(added))
     assert [manual.key for manual, _ in folded] == [hand.key] and "manual:1" not in first.devices
+    assert first.positions["acc2"] == (900.0, 900.0)  # Stays where the hand-added one was
 
 
 # ----------------------------------------------------------------- Asking over SNMP
@@ -342,3 +353,144 @@ def test_drawing_a_link_on_the_map(tab, monkeypatch):
     tab.delete_links([drawn])
     assert drawn not in tab.network_map.links
     tab.hide()
+
+
+# ----------------------------------------------------------------- Devices the crawl found, corrected by hand
+
+def test_a_correction_remembers_what_the_crawl_found():
+    device = Device(key="rtr1", name="rtr1", mgmt_ip="10.0.0.254", kind=ROUTER)
+    device.correct("mgmt_ip", "10.0.0.253")
+    device.correct("mgmt_ip", "10.0.0.252")  # Corrected again: still what the crawl found underneath
+    device.correct("kind", SWITCH)
+    assert device.corrected == {"mgmt_ip": ["10.0.0.254", "10.0.0.252"], "kind": [ROUTER, SWITCH]}
+    assert device.corrections() == {"mgmt_ip": "10.0.0.252", "kind": SWITCH}
+    device.correct("kind", ROUTER)  # Back to what was found: no longer a correction
+    assert list(device.corrected) == ["mgmt_ip"]
+    again = NetworkMap.from_json(NetworkMap(devices={"rtr1": device}).to_json()).devices["rtr1"]
+    assert again.corrected == {"mgmt_ip": ["10.0.0.254", "10.0.0.252"]}
+    again.forget_corrections()
+    assert (again.mgmt_ip, again.corrected) == ("10.0.0.254", {})
+
+
+def test_the_crawl_asks_a_device_where_it_was_corrected_to_and_keeps_the_corrections():
+    corrections = {"rtr1": {"mgmt_ip": "10.0.0.99"},  # CDP's address was wrong: asked here (nothing answers)
+                   "acc2": {"kind": SERVER, "name": "esx-host"},  # Not a network device: shown, not asked
+                   "pa-fw1": {"note": "Rack 4"}}
+    network_map = crawl(corrections=corrections)
+    rtr1, acc2, firewall = (network_map.devices[key] for key in ("rtr1", "acc2", "pa-fw1"))
+    assert (rtr1.mgmt_ip, rtr1.source) == ("10.0.0.99", UNREACHABLE)  # Not 10.0.0.254, which pings
+    assert rtr1.corrected == {"mgmt_ip": ["10.0.0.254", "10.0.0.99"]}
+    assert (acc2.kind, acc2.name, acc2.source) == (SERVER, "esx-host", NEIGHBOR)
+    assert acc2.corrected == {"kind": [SWITCH, SERVER], "name": ["acc2", "esx-host"]}
+    assert firewall.source == SNMP and firewall.note == "Rack 4"
+
+
+def test_crawl_from_here_keeps_corrections_on_devices_it_reads_again():
+    first = crawl()
+    first.devices["pa-fw1"].correct("name", "edge-fw")
+    newer = crawl(seeds=["10.0.0.5"])  # Started without the corrections
+    first.merge_crawl(newer)
+    assert first.devices["pa-fw1"].name == "edge-fw" and first.devices["pa-fw1"].corrected
+
+
+def test_correcting_a_device_the_crawl_found(tab, monkeypatch):
+    tab.on_crawled(crawl())
+    assert tab.network_map.devices["rtr1"].mgmt_ip == "10.0.0.254"
+
+    def fill(dialog):
+        assert "Found by the crawl" in dialog.findChildren(netmap_tab.QLabel)[0].text()
+        dialog.ip_input.setText("10.0.0.253")
+        dialog.kind_combo.setCurrentIndex(dialog.kind_combo.findData(SERVER))
+    accept_with(monkeypatch, DeviceDialog, fill)
+    tab.edit_device("rtr1")
+    rtr1 = tab.network_map.devices["rtr1"]
+    assert not rtr1.manual and (rtr1.mgmt_ip, rtr1.kind) == ("10.0.0.253", SERVER)
+    assert any("rtr1" in (link.a, link.b) for link in tab.network_map.links)  # Its links stay
+    assert "answers SNMP at 10.0.0.253" in tab.status_label.text()
+    finish_checks(tab)
+    assert tab.network_map.devices["rtr1"].source == NO_SNMP  # Asked at the corrected address
+    assert "IP address (the crawl found 10.0.0.254)" in netmap_tab.device_html(tab.network_map, "rtr1")
+    assert tab.crawl_settings([]).corrections == {"rtr1": {"mgmt_ip": "10.0.0.253", "kind": SERVER}}
+    assert store.load(tab.map_path).devices["rtr1"].corrected["kind"] == [ROUTER, SERVER]
+
+    tab.on_crawled(crawl(corrections=tab.crawl_settings([]).corrections))  # Mapping again: still corrected
+    assert tab.network_map.devices["rtr1"].mgmt_ip == "10.0.0.253"
+
+    tab.forget_corrections("rtr1")
+    rtr1 = tab.network_map.devices["rtr1"]
+    assert (rtr1.mgmt_ip, rtr1.kind, rtr1.corrected) == ("10.0.0.254", ROUTER, {})
+
+
+def test_snmp_details_get_the_community_the_device_answered_to(tab, monkeypatch):
+    network = build_network()
+    events = []
+    Crawler(CrawlSettings(**SETTINGS), client_factory=network.client, pinger=network.ping, echo=network.echo,
+            events=lambda kind, *details: events.append((kind, details))).run()
+    assert ("community", ("10.0.0.12", "secret")) in events  # Its subnet's community, not public
+    assert check_device(CrawlSettings(**SETTINGS), "10.0.0.12", client_factory=network.client,
+                        pinger=network.ping).community == "secret"
+
+    tab.communities, tab.overrides, tab.version = ["first", "second"], [("10.9.0.0/16", "branch")], V1
+    assert tab.snmp_access("10.0.0.5") == ("first", V1)  # Not read yet: the first the map would try
+    assert tab.snmp_access("10.9.1.1") == ("branch", V1)
+    tab.on_crawl_event("community", ("10.0.0.5", "second"))
+    assert tab.snmp_access("10.0.0.5") == ("second", V1)
+
+    asked = []
+    monkeypatch.setattr(tab.host_actions, "snmp", lambda *args: asked.append(args))
+    pages = type("Page", (), {"saved_matches": lambda self, *args: []})()
+    tab.window.terminal_tab = tab.window.scp_tab = pages
+    menu = QMenu()
+    actions = tab.host_actions.add_to(menu, "10.0.0.5", snmp=tab.snmp_access("10.0.0.5"))
+    next(run for action, run in actions.items() if action.text() == "SNMP Details")()
+    assert asked == [("10.0.0.5", "second", V1)]
+
+
+def test_the_snmp_page_takes_the_community_and_version(app):
+    page = SnmpTab(Window())
+    page.start = lambda mode: None  # Not reading anything here
+    page.query_host("10.0.0.5", "secret", V1)
+    assert (page.host_input.text(), page.community_input.text(), page.version_combo.currentText()) == \
+        ("10.0.0.5", "secret", "v1")
+    page.query_host("10.0.0.6")  # From the Sweep page: keeps what's typed
+    assert page.community_input.text() == "secret"
+
+
+def test_deleting_a_device_the_crawl_found_keeps_it_off_the_map(tab, monkeypatch):
+    tab.on_crawled(crawl())
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.Yes)
+    tab.delete_devices(["acc2"])
+    assert "acc2" not in tab.network_map.devices and "acc2" not in tab.view.items_by_key
+    assert tab.network_map.deleted == {"acc2": ["acc2", ["10.0.0.12"]]}
+    assert store.load(tab.map_path).deleted == tab.network_map.deleted
+
+    settings = tab.crawl_settings(["10.0.0.1"])  # Mapping again
+    assert settings.deleted == {"acc2": ["10.0.0.12"]}
+    network = build_network()
+    tab.on_crawled(Crawler(settings, client_factory=network.client, pinger=network.ping, echo=network.echo).run())
+    assert "acc2" not in tab.network_map.devices and "acc2" in tab.network_map.deleted
+
+    menu_texts = []
+    monkeypatch.setattr(QMenu, "exec_", lambda menu, *args: menu_texts.extend(a.text() for a in menu.actions()))
+    tab.show_background_menu(tab.view.mapToScene(0, 0), QPoint(0, 0))
+    assert "Deleted Devices (1)..." in menu_texts
+
+    def choose(dialog):
+        dialog.table.selectRow(0)
+    accept_with(monkeypatch, netmap_tab.DeletedDevicesDialog, choose)
+    tab.show_deleted_devices()
+    assert not tab.network_map.deleted
+    tab.on_crawled(crawl())
+    assert "acc2" in tab.network_map.devices
+
+
+def test_delete_key_deletes_the_devices_selected(tab, monkeypatch):
+    tab.on_crawled(crawl())
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.Yes)
+    tab.tabs.setCurrentWidget(tab.devices_table)
+    row = tab.table_rows(tab.devices_table, "rtr1")[0]
+    tab.devices_table.selectRow(row)
+    shortcut = next(item for item in tab.devices_table.findChildren(QShortcut)
+                    if item.key() == QKeySequence(QKeySequence.Delete))
+    shortcut.activated.emit()  # Offscreen windows aren't active, so a key press doesn't reach shortcuts
+    assert "rtr1" not in tab.network_map.devices and "rtr1" in tab.network_map.deleted

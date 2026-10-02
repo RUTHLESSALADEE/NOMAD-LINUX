@@ -78,6 +78,31 @@ def test_finding_a_host_opens_its_switch(tab, crawled):
     assert not tab.view.find("no-such-thing")
 
 
+def test_find_steps_through_every_match(tab, crawled):
+    tab.on_crawled(crawled)
+    matches = tab.view.find_matches("10.")
+    devices = [key for kind, key, _ in matches if kind == "device"]
+    assert len(devices) > 1 and len(matches) > len(devices)  # Devices first, then hosts
+    tab.find_input.setText("10.")
+    shown = []
+    for _ in matches:
+        tab.find()
+        shown.append(tab.view.last_found[1])
+        assert f"{len(shown)} of {len(matches)}" in tab.status_label.text()
+    assert shown == matches  # Each once, in order
+    tab.find()
+    assert tab.view.last_found[1] == matches[0]  # Round to the first again
+    tab.find(backward=True)
+    assert tab.view.last_found[1] == matches[-1]  # And back round to the last
+    tab.find_input.setText("10.10")  # Different text starts again from the first
+    tab.find()
+    assert tab.view.last_found[1] == tab.view.find_matches("10.10")[0]
+    tab.find_input.setText("10.")
+    tab.find(select_all=True)
+    selected = [item for item in tab.view.scene().selectedItems() if isinstance(item, DeviceItem)]
+    assert len(selected) == len(devices) and f"Selected {len(devices)} devices" in tab.status_label.text()
+
+
 def test_expanding_hosts_and_shared_ports(tab, crawled):
     tab.on_crawled(crawled)
     acc2 = tab.view.items_by_key["acc2"]

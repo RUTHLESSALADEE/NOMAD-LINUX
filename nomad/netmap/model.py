@@ -7,9 +7,10 @@ FORMAT_VERSION = 1
 
 # Kinds of device
 SWITCH, ROUTER, FIREWALL, AP, PHONE, HOST, UNKNOWN = "switch", "router", "firewall", "ap", "phone", "host", "unknown"
+SERVER = "server"  # Only set by hand: the crawl shows servers as hosts on their switch port
 NETWORK_KINDS = {SWITCH, ROUTER, FIREWALL}  # Worth asking over SNMP, and whose links carry other devices' traffic
 KIND_NAMES = {SWITCH: "Switch", ROUTER: "Router", FIREWALL: "Firewall", AP: "Access point", PHONE: "Phone",
-              HOST: "Host", UNKNOWN: "Unknown"}
+              HOST: "Host", SERVER: "Server", UNKNOWN: "Unknown"}
 
 # How a device was found
 SNMP = "snmp"  # Answered SNMP: its neighbors, MAC and ARP tables were read
@@ -26,6 +27,9 @@ MANUAL_SOURCE_NAMES = {SNMP: "Added by hand, answers SNMP", NO_SNMP: "Added by h
 SITE, BUILDING, ROOM = "site", "building", "room"
 GROUP_KINDS = {SITE: "Site", BUILDING: "Building", ROOM: "Room"}
 PARENT_KIND = {BUILDING: SITE, ROOM: BUILDING}  # The kind of group each kind can be in
+
+CORRECTABLE = ("name", "mgmt_ip", "kind", "platform", "note")  # What can be corrected by hand on a device found
+CORRECTED_NAMES = {"name": "Name", "mgmt_ip": "IP address", "kind": "Kind", "platform": "Model", "note": "Note"}
 
 SHARED_PORT_HOSTS = 8  # More MACs than this on a port with no neighbor: probably an unmanaged switch or a hypervisor
 
@@ -85,10 +89,38 @@ class Device:
     routes_truncated: bool = False
     manual: bool = False  # Added by hand (an unmanaged switch, or one the crawl can't reach), kept when mapping again
     note: str = ""
+    # On a device the crawl found: what was corrected by hand (a wrong address, kind or name), kept over what later
+    # crawls find. {attribute: [what the crawl found, what it was corrected to]}
+    corrected: dict = field(default_factory=dict)
 
     @property
     def label(self):
         return self.name or self.mgmt_ip or self.key
+
+    def correct(self, attribute, value):
+        """Correct what the crawl found; putting it back to what was found forgets the correction."""
+        found = self.corrected[attribute][0] if attribute in self.corrected else getattr(self, attribute)
+        if value == found:
+            self.corrected.pop(attribute, None)
+        else:
+            self.corrected[attribute] = [found, value]
+        setattr(self, attribute, value)
+
+    def apply_corrections(self, corrections):
+        """Corrections ({attribute: value}) made by hand on an earlier map, over what this crawl found."""
+        for attribute, value in corrections.items():
+            if attribute in CORRECTABLE:
+                self.correct(attribute, value)
+
+    def corrections(self):
+        """{attribute: value} corrected by hand, for the next crawl."""
+        return {attribute: value for attribute, (_, value) in self.corrected.items()}
+
+    def forget_corrections(self):
+        """Back to what the crawl found."""
+        for attribute, (found, _) in self.corrected.items():
+            setattr(self, attribute, found)
+        self.corrected = {}
 
     @property
     def found_by(self):
@@ -178,6 +210,13 @@ class NetworkMap:
     status_log: list = field(default_factory=list)  # Monitoring: [[time, device key, label, up/down, text]]
     groups: list = field(default_factory=list)  # [Group]
     group_of: dict = field(default_factory=dict)  # Device key -> key of the group it's directly in
+    # Devices the crawl found that were deleted by hand: left off (and not crawled through) when mapping again.
+    # Device key -> [label, [its addresses]]
+    deleted: dict = field(default_factory=dict)
+    # Found by watching for new devices and not looked at yet: "device:<key>" or "host:<MAC>" ->
+    # {"when": ISO time, "where": "SW1 Gi1/0/5", "by": who found it}
+    news: dict = field(default_factory=dict)
+    host_seen: dict = field(default_factory=dict)  # MAC -> date (ISO) last on the map, so a host back isn't "new"
 
     def add_link(self, link):
         """Add a link, merging it with the same link seen from the other end (or by the other protocol)."""
@@ -201,6 +240,8 @@ class NetworkMap:
         for key, device in newer.devices.items():
             old = self.devices.get(key)
             if old is None or device.source == SNMP or (old.source != SNMP and device.source != NEIGHBOR):
+                if old is not None and old.corrected and not device.corrected:  # Corrected by hand: still is
+                    device.apply_corrections(old.corrections())
                 self.devices[key] = device
         for link in newer.links:
             self.add_link(Link(link.a, link.a_port, link.b, link.b_port, list(link.protocols)))
@@ -222,15 +263,19 @@ class NetworkMap:
             self.finished, self.stopped = newer.finished, newer.stopped
         return added, read
 
-    def preview_with(self, newer):
+    def preview_with(self, newer, positions=None):
         """This map with a crawl's devices and links so far added (for drawing Crawl from Here as it goes), leaving
-        this map as it was."""
-        preview = NetworkMap(seeds=self.seeds, started=self.started, positions=dict(self.positions), root=self.root)
+        this map as it was. Devices added by hand that it has found are folded in, so the found one is drawn in their
+        place (positions: where devices are drawn now, if not this map's)."""
+        preview = NetworkMap(seeds=self.seeds, started=self.started, root=self.root,
+                             positions=dict(self.positions if positions is None else positions))
         preview.devices = dict(self.devices)
         preview.links = [replace(link, protocols=list(link.protocols)) for link in self.links]
-        preview.hosts = list(self.hosts)
-        preview.groups, preview.group_of = self.groups, dict(self.group_of)
-        preview.merge_crawl(newer, hosts=False)
+        preview.hosts = [replace(host) for host in self.hosts]
+        preview.groups, preview.group_of = [replace(group) for group in self.groups], dict(self.group_of)
+        added, _ = preview.merge_crawl(newer, hosts=False)
+        preview.devices = {key: replace(device) for key, device in preview.devices.items()}  # Folding fills some in
+        preview.fold_manual_devices(new=set(added))
         return preview
 
     # ----------------------------------------------------------------- Devices and links added by hand
@@ -241,18 +286,35 @@ class NetworkMap:
             number += 1
         return f"manual:{number}"
 
-    def remove_devices(self, keys):
-        """Take devices off the map, with their links and hosts."""
+    def remove_devices(self, keys, remember=False):
+        """Take devices off the map, with their links and hosts. remember: the ones the crawl found stay off it when
+        mapping again (deleted), until brought back."""
         keys = set(keys)
         for key in keys:
+            device = self.devices.get(key)
+            if remember and device is not None and not device.manual:
+                addresses = [device.mgmt_ip] + [address for address in device.addresses if address != device.mgmt_ip]
+                self.deleted[key] = [device.label, [address for address in addresses if address]]
             self.devices.pop(key, None)
             self.positions.pop(key, None)
             self.l3_positions.pop(key, None)
         self.links = [link for link in self.links if link.a not in keys and link.b not in keys]
         self.hosts = [host for host in self.hosts if host.device not in keys]
+        self.news = {ref: item for ref, item in self.news.items() if ref.partition(":")[2] not in keys
+                     or not ref.startswith("device:")}
         if self.root in keys:
             self.root = ""
         self.prune_groups()
+
+    def bring_back(self, keys):
+        """Forget that devices were deleted, so the next crawl puts them back on the map."""
+        for key in keys:
+            self.deleted.pop(key, None)
+
+    def carry_deleted(self, older):
+        """Keep an earlier map's deleted devices off this one too (the crawl was told to leave them out). One the
+        crawl was started from is on it again, so it isn't deleted any more."""
+        self.deleted = {key: value for key, value in older.deleted.items() if key not in self.devices}
 
     def carry_manual(self, older):
         """Bring the devices and links added by hand to an earlier map of the network over to this one; a device the
@@ -292,11 +354,12 @@ class NetworkMap:
                 return device
         return None
 
-    def fold_manual_devices(self):
+    def fold_manual_devices(self, new=()):
         """Devices added by hand that a crawl has now found for real become the found ones: their links, hosts, place
         and group move over, and what the found one doesn't know (an address, a model, a note) is filled in. A link
-        drawn by hand is dropped when the crawl found one between the same two devices. Returns [(hand-added Device,
-        found Device)]."""
+        drawn by hand is dropped when the crawl found one between the same two devices. A found device in new (just
+        added to the map, by Crawl from Here) takes the hand-added one's place rather than where the crawl drew it.
+        Returns [(hand-added Device, found Device)]."""
         folded = []
         for key, manual in list(self.devices.items()):
             found = self.found_for(manual) if manual.manual else None
@@ -319,8 +382,8 @@ class NetworkMap:
                 if host.device == key:
                     host.device = found.key
             for positions in (self.positions, self.l3_positions):
-                if key in positions:
-                    positions.setdefault(found.key, positions[key])
+                if key in positions and (found.key in new or found.key not in positions):
+                    positions[found.key] = positions[key]
             if key in self.group_of:
                 self.group_of.setdefault(found.key, self.group_of[key])
             if self.root == key:
@@ -483,6 +546,9 @@ class NetworkMap:
         network_map.status_log = [list(entry) for entry in data.get("status_log", [])]
         network_map.groups = [_build(Group, item) for item in data.get("groups", [])]
         network_map.group_of = dict(data.get("group_of", {}))
+        network_map.deleted = {key: [value[0], list(value[1])] for key, value in data.get("deleted", {}).items()}
+        network_map.news = {ref: dict(value) for ref, value in data.get("news", {}).items()}
+        network_map.host_seen = dict(data.get("host_seen", {}))
         network_map.prune_groups()
         return network_map
 
