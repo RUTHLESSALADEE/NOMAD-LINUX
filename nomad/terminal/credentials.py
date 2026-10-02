@@ -8,6 +8,7 @@ import ctypes
 from ctypes import wintypes
 
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
+CRYPTPROTECT_LOCAL_MACHINE = 0x4  # Any account on this computer can decrypt it (for services)
 ENTROPY = b"NOMAD saved session credential"  # Extra input, so other programs' DPAPI data can't be swapped in
 DESCRIPTION = "NOMAD saved session password"
 
@@ -44,14 +45,16 @@ def _take(blob, kernel32):
         kernel32.LocalFree(ctypes.cast(blob.pbData, ctypes.c_void_p))
 
 
-def protect(secret):
-    """Encrypt a password for this Windows account. Returns text safe to store in a JSON file."""
+def protect(secret, machine=False):
+    """Encrypt a password for this Windows account (or, with machine, for any account on this computer: what a
+    service and the GUI on the same machine both need). Returns text safe to store in a JSON file."""
     crypt32, kernel32 = _api()
     data, _data_buffer = _blob(secret.encode("utf-8"))
     entropy, _entropy_buffer = _blob(ENTROPY)
     result = DATA_BLOB()
-    if not crypt32.CryptProtectData(ctypes.byref(data), DESCRIPTION, ctypes.byref(entropy), None, None,
-                                    CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(result)):
+    flags = CRYPTPROTECT_UI_FORBIDDEN | (CRYPTPROTECT_LOCAL_MACHINE if machine else 0)
+    if not crypt32.CryptProtectData(ctypes.byref(data), DESCRIPTION, ctypes.byref(entropy), None, None, flags,
+                                    ctypes.byref(result)):
         raise CredentialError(f"Windows couldn't encrypt the password ({ctypes.WinError(ctypes.get_last_error())}).")
     return base64.b64encode(_take(result, kernel32)).decode("ascii")
 

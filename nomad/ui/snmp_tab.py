@@ -187,9 +187,15 @@ class SnmpTab(QWidget):
             self.worker.stop()
             self.worker.wait(self.timeout_input.value() * 3 + 2000)
 
-    def query_host(self, host):
-        """Read a device's system details now (from the Sweep page)."""
+    def query_host(self, host, community=None, version=None):
+        """Read a device's system details now (from the Sweep or Network Map page), with community and version
+        (V1 or V2C) when the page knows what the device answers to."""
         self.host_input.setText(host)
+        if community:
+            self.community_input.setText(community)
+        names = {number: name for name, number in VERSIONS.items()}
+        if version in names:
+            self.version_combo.setCurrentText(names[version])
         self.oid_input.setText(SYSTEM)
         self.on_oid_edited()
         if self.worker is None:

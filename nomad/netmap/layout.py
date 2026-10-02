@@ -362,3 +362,52 @@ def distribute(positions, direction, sizes=None):
         result[node] = (edge + size / 2, positions[node][1]) if axis == 0 else (positions[node][0], edge + size / 2)
         edge += size + gap
     return result
+
+
+# ----------------------------------------------------------------- Arranging boxes (groups among devices)
+
+
+def arrange_boxes(sizes, edges, style=TOP_DOWN, weight=lambda node: 0, gap=GROUP_GAP):
+    """Centers {key: (x, y)} for boxes of {key: (width, height)} (groups' boxes, perhaps with devices among them) in
+    an arrangement, the top-left corner of the lot at (0, 0). They're laid out as if they were device-sized, then
+    each row of that (each column, left to right) is spread out to fit the boxes' real sizes, gap apart; in a
+    circle, the whole circle is stretched to fit the biggest."""
+    if not sizes:
+        return {}
+    flat = arrange_flat(list(sizes), edges, style, None, weight)
+    if style == CIRCLE:
+        stretch_x = max(1, (max(width for width, _ in sizes.values()) + gap) / (NODE_WIDTH + H_GAP))
+        stretch_y = max(1, (max(height for _, height in sizes.values()) + gap) / (NODE_HEIGHT + LEAF_GAP))
+        centers = {key: (x * stretch_x, y * stretch_y) for key, (x, y) in flat.items()}
+        left = min(x - sizes[key][0] / 2 for key, (x, _) in centers.items())
+        top = min(y - sizes[key][1] / 2 for key, (_, y) in centers.items())
+        return {key: (x - left, y - top) for key, (x, y) in centers.items()}
+    across = 1 if style == LEFT_RIGHT else 0  # The axis a row runs along
+    lines = {}
+    for key, point in flat.items():
+        lines.setdefault(round(point[1 - across], 3), []).append(key)
+    rows = [sorted(lines[at], key=lambda key: (flat[key][across], key)) for at in sorted(lines)]
+    lengths = [sum(sizes[key][across] for key in row) + gap * (len(row) - 1) for row in rows]
+    result, offset = {}, 0
+    for row, length in zip(rows, lengths):
+        along = (max(lengths) - length) / 2  # Each row centered on the longest
+        for key in row:
+            center = [0, 0]
+            center[across] = along + sizes[key][across] / 2
+            center[1 - across] = offset + sizes[key][1 - across] / 2  # Lined up along the row's top (or left)
+            result[key] = tuple(center)
+            along += sizes[key][across] + gap
+        offset += max(sizes[key][1 - across] for key in row) + gap
+    return result
+
+
+def arrange_boxes_in_place(boxes, edges, style=TOP_DOWN, weight=lambda node: 0, gap=GROUP_GAP):
+    """arrange_boxes for {key: (center x, center y, width, height)} where they are now, keeping the top-left corner
+    of the lot where it was. Returns their new centers {key: (x, y)}."""
+    if not boxes:
+        return {}
+    left = min(x - width / 2 for x, _, width, _ in boxes.values())
+    top = min(y - height / 2 for _, y, _, height in boxes.values())
+    placed = arrange_boxes({key: (width, height) for key, (_, _, width, height) in boxes.items()}, edges, style,
+                           weight, gap)
+    return {key: (x + left, y + top) for key, (x, y) in placed.items()}

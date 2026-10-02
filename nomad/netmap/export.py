@@ -6,9 +6,9 @@ from .layout import NODE_HEIGHT, NODE_WIDTH
 from .model import KIND_NAMES
 
 DEVICE_COLUMNS = ["Name", "Status", "Management IP", "Kind", "Group", "Platform", "Found by", "Links", "Hosts",
-                  "Addresses", "Description", "Problem"]
+                  "Addresses", "Description", "Problem", "New"]
 LINK_COLUMNS = ["Device", "Port", "Neighbor", "Neighbor Port", "Seen by"]
-HOST_COLUMNS = ["MAC Address", "IP Address", "Vendor", "Name", "Switch", "Port", "VLAN", "Found by", "Note"]
+HOST_COLUMNS = ["MAC Address", "IP Address", "Vendor", "Name", "Switch", "Port", "VLAN", "Found by", "Note", "New"]
 
 DRAWIO_STYLES = {
     "switch": "fillColor=#dae8fc;strokeColor=#6c8ebf;",
@@ -36,7 +36,7 @@ def device_rows(network_map, status_of=lambda key: ""):
                      device.found_by,
                      str(len(network_map.links_of(device.key))), str(hosts.get(device.key, "")),
                      ", ".join(device.addresses), device.sys_descr.splitlines()[0] if device.sys_descr else "",
-                     device.error])
+                     device.error, news_text(network_map, f"device:{device.key}")])
     return rows
 
 
@@ -60,8 +60,15 @@ def seen_by(link):
 def host_rows(network_map):
     devices = network_map.devices
     return [[host.mac, host.ip, host.vendor, host.name, devices[host.device].label, host.port,
-             str(host.vlan or ""), "Added by hand" if host.manual else "Crawl", host.note]
+             str(host.vlan or ""), "Added by hand" if host.manual else "Crawl", host.note,
+             news_text(network_map, f"host:{host.mac}") if host.mac else ""]
             for host in network_map.hosts]
+
+
+def news_text(network_map, ref):
+    """The New column: when watching found it (until someone marks it seen)."""
+    item = network_map.news.get(ref)
+    return f"New {item.get('when', '')[:16].replace('T', ' ')}".strip() if item is not None else ""
 
 
 def write_csv(path, columns, rows):

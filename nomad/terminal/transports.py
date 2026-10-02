@@ -287,6 +287,9 @@ class SshTransport(Transport):
             sock = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
         except OSError as error:
             raise ConnectionFailed(friendly_socket_error(error, host, port)) from None
+        if self.closed:  # Closed while the connection was being made (nothing to close then)
+            sock.close()
+            raise Cancelled()
         try:
             self.transport = CompatibleTransport(sock)
             self.transport.banner_timeout = 15

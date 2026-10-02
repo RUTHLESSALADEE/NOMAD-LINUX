@@ -13,24 +13,28 @@ from pathlib import Path
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import QAbstractItemView, QActionGroup, QApplication, QCheckBox, QComboBox, QDialog, \
-    QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QShortcut, QSplitter, QTabWidget, \
-    QTextBrowser, QToolButton, QVBoxLayout, QWidget
+    QFileDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QShortcut, \
+    QSplitter, QTabWidget, QTextBrowser, QToolButton, QVBoxLayout, QWidget
 
-from ..netmap import diff, export, l3, monitor, store
-from ..netmap.crawl import MAX_WORKERS, WORKERS, CrawlSettings, Crawler, check_device
+from ..ipam.store import IpamError
+from ..netmap import diff, export, l3, monitor, shared, store, watch
+from ..netmap.crawl import MAX_WORKERS, WORKERS, CrawlSettings, Crawler, check_device, communities_for, \
+    parse_overrides
 from ..netmap.layout import BOTTOM, CENTER, HORIZONTAL, LEFT, MIDDLE, RIGHT, STYLE_NAMES, TOP, TOP_DOWN, VERTICAL, \
-    align, arrange, arrange_in_place, distribute, merge_positions
-from ..netmap.model import BUILDING, FIREWALL, GROUP_KINDS, KIND_NAMES, NO_SNMP, PARENT_KIND, ROUTER, SNMP, \
-    SWITCH, UNCHECKED, UNREACHABLE, Group, NetworkMap, display_name, port_key, short_port
+    align, arrange, arrange_boxes_in_place, arrange_in_place, distribute, merge_positions
+from ..netmap.model import BUILDING, CORRECTED_NAMES, FIREWALL, GROUP_KINDS, KIND_NAMES, NO_SNMP, PARENT_KIND, \
+    ROUTER, SNMP, SWITCH, UNCHECKED, UNREACHABLE, Group, NetworkMap, display_name, port_key, short_port
 from ..snmp import V2C
 from ..terminal.credentials import CredentialError, protect, unprotect
 from .common import SortableTableItem, StoppableThread, read_only_table, set_hint
 from .host_menu import HostActions
 from .netmap_monitor import NetworkMonitor
 from .netmap_progress import CrawlProgress
-from .netmap_dialogs import CommunitiesDialog, CompareDialog, DeviceDialog, GroupDialog, HostDialog, LinkDialog, \
-    ScopeDialog
-from .netmap_view import MapView
+from .netmap_dialogs import CommunitiesDialog, CompareDialog, DeletedDevicesDialog, DeviceDialog, GroupDialog, \
+    HostDialog, LinkDialog, ScopeDialog, shown_value
+from .netmap_tribe import TribeSync
+from .netmap_view import GROUP_BOX, MapView
+from .netmap_watch import MapWatcher
 from .table_filter import TableFilter
 from .theme import COLORS, accent_button
 
@@ -125,6 +129,7 @@ class NetworkMapTab(QWidget):
         self.network_map = None
         self.map_path = None
         self.communities, self.overrides = ["public"], []
+        self.answered = {}  # Address -> the community it answered to (kept for this session, never in the map file)
         self.version, self.timeout = V2C, DEFAULTS["timeout"]
         self.scope, self.max_hops, self.max_devices = [], DEFAULTS["max_hops"], DEFAULTS["max_devices"]
         self.collect_hosts = True
@@ -141,6 +146,9 @@ class NetworkMapTab(QWidget):
         self.crawled_map = False
         self.crawl_progress = CrawlProgress(self)
         self.monitor = NetworkMonitor(self)
+        self.tribe_map_id = None  # The tribe map open (None: a map file, or none)
+        self.tribe = TribeSync(self)
+        self.watcher = MapWatcher(self)
         self.history_map = None  # The map whose monitoring history the Monitor log is showing
         self.host_actions = HostActions(window, self)
         self.check_threads = []  # Asking devices added by hand over SNMP
@@ -159,6 +167,10 @@ class NetworkMapTab(QWidget):
         self.init_ui()
         window.adapter_changed.connect(lambda _: self.update_gateway_button())
         window.snapshot_changed.connect(lambda _: self.update_gateway_button())
+        self.tribe.synced.connect(self.on_tribe_synced)
+        self.tribe.status_changed.connect(self.update_tribe_label)
+        self.watcher.applied.connect(self.watch_applied)
+        self.watcher.status_changed.connect(self.update_watch_label)
         self.update_gateway_button()
         self.update_buttons()
 
@@ -232,8 +244,16 @@ class NetworkMapTab(QWidget):
         self.arrange_menu = QMenu(self.arrange_button)
         self.arrange_menu.aboutToShow.connect(self.fill_arrange_menu)
         self.arrange_button.setMenu(self.arrange_menu)
+        self.tribe_button = QToolButton()
+        self.tribe_button.setText("Tribe")
+        self.tribe_button.setToolTip("Maps shared with the tribe through the IPAM server: everyone with the tribe key "
+                                     "sees the same map, and changes anyone makes reach the others.")
+        self.tribe_button.setPopupMode(QToolButton.InstantPopup)
+        self.tribe_menu = QMenu(self.tribe_button)
+        self.tribe_menu.aboutToShow.connect(self.fill_tribe_menu)
+        self.tribe_button.setMenu(self.tribe_menu)
         for widget in (self.open_button, self.recent_button, self.save_button, self.export_button,
-                       self.compare_button):
+                       self.compare_button, self.tribe_button):
             tools.addWidget(widget)
         tools.addSpacing(16)
         self.monitor_check = QCheckBox("Monitor")
@@ -249,6 +269,13 @@ class NetworkMapTab(QWidget):
         tools.addWidget(self.monitor_check)
         tools.addWidget(self.interval_combo)
         tools.addWidget(self.monitor_label)
+        self.watch_check = QCheckBox("Watch")
+        self.watch_check.setToolTip("Watch for devices and hosts plugged into the network, and add them to the map "
+                                    "as they appear, tagged NEW (see the Watch tab). Keeps going on other pages "
+                                    "while NOMAD is open.")
+        self.watch_label = QLabel()
+        tools.addWidget(self.watch_check)
+        tools.addWidget(self.watch_label)
         tools.addSpacing(16)
         tools.addWidget(self.find_input, 1)
         self.hosts_check = QCheckBox("Show Hosts")
@@ -265,6 +292,9 @@ class NetworkMapTab(QWidget):
         tools.addWidget(self.fit_button)
         tools.addWidget(self.arrange_button)
         layout.addLayout(tools)
+        self.tribe_label = QLabel()
+        self.tribe_label.hide()
+        layout.addWidget(self.tribe_label)
 
         self.tabs = QTabWidget()
         self.view = MapView()
@@ -279,6 +309,7 @@ class NetworkMapTab(QWidget):
         self.tabs.addTab(self.hosts_table, "Hosts")
         self.tabs.addTab(self.crawl_progress.tab, "Crawl")
         self.tabs.addTab(self.monitor.tab, "Monitor")
+        self.tabs.addTab(self.watcher.tab, "Watch")
         self.table_names = {self.devices_table: "Devices", self.links_table: "Links", self.hosts_table: "Hosts"}
         self.table_filters = {table: TableFilter(table, lambda shown, total, table=table:
                                                  self.show_filtered_count(table, shown, total))
@@ -302,7 +333,7 @@ class NetworkMapTab(QWidget):
         self.stop_button.clicked.connect(self.stop)
         self.open_button.clicked.connect(self.open_map)
         self.save_button.clicked.connect(self.save_map_as)
-        self.find_input.returnPressed.connect(self.find)
+        self.find_input.returnPressed.connect(self.on_find_return)
         self.find_input.textChanged.connect(self.on_find_text)
         self.find_texts = {}  # Sub-tab -> what was in the find box there: each tab has its own
         self.find_owner = self.tabs.currentWidget()
@@ -316,6 +347,7 @@ class NetworkMapTab(QWidget):
         self.arrange_button.clicked.connect(lambda: self.rearrange())
         self.hosts_check.toggled.connect(self.view.set_all_hosts_shown)
         self.monitor_check.toggled.connect(self.on_monitor_toggled)
+        self.watch_check.toggled.connect(self.on_watch_toggled)
         self.interval_combo.currentIndexChanged.connect(
             lambda _: self.monitor.set_interval(self.interval_combo.currentData()))
         self.monitor.statuses_changed.connect(self.show_statuses)
@@ -340,6 +372,10 @@ class NetworkMapTab(QWidget):
         self.hosts_table.customContextMenuRequested.connect(self.show_hosts_table_menu)
         delete = QShortcut(QKeySequence.Delete, self.hosts_table, context=Qt.WidgetShortcut)
         delete.activated.connect(lambda: self.delete_hosts(self.selected_table_hosts()))
+        for widget, selected in ((self.devices_table, self.selected_table_devices),
+                                 (self.view, self.view.selected_keys), (self.l3_view, self.l3_view.selected_keys)):
+            delete = QShortcut(QKeySequence.Delete, widget, context=Qt.WidgetShortcut)
+            delete.activated.connect(lambda selected=selected: self.delete_devices(selected()))
         self.view.port_context_requested.connect(self.show_port_menu)
         self.view.background_context_requested.connect(self.show_background_menu)
         self.view.link_context_requested.connect(self.show_link_menu)
@@ -364,7 +400,12 @@ class NetworkMapTab(QWidget):
         settings.setValue("netmap/workers", self.workers)
         settings.setValue("netmap/monitor", self.monitor_check.isChecked())
         settings.setValue("netmap/monitor_interval", self.interval_combo.currentData())
-        settings.setValue("netmap/last_map", str(self.map_path) if self.map_path else "")
+        settings.setValue("netmap/last_map", f"tribe:{self.tribe_map_id}" if self.tribe_map_id is not None
+                          else str(self.map_path) if self.map_path else "")
+        settings.setValue("netmap/watch", self.watch_check.isChecked())
+        settings.setValue("netmap/watch_neighbors", self.watcher.neighbor_combo.currentData())
+        settings.setValue("netmap/watch_hosts", self.watcher.host_combo.currentData())
+        settings.setValue("netmap/watch_listen", self.watcher.listen_check.isChecked())
         settings.setValue("netmap/splitter", self.splitter.saveState())
         settings.setValue("netmap/arrange_style", self.arrange_style)
         settings.setValue("netmap/keep_groups", self.keep_groups)
@@ -395,7 +436,12 @@ class NetworkMapTab(QWidget):
         if splitter is not None:
             self.splitter.restoreState(splitter)
         last = settings.value("netmap/last_map", "", str)
-        if last and Path(last).is_file():
+        if last.startswith("tribe:") and self.tribe.ensure() is not None:
+            try:
+                self.open_tribe_map(int(last[6:]), quiet=True)
+            except ValueError:
+                pass
+        elif last and Path(last).is_file():
             try:
                 self.show_map(store.load(last), Path(last), fit=True)
             except (OSError, ValueError) as error:
@@ -405,9 +451,18 @@ class NetworkMapTab(QWidget):
             self.interval_combo.setCurrentIndex(monitor.INTERVALS.index(interval))
         if settings.value("netmap/monitor", False, bool) and self.network_map is not None:
             self.monitor_check.setChecked(True)  # Carry on watching from where it was left
+        for combo, name, choices in ((self.watcher.neighbor_combo, "watch_neighbors", watch.NEIGHBOR_INTERVALS),
+                                     (self.watcher.host_combo, "watch_hosts", watch.HOST_INTERVALS)):
+            seconds = settings.value(f"netmap/{name}", combo.currentData(), int)
+            if seconds in choices:
+                combo.setCurrentIndex(choices.index(seconds))
+        self.watcher.listen_check.setChecked(settings.value("netmap/watch_listen", True, bool))
+        if settings.value("netmap/watch", False, bool) and self.network_map is not None:
+            self.watch_check.setChecked(True)
 
     def shutdown(self):
         self.monitor.shutdown()
+        self.watcher.shutdown()
         for thread in list(self.check_threads):
             thread.stop()
             thread.wait(self.timeout * 2 + 3000)
@@ -417,6 +472,7 @@ class NetworkMapTab(QWidget):
         if self.worker is not None:
             self.worker.stop()
             self.worker.wait(self.timeout * 2 + 3000)
+        self.tribe.shutdown()
 
     # ----------------------------------------------------------------- Inputs
 
@@ -437,6 +493,13 @@ class NetworkMapTab(QWidget):
         dialog = CommunitiesDialog(self.communities, self.overrides, self.version, self.timeout, self)
         if dialog.exec_() == QDialog.Accepted:
             self.communities, self.overrides, self.version, self.timeout = dialog.values()
+            if self.tribe_map_id is not None:  # Shared with the tribe's map
+                try:
+                    self.tribe.maps.set_secrets(self.tribe_map_id, self.tribe_secrets())
+                except IpamError as error:
+                    QMessageBox.warning(self, "Communities", "The community strings are changed on this computer, "
+                                        f"but couldn't be saved with the tribe map:\n\n{error}")
+                self.write_map(self.network_map, None)  # Version and timeout go with the map
 
     def edit_scope(self):
         dialog = ScopeDialog(self.scope, self.max_hops, self.max_devices, self.collect_hosts, self.trace,
@@ -444,6 +507,8 @@ class NetworkMapTab(QWidget):
         if dialog.exec_() == QDialog.Accepted:
             self.scope, self.max_hops, self.max_devices, self.collect_hosts, self.trace, self.workers = \
                 dialog.values()
+            if self.tribe_map_id is not None and self.network_map is not None:
+                self.write_map(self.network_map, None)  # Kept with the tribe's map
 
     # ----------------------------------------------------------------- Crawling
 
@@ -491,10 +556,14 @@ class NetworkMapTab(QWidget):
         self.update_buttons()
 
     def crawl_settings(self, seeds):
+        devices = self.network_map.devices.values() if self.network_map else []
         return CrawlSettings(seeds=seeds, communities=list(self.communities), overrides=list(self.overrides),
                              scope=list(self.scope), max_hops=self.max_hops, max_devices=self.max_devices,
                              version=self.version, timeout=self.timeout, collect_hosts=self.collect_hosts,
-                             trace=self.trace, workers=self.workers)
+                             trace=self.trace, workers=self.workers,
+                             corrections={device.key: device.corrections() for device in devices if device.corrected},
+                             deleted={key: list(addresses) for key, (_, addresses)
+                                      in (self.network_map.deleted.items() if self.network_map else [])})
 
     def stop(self):
         if self.worker is not None:
@@ -518,7 +587,9 @@ class NetworkMapTab(QWidget):
 
     def on_crawl_event(self, kind, details):
         self.crawl_progress.handle(kind, details)
-        if kind == "map":
+        if kind == "community":
+            self.answered[details[0]] = details[1]
+        elif kind == "map":
             self.show_live(details[0])
         elif kind in ("started", "finished") and self.live_map is not None:
             self.ring_devices_being_read()
@@ -531,7 +602,9 @@ class NetworkMapTab(QWidget):
         if not first:
             self.live_positions.update(self.view.positions())
         if self.extending:
-            snapshot = self.network_map.preview_with(snapshot)  # The map with what's been found so far
+            # The map with what's been found so far; a device added by hand that's been read is drawn in its place
+            snapshot = self.network_map.preview_with(snapshot, self.live_positions)
+            self.live_positions = snapshot.positions
             first = False  # Keep the view where it is: the map's already on screen
         nodes = list(snapshot.devices)
         edges = [(link.a, link.b) for link in snapshot.links]
@@ -554,11 +627,12 @@ class NetworkMapTab(QWidget):
         base.positions = self.view.positions() if self.live_map is not None else base.positions
         before = {key for key, device in base.devices.items() if device.source == SNMP}
         added, read = base.merge_crawl(newer)
-        folded = base.fold_manual_devices()  # Ones added by hand it has now found
+        base.bring_back(added)  # Started from one that was deleted: it's back
+        folded = base.fold_manual_devices(new=set(added))  # Ones added by hand it has now found, kept where they were
         self.live_map = None
-        if self.map_path is not None:
+        if self.map_path is not None or self.tribe_map_id is not None:
             try:
-                store.save(base, self.map_path)
+                self.write_map(base, self.map_path)
             except OSError as error:
                 log.warning("Couldn't save the network map: %s", error)
         self.show_map(base, self.map_path)
@@ -590,6 +664,7 @@ class NetworkMapTab(QWidget):
             return
         dropped, folded, links_left_out = [], [], 0
         if self.network_map is not None:  # Devices and links added by hand, first: their places are kept below
+            network_map.carry_deleted(self.network_map)
             folded, links_left_out = network_map.carry_manual(self.network_map)
         if self.live_positions:  # Where devices were drawn (and dragged) while it crawled
             network_map.positions = {key: position for key, position in self.live_positions.items()
@@ -613,7 +688,10 @@ class NetworkMapTab(QWidget):
         self.live_map = None
         path = None
         try:
-            path = store.save(network_map)
+            if self.tribe_map_id is not None:  # The tribe's map, mapped again
+                self.write_map(network_map, None)
+            else:
+                path = store.save(network_map)
         except OSError as error:
             log.warning("Couldn't save the network map: %s", error)
         self.show_map(network_map, path, fit=not self.live_positions or self.view.auto_fit)
@@ -633,6 +711,8 @@ class NetworkMapTab(QWidget):
                         f"{'was' if links_left_out == 1 else 'were'} left out: a device at the end isn't on this map.")
         if path:
             message += f" Saved as {path.name}."
+        elif self.tribe_map_id is not None:
+            message += " Saved to the tribe map."
         set_hint(self.status_label, message, "warning" if network_map.stopped or problems or dropped
                  or links_left_out else "success")
         # Ask the devices added by hand again, so whether they answer SNMP is as fresh as the rest
@@ -667,6 +747,11 @@ class NetworkMapTab(QWidget):
         self.show_details(None)
         if self.hosts_check.isChecked():
             self.view.set_all_hosts_shown(True)
+        self.view.set_news(network_map.news)
+        identity = (self.tribe_map_id, str(path), network_map.started)
+        if identity != getattr(self, "watched_identity", None):
+            self.watched_identity = identity
+            self.watcher.map_changed()  # Watching carries on, on this map
         if fit:
             self.view.request_fit()
             self.l3_view.request_fit()
@@ -734,16 +819,20 @@ class NetworkMapTab(QWidget):
         set_hint(self.status_label, "Re-arrange lays out each site, building and room in its own box." if on else
                  "Re-arrange lays out the devices without regard to their groups.", "info")
 
-    def add_selection_actions(self, menu, view, keys, always=False):
-        """Arrange Selected and Align (with Distribute) for the devices selected on a map. always: show them
-        (disabled) when fewer than two are selected."""
-        if len(keys) < 2 and not always:
+    def add_selection_actions(self, menu, view, keys, always=False, groups=None):
+        """Arrange Selected and Align (with Distribute) for the devices and groups (sites, buildings and rooms)
+        selected on a map. groups: their keys (those selected, if None). always: show them (disabled) when fewer
+        than two are selected."""
+        groups = self.selected_groups(view) if groups is None else groups
+        count = len(view.boxes(keys, groups))
+        if count < 2 and not always:
             return
-        enabled = len(keys) > 1 and self.worker is None
-        arranged = menu.addAction(f"Arrange the {len(keys)} Selected ({STYLE_NAMES[self.arrange_style]})"
-                                  if len(keys) > 1 else "Arrange Selected")
+        enabled = count > 1 and self.worker is None
+        what = "Selected" if not groups else "Selected Groups" if count == len(groups) else "Selected Items"
+        arranged = menu.addAction(f"Arrange the {count} {what} ({STYLE_NAMES[self.arrange_style]})"
+                                  if count > 1 else "Arrange Selected")
         arranged.setEnabled(enabled)
-        arranged.triggered.connect(lambda: self.arrange_selected(view, keys))
+        arranged.triggered.connect(lambda: self.arrange_selected(view, keys, groups))
         lining = menu.addMenu("Align")
         lining.setEnabled(enabled)
         for entry in ALIGNMENTS + [None, ("Distribute Horizontally", HORIZONTAL), ("Distribute Vertically", VERTICAL)]:
@@ -751,29 +840,40 @@ class NetworkMapTab(QWidget):
                 lining.addSeparator()
             else:
                 lining.addAction(entry[0]).triggered.connect(
-                    lambda _, how=entry[1]: self.align_selected(view, keys, how))
+                    lambda _, how=entry[1]: self.align_selected(view, keys, how, groups))
 
-    def arrange_selected(self, view, keys):
-        """Lay out just these devices, where they are."""
+    def selected_groups(self, view):
+        return view.selected_groups() if view is self.view else []
+
+    def arrange_selected(self, view, keys, groups=()):
+        """Lay out just these devices, where they are; with groups, those groups' boxes (each with everything in
+        it) and the devices not in them."""
+        if groups:
+            boxes = view.boxes(keys, groups)
+            weight = self.arrange_options(view, [])["weight"]
+            view.move_boxes(arrange_boxes_in_place(boxes, view.box_links(boxes), style=self.arrange_style,
+                                                   weight=lambda key: 0 if key.startswith(GROUP_BOX) else weight(key)))
+            return
         where = view.positions()
         positions = {key: where[key] for key in keys if key in where}
         view.move_to(arrange_in_place(positions, style=self.arrange_style, **self.arrange_options(view, keys)))
 
-    def align_selected(self, view, keys, how):
-        where = view.positions()
-        positions = {key: where[key] for key in keys if key in where}
-        if how in (HORIZONTAL, VERTICAL):
-            view.move_to(distribute(positions, how, view.sizes(positions)))
-        else:
-            view.move_to(align(positions, how, view.sizes(positions)))
+    def align_selected(self, view, keys, how, groups=()):
+        """Line up devices (and with groups, those groups' boxes and the devices not in them) by their edges or
+        middles, or space them evenly."""
+        boxes = view.boxes(keys, groups)
+        centers = {key: (x, y) for key, (x, y, _, _) in boxes.items()}
+        sizes = {key: (width, height) for key, (_, _, width, height) in boxes.items()}
+        line_up = distribute if how in (HORIZONTAL, VERTICAL) else align
+        view.move_boxes(line_up(centers, how, sizes))
 
     def save_positions(self):
-        if self.network_map is None or self.map_path is None:
+        if self.network_map is None or (self.map_path is None and self.tribe_map_id is None):
             return
         self.network_map.positions = self.view.positions()
         self.network_map.l3_positions = self.l3_view.positions()
         try:
-            store.save(self.network_map, self.map_path)
+            self.write_map(self.network_map, self.map_path)
         except OSError as error:
             log.warning("Couldn't save the network map's layout: %s", error)
 
@@ -829,9 +929,9 @@ class NetworkMapTab(QWidget):
         elif here is self.crawl_progress.tab:
             text = "Find in the crawl log (Enter for the next) (Ctrl+F)"
         elif here is self.l3_view:
-            text = "Find a router, subnet or hop: name or address (Ctrl+F)"
+            text = "Find a router, subnet or hop: name or address (Enter for the next) (Ctrl+F)"
         else:
-            text = "Find a device or host: name, IP, MAC or vendor (Ctrl+F)"
+            text = "Find a device or host: name, IP, MAC or vendor (Enter for the next) (Ctrl+F)"
         self.find_input.setPlaceholderText(text)
 
     def on_find_text(self, text):
@@ -839,7 +939,12 @@ class NetworkMapTab(QWidget):
         if here in self.table_filters:
             self.table_filters[here].set_text(text)  # Tables filter as you type
 
-    def find(self):
+    def on_find_return(self):
+        """Enter: the next match. Shift+Enter: the one before. Ctrl+Enter: every matching device at once."""
+        modifiers = QApplication.keyboardModifiers()
+        self.find(backward=bool(modifiers & Qt.ShiftModifier), select_all=bool(modifiers & Qt.ControlModifier))
+
+    def find(self, backward=False, select_all=False):
         text = self.find_input.text().strip()
         here = self.tabs.currentWidget()
         if not text or here in self.table_filters:
@@ -849,8 +954,25 @@ class NetworkMapTab(QWidget):
                 set_hint(self.status_label, f"'{text}' isn't in the crawl log.", "warning")
             return
         view = self.current_view()
-        if not view.find(text):
+        if select_all:
+            count = view.find_all(text)
+            if count:
+                set_hint(self.status_label, f"Selected {count} device{'' if count == 1 else 's'} matching '{text}'.",
+                         "info")
+            else:
+                set_hint(self.status_label, f"No device on the map matches '{text}'.", "warning")
+            return
+        found = view.find(text, backward)
+        if found is None:
             set_hint(self.status_label, f"Nothing on the map matches '{text}'.", "warning")
+            return
+        position, count, label = found
+        if count == 1:
+            set_hint(self.status_label, f"Found {label}, the only match for '{text}'.", "info")
+        else:
+            set_hint(self.status_label, f"{position} of {count} matching '{text}': {label}. Enter for the next, "
+                                        f"Shift+Enter the one before, Ctrl+Enter selects every matching device.",
+                     "info")
 
     def show_details(self, selection):
         network_map = self.displayed_map()
@@ -872,10 +994,11 @@ class NetworkMapTab(QWidget):
             return
         if selection[0] == "many":
             self.details.setHtml(f"<p>{selection[1]} selected. Drag any of them to move them all.</p>"
-                                 "<p>Shift and drag the background to select several, Ctrl+click to add or remove "
-                                 "one, and Ctrl+A to select everything.</p>"
+                                 "<p>Shift and drag the background to select several, Ctrl+click a device or a "
+                                 "group's title to add or remove it, and Ctrl+A to select every device.</p>"
                                  "<p>Right-click one of them to put them in a site, building or room (Group), arrange "
-                                 "just them, or line them up (Align).</p>")
+                                 "just them, or line them up (Align). Sites, buildings and rooms selected are "
+                                 "arranged and lined up as whole boxes.</p>")
         elif selection[0] == "group":
             self.details.setHtml(group_html(network_map, selection[1], self.monitor.status))
         elif selection[0] == "device":
@@ -896,6 +1019,18 @@ class NetworkMapTab(QWidget):
         folder = "/".join(group.name.replace("/", "-") for group in network_map.group_path(device.key))
         return {"aliases": [alias for alias in aliases if alias], "name": display_name(device.name), "folder": folder}
 
+    def snmp_access(self, address):
+        """(community, version) for SNMP Details on a device: the community it answered to on a crawl or check, or
+        else the first the map would try for it."""
+        community = self.answered.get(address)
+        if community is None:
+            try:
+                candidates = communities_for(address, self.communities, parse_overrides(self.overrides))
+            except ValueError:
+                candidates = list(self.communities)
+            community = candidates[0] if candidates else None
+        return community, self.version
+
     def host_session_hints(self, host):
         """session_hints for a host learned on a switch port: its announced name, and the folder of its switch."""
         folder = ""
@@ -910,8 +1045,8 @@ class NetworkMapTab(QWidget):
             self.show_node_menu(key, position)
             return
         menu = QMenu(self)
-        actions = self.host_actions.add_to(menu, device.mgmt_ip, **self.session_hints(shown, device)) \
-            if device.mgmt_ip else {}
+        actions = self.host_actions.add_to(menu, device.mgmt_ip, **self.session_hints(shown, device),
+                                           snmp=self.snmp_access(device.mgmt_ip)) if device.mgmt_ip else {}
         menu.addSeparator()
         self.add_show_in(menu, actions, key)
         menu.addSeparator()
@@ -933,6 +1068,9 @@ class NetworkMapTab(QWidget):
         if item is not None and item.host_count and self.tabs.currentWidget() is self.view:
             label = "Hide Hosts" if item.expanded else "Show Hosts"
             actions[menu.addAction(label)] = lambda: self.view.toggle_hosts(item)
+        news = self.news_of_devices(keys)
+        if news and self.worker is None:
+            actions[menu.addAction("Mark as Seen")] = lambda: self.mark_seen(news)
         menu.addSeparator()
         actions[menu.addAction("Copy Name")] = lambda: QApplication.clipboard().setText(device.label)
         if device.mgmt_ip:
@@ -1044,7 +1182,7 @@ class NetworkMapTab(QWidget):
             actions[menu.addAction("Sweep This Subnet")] = lambda: self.sweep_subnet(node.label)
             actions[menu.addAction("Copy Subnet")] = lambda: QApplication.clipboard().setText(node.label)
         elif node.kind == l3.HOP and key != l3.SELF:
-            actions = self.host_actions.add_to(menu, node.label)
+            actions = self.host_actions.add_to(menu, node.label, snmp=self.snmp_access(node.label))
             menu.addSeparator()
             actions[menu.addAction("Crawl from Here")] = lambda: self.crawl_from(node.label)
             actions[menu.addAction("Copy Address")] = lambda: QApplication.clipboard().setText(node.label)
@@ -1084,6 +1222,9 @@ class NetworkMapTab(QWidget):
         if hosts:
             label = "Delete Host" if len(hosts) == 1 else f"Delete {len(hosts)} Hosts"
             actions[menu.addAction(label)] = lambda: self.delete_hosts(hosts)
+        news = [f"host:{host.mac}" for host in hosts if f"host:{host.mac}" in self.network_map.news]
+        if news:
+            actions[menu.addAction("Mark as Seen")] = lambda: self.mark_seen(news)
         chosen = menu.exec_(self.hosts_table.viewport().mapToGlobal(position))
         if chosen in actions:
             actions[chosen]()
@@ -1155,21 +1296,9 @@ class NetworkMapTab(QWidget):
                                  if key in network_map.devices}
         network_map.positions.update(place or {})
         network_map.l3_positions = self.l3_view.positions()
-        expanded = {key for key, item in self.view.items_by_key.items() if item.expanded}
-        selected = [select] if select else self.view.selected_keys()
-        scroll = (self.view.horizontalScrollBar().value(), self.view.verticalScrollBar().value())
-        self.show_map(network_map, self.map_path)
-        for key in expanded | ({show.device} if show else set()):
-            if key in self.view.items_by_key and self.view.items_by_key[key].host_count:
-                self.view.items_by_key[key].set_expanded(True)
-        self.view.update_scene_rect()
-        self.view.horizontalScrollBar().setValue(scroll[0])
-        self.view.verticalScrollBar().setValue(scroll[1])
-        for key in selected:
-            if key in self.view.items_by_key:
-                self.view.items_by_key[key].setSelected(True)
+        self.redraw_keeping_view(show, select)
         try:
-            self.map_path = store.save(network_map, self.map_path) if self.map_path else store.save(network_map)
+            self.map_path = self.write_map(network_map, self.map_path)
         except OSError as error:
             QMessageBox.warning(self, "Save Network Map", f"Couldn't save the map:\n\n{error}")
 
@@ -1186,8 +1315,8 @@ class NetworkMapTab(QWidget):
     # ----------------------------------------------------------------- Devices and links added by hand
 
     def add_by_hand_actions(self, menu, actions, key, keys):
-        """The device menu's links and devices drawn by hand: draw a link from it, add a device linked to it, and
-        for one added by hand, edit, ask again over SNMP, or delete."""
+        """The device menu's links and devices drawn by hand: draw a link from it, add a device linked to it, edit
+        it (or correct one the crawl found), ask again over SNMP, and delete it (or the devices selected)."""
         network_map = self.network_map
         device = network_map.devices[key]
         menu.addSeparator()
@@ -1197,16 +1326,17 @@ class NetworkMapTab(QWidget):
         if len(network_map.devices) > 1:
             actions[menu.addAction("Add Link...")] = lambda: self.add_link(key)
         actions[menu.addAction("Add Device Linked to This...")] = lambda: self.add_device(linked_to=key)
-        if not device.manual:
-            return
-        actions[menu.addAction("Edit Device...")] = lambda: self.edit_device(key)
-        if device.mgmt_ip:
+        edit = menu.addAction("Edit Device..." if device.manual else "Correct Device...")
+        actions[edit] = lambda: self.edit_device(key)
+        if device.mgmt_ip and (device.manual or "mgmt_ip" in device.corrected):
             check = menu.addAction("Checking SNMP..." if key in self.checking else "Check SNMP Again")
             check.setEnabled(key not in self.checking)
             actions[check] = lambda: self.check_devices([key], announce=True)
-        manual = [item for item in keys if item in network_map.devices and network_map.devices[item].manual]
-        label = "Delete Device" if len(manual) == 1 else f"Delete the {len(manual)} Devices Added by Hand"
-        actions[menu.addAction(label)] = lambda: self.delete_devices(manual)
+        if device.corrected:
+            actions[menu.addAction("Forget Corrections")] = lambda: self.forget_corrections(key)
+        doomed = [item for item in keys if item in network_map.devices]
+        label = "Delete Device..." if len(doomed) == 1 else f"Delete {len(doomed)} Devices..."
+        actions[menu.addAction(label)] = lambda: self.delete_devices(doomed)
 
     def add_link_actions(self, menu, actions, links):
         """Edit or delete links drawn by hand, and add another between the same two devices."""
@@ -1232,6 +1362,9 @@ class NetworkMapTab(QWidget):
         actions[menu.addAction("Add Device Here...")] = lambda: self.add_device(place=place)
         if self.network_map is not None and len(self.network_map.devices) > 1:
             actions[menu.addAction("Add Link...")] = lambda: self.add_link()
+        if self.network_map is not None and self.network_map.deleted:
+            actions[menu.addAction(f"Deleted Devices ({len(self.network_map.deleted)})...")] = \
+                self.show_deleted_devices
         if self.network_map is not None and self.network_map.devices:
             menu.addSeparator()
             actions[menu.addAction("Fit")] = self.view.fit
@@ -1306,11 +1439,30 @@ class NetworkMapTab(QWidget):
         edited, _ = dialog.values()
         self.network_map.devices[key] = edited
         self.map_changed(select=key)
-        if edited.mgmt_ip and edited.source == UNCHECKED:  # A new address: ask it
-            set_hint(self.status_label, f"Checking whether {edited.label} answers SNMP...", "info")
+        if not edited.manual and edited.corrected != device.corrected:
+            set_hint(self.status_label, f"Corrected {edited.label}. It's kept when you map again; right-click it > "
+                     "Forget Corrections to go back to what the crawl found.", "success")
+        new_address = edited.source == UNCHECKED or (not edited.manual and edited.mgmt_ip != device.mgmt_ip)
+        if edited.mgmt_ip and new_address:  # Ask it there
+            set_hint(self.status_label, f"Checking whether {edited.label} answers SNMP at {edited.mgmt_ip}...", "info")
             self.check_devices([key], announce=True)
 
+    def forget_corrections(self, key):
+        device = self.network_map.devices.get(key) if self.network_map else None
+        if device is None or not device.corrected or self.worker is not None:
+            return
+        device.forget_corrections()
+        self.map_changed(select=key)
+        set_hint(self.status_label, f"{device.label} is back to what the crawl found.", "info")
+
+    def selected_table_devices(self):
+        rows = {index.row() for index in self.devices_table.selectionModel().selectedRows()
+                if not self.devices_table.isRowHidden(index.row())}
+        return [self.devices_table.item(row, 0).data_object for row in sorted(rows)]
+
     def delete_devices(self, keys):
+        """Take devices off the map. Ones the crawl found stay off it when mapping again (and aren't crawled
+        through), until brought back from the background menu's Deleted Devices."""
         network_map = self.network_map
         keys = [key for key in keys if network_map is not None and key in network_map.devices]
         if not keys or self.worker is not None:
@@ -1322,12 +1474,30 @@ class NetworkMapTab(QWidget):
         if links or hosts:
             parts = [count_text(count, noun) for count, noun in ((links, "link"), (hosts, "host")) if count]
             text += f"\n\n{' and '.join(parts).capitalize()} on {'it' if len(keys) == 1 else 'them'} go too."
+        found = sum(1 for key in keys if not network_map.devices[key].manual)
+        if found:
+            which = ("it" if len(keys) == 1 else "them") if found == len(keys) else "the ones the crawl found"
+            text += (f"\n\nMapping again leaves {which} off the map, and doesn't crawl through {which} to what's "
+                     "beyond. To put them back, right-click the map's background > Deleted Devices.")
         if QMessageBox.question(self, "Delete Devices", text, QMessageBox.Yes | QMessageBox.No,
                                 QMessageBox.No) != QMessageBox.Yes:
             return
-        network_map.remove_devices(keys)
+        network_map.remove_devices(keys, remember=True)
         self.map_changed()
         set_hint(self.status_label, f"Deleted {count_text(len(keys), 'device')}.", "info")
+
+    def show_deleted_devices(self):
+        """The devices deleted from the map, to bring some back on the next crawl."""
+        if self.network_map is None or not self.network_map.deleted or self.worker is not None:
+            return
+        dialog = DeletedDevicesDialog(self.network_map.deleted, self)
+        if dialog.exec_() != QDialog.Accepted or not dialog.chosen():
+            return
+        keys = dialog.chosen()
+        self.network_map.bring_back(keys)
+        self.map_changed()
+        set_hint(self.status_label, f"{count_text(len(keys), 'device').capitalize()} will be back on the map when "
+                 "you map again (or Crawl from Here on a neighbor).", "success")
 
     def draw_link_from(self, key):
         self.tabs.setCurrentWidget(self.view)
@@ -1397,10 +1567,12 @@ class NetworkMapTab(QWidget):
 
     def on_checked(self, key, address, check):
         self.checking.discard(key)
+        if check.community:
+            self.answered[address] = check.community
         announce = key in self.announce
         self.announce.discard(key)
         device = self.network_map.devices.get(key) if self.network_map else None
-        if device is None or not device.manual or device.mgmt_ip != address:
+        if device is None or device.mgmt_ip != address or not (device.manual or "mgmt_ip" in device.corrected):
             return  # Deleted, found by a crawl, or given another address meanwhile
         check.apply(device)
         if self.worker is None:
@@ -1453,6 +1625,7 @@ class NetworkMapTab(QWidget):
         if self.worker is None:
             actions[menu.addAction(f"Arrange This {kind} ({STYLE_NAMES[self.arrange_style]})")] = \
                 lambda: self.arrange_group(key)
+            self.add_selection_actions(menu, self.view, self.view.selected_keys())  # With others selected
             menu.addSeparator()
             actions[menu.addAction("Rename...")] = lambda: self.rename_group(key)
             if group.kind in PARENT_KIND:
@@ -1561,7 +1734,7 @@ class NetworkMapTab(QWidget):
         self.view.update_scene_rect()
         self.fill_tables()  # The Group column
         try:
-            self.map_path = store.save(network_map, self.map_path) if self.map_path else store.save(network_map)
+            self.map_path = self.write_map(network_map, self.map_path)
         except OSError as error:
             QMessageBox.warning(self, "Save Network Map", f"Couldn't save the map:\n\n{error}")
         if message:
@@ -1712,6 +1885,294 @@ class NetworkMapTab(QWidget):
         if change.device:
             self.view.show_device(change.device)
 
+    # ----------------------------------------------------------------- Watching for new devices
+
+    def on_watch_toggled(self, on):
+        if on and self.network_map is None:
+            self.watch_check.setChecked(False)
+            return
+        if on:
+            self.watcher.start()
+        else:
+            self.watcher.stop()
+        self.update_watch_label()
+
+    def update_watch_label(self):
+        summary = self.watcher.summary()
+        self.watch_label.setText(summary)
+        new = self.network_map is not None and bool(self.network_map.news)
+        self.watch_label.setStyleSheet(f"color: {COLORS['success' if new else 'muted']};")
+
+    def watch_options(self):
+        return watch.WatchOptions(communities=list(self.communities), overrides=[list(item) for item in self.overrides],
+                                  scope=list(self.scope), version=self.version, timeout=self.timeout,
+                                  max_hops=self.max_hops, max_devices=self.max_devices, workers=self.workers)
+
+    def can_watch_now(self):
+        """Whether watching may change the map now: not while the user's own crawl runs or something's dragged."""
+        return self.worker is None and QApplication.mouseButtons() == Qt.NoButton
+
+    def map_name(self):
+        if self.tribe_map_id is not None and self.tribe.maps is not None:
+            return (self.tribe.maps.map_info(self.tribe_map_id) or {}).get("name", "the tribe map")
+        return Path(self.map_path).stem if self.map_path else "the map"
+
+    def watch_applied(self, result):
+        """Watching read some switches again and added what it found: redraw (keeping the view) and save."""
+        if self.network_map is None:
+            return
+        place = {}
+        for key in result.devices:  # Beside the switch it was seen on
+            near = next((link.other(key) for link in self.network_map.links_of(key)
+                         if link.other(key) in self.view.items_by_key), None)
+            if near is not None:
+                position = self.view.items_by_key[near].pos()
+                place[key] = (position.x() + 40 * (1 + len(place)), position.y() + 140)
+        self.map_changed(place=place)
+        if result:
+            self.window.show_status("Watch: " + "; ".join(result.lines[:3])
+                                    + (f" (and {len(result.lines) - 3} more)" if len(result.lines) > 3 else ""))
+            if result.devices or result.hosts:
+                set_hint(self.status_label, "Watching found: " + "; ".join(result.lines[:5]) + ". They're tagged "
+                         "NEW until marked as seen (right-click, or Mark All as Seen on the Watch tab).", "success")
+        self.update_watch_label()
+
+    def news_of_devices(self, keys):
+        """News refs for these devices and the hosts on them."""
+        if self.network_map is None:
+            return []
+        keys = set(keys)
+        refs = [f"device:{key}" for key in keys if f"device:{key}" in self.network_map.news]
+        refs += [f"host:{host.mac}" for host in self.network_map.hosts
+                 if host.device in keys and f"host:{host.mac}" in self.network_map.news]
+        return refs
+
+    def mark_seen(self, refs):
+        """Clear NEW tags (all of them when refs is None)."""
+        if self.network_map is None or not self.network_map.news:
+            return
+        cleared = watch.acknowledge(self.network_map, refs)
+        if not cleared:
+            return
+        self.view.set_news(self.network_map.news)
+        self.fill_tables()
+        try:
+            self.map_path = self.write_map(self.network_map, self.map_path)
+        except OSError as error:
+            log.warning("Couldn't save the network map: %s", error)
+        self.update_watch_label()
+        self.watcher.update_summary()
+
+    # ----------------------------------------------------------------- Tribe maps
+
+    def write_map(self, network_map, path):
+        """Save the map where it belongs: the tribe map open, the file it came from, or a new file. Returns the
+        file's path (None for a tribe map)."""
+        if self.tribe_map_id is not None and self.tribe.maps is not None:
+            self.tribe.save(self.tribe_map_id, network_map, self.tribe_settings())
+            self.update_tribe_label()
+            return None
+        return store.save(network_map, path) if path else store.save(network_map)
+
+    def tribe_settings(self):
+        """How the map is crawled, kept with a tribe map (community strings are kept apart, as secrets)."""
+        return {"scope": list(self.scope), "max_hops": self.max_hops, "max_devices": self.max_devices,
+                "version": self.version, "timeout": self.timeout, "collect_hosts": self.collect_hosts,
+                "trace": self.trace, "workers": self.workers, "seeds": self.seeds_input.text()}
+
+    def tribe_secrets(self):
+        return {"communities": list(self.communities), "overrides": [list(item) for item in self.overrides]}
+
+    def apply_tribe_settings(self, settings, secrets):
+        self.scope = list(settings.get("scope", self.scope))
+        for name in ("max_hops", "max_devices", "version", "timeout", "collect_hosts", "trace", "workers"):
+            if name in settings:
+                setattr(self, name, type(getattr(self, name))(settings[name]))
+        self.workers = max(1, min(MAX_WORKERS, self.workers))
+        if settings.get("seeds"):
+            self.seeds_input.setText(settings["seeds"])
+        if secrets.get("communities"):
+            self.communities = list(secrets["communities"])
+            self.overrides = [tuple(item) for item in secrets.get("overrides", [])]
+
+    def fill_tribe_menu(self):
+        menu = self.tribe_menu
+        menu.clear()
+        maps = self.tribe.ensure()
+        if maps is None:
+            menu.addAction("No tribe key on this computer: join the tribe on the IP Addresses page "
+                           "(Tribe...)").setEnabled(False)
+            return
+        listed = maps.maps()
+        if not listed:
+            menu.addAction("No tribe maps yet" if maps.online else "No tribe maps here yet (the server hasn't "
+                           "been reached)").setEnabled(False)
+        for item in listed:
+            action = menu.addAction(f"Open {item['name']}", lambda map_id=item["id"]: self.open_tribe_map(map_id))
+            action.setCheckable(True)
+            action.setChecked(item["id"] == self.tribe_map_id)
+        menu.addSeparator()
+        share = menu.addAction("Share This Map with the Tribe...", self.share_with_tribe)
+        share.setEnabled(self.network_map is not None and self.tribe_map_id is None and self.worker is None)
+        if self.tribe_map_id is not None:
+            menu.addAction("Rename Tribe Map...", self.rename_tribe_map)
+            menu.addAction("Keep a Copy on This Computer Only", self.leave_tribe_map)
+            menu.addAction("Delete Tribe Map...", self.delete_tribe_map)
+
+    def flush_save(self):
+        """Save a move waiting on the timer now (before the map open changes)."""
+        if self.save_timer.isActive():
+            self.save_timer.stop()
+            self.save_positions()
+
+    def open_tribe_map(self, map_id, quiet=False):
+        maps = self.tribe.ensure()
+        if maps is None or self.worker is not None:
+            return
+        info = maps.map_info(map_id)
+        if info is None or info.get("deleted"):
+            if not quiet:
+                QMessageBox.warning(self, "Open Tribe Map", "That map isn't shared with the tribe any more.")
+            return
+        self.flush_save()
+        network_map, settings = maps.load(map_id)
+        secrets = maps.secrets(map_id)
+        if not secrets:
+            try:
+                secrets = maps.fetch_secrets(map_id)
+            except Exception as error:  # Offline: the communities already set here are used
+                log.info("Couldn't fetch a tribe map's community strings: %s", error)
+        self.apply_tribe_settings(settings, secrets)
+        self.tribe_map_id = map_id
+        self.show_map(network_map, None, fit=True)
+        self.update_tribe_label()
+        if not quiet:
+            set_hint(self.status_label, f"Opened the tribe map {info['name']}. Changes made here reach everyone "
+                     "with the tribe key (and are sent later if the server can't be reached now).", "info")
+
+    def share_with_tribe(self):
+        maps = self.tribe.ensure()
+        if maps is None or self.network_map is None:
+            return
+        default = Path(self.map_path).stem if self.map_path else store.default_name(self.network_map)[:-len(
+            store.EXTENSION)]
+        name, ok = QInputDialog.getText(self, "Share with the Tribe", "Name for the map (everyone in the tribe will "
+                                        "see it, and its community strings, by this name):", text=default)
+        if not ok or not name.strip():
+            return
+        self.flush_save()
+        self.network_map.positions = self.view.positions()
+        self.network_map.l3_positions = self.l3_view.positions()
+        try:
+            map_id = maps.create(name, self.network_map, self.tribe_settings(), self.tribe_secrets())
+        except IpamError as error:
+            QMessageBox.warning(self, "Share with the Tribe", f"Couldn't share the map:\n\n{error}")
+            return
+        self.tribe_map_id, self.map_path = map_id, None
+        self.watched_identity = (map_id, "None", self.network_map.started)  # Same map: watching carries on
+        if self.watcher.running:
+            self.watcher.map_changed()
+        self.update_tribe_label()
+        set_hint(self.status_label, f"Shared as the tribe map {name.strip()}. Everyone with the tribe key can open it "
+                 "from Tribe, and changes anyone makes reach the others.", "success")
+
+    def rename_tribe_map(self):
+        info = self.tribe.maps.map_info(self.tribe_map_id) or {}
+        name, ok = QInputDialog.getText(self, "Rename Tribe Map", "New name:", text=info.get("name", ""))
+        if not ok or not name.strip():
+            return
+        try:
+            self.tribe.maps.rename(self.tribe_map_id, name)
+        except IpamError as error:
+            QMessageBox.warning(self, "Rename Tribe Map", f"Couldn't rename it:\n\n{error}")
+        self.update_tribe_label()
+
+    def leave_tribe_map(self, message=None):
+        """Carry on with the map as a file on this computer only."""
+        self.flush_save()
+        self.network_map.positions = self.view.positions()
+        self.tribe_map_id = None
+        try:
+            self.map_path = store.save(self.network_map)
+        except OSError as error:
+            QMessageBox.warning(self, "Tribe Map", f"Couldn't save the map:\n\n{error}")
+        self.watched_identity = (None, str(self.map_path), self.network_map.started)
+        if self.watcher.running:
+            self.watcher.map_changed()
+        self.update_tribe_label()
+        set_hint(self.status_label, message or f"This map is now on this computer only, as "
+                 f"{self.map_path.name if self.map_path else 'a file'}. The tribe map is unchanged.", "info")
+
+    def delete_tribe_map(self):
+        info = self.tribe.maps.map_info(self.tribe_map_id) or {}
+        answer = QMessageBox.question(self, "Delete Tribe Map", f"Delete the tribe map {info.get('name', '')} for "
+                                      "everyone? This computer keeps a copy as a file.")
+        if answer != QMessageBox.Yes:
+            return
+        map_id = self.tribe_map_id
+        try:
+            self.tribe.maps.delete(map_id)
+        except IpamError as error:
+            QMessageBox.warning(self, "Delete Tribe Map", f"Couldn't delete it:\n\n{error}")
+            return
+        self.leave_tribe_map("Deleted the tribe map. This computer keeps a copy as a file.")
+
+    def update_tribe_label(self):
+        text = self.tribe.status_text(self.tribe_map_id)
+        self.tribe_label.setText(text)
+        self.tribe_label.setVisible(bool(text))
+        offline = bool(self.tribe.error) or (self.tribe.maps is not None and not self.tribe.maps.online)
+        self.tribe_label.setStyleSheet(f"color: {COLORS['warning' if offline else 'muted']};")
+
+    def on_tribe_synced(self, touched):
+        self.update_tribe_label()
+        map_id = self.tribe_map_id
+        if map_id is None or map_id not in touched:
+            return
+        info = self.tribe.maps.map_info(map_id)
+        if info is None or info.get("deleted"):
+            self.leave_tribe_map("Someone deleted this tribe map. This computer keeps a copy as a file.")
+            return
+        if touched[map_id]:
+            self.reload_from_tribe()
+
+    def reload_from_tribe(self):
+        """Others changed the tribe map open: show their changes, keeping the view where it is."""
+        if self.tribe_map_id is None or self.network_map is None:
+            return
+        if not self.can_watch_now():  # Mid-crawl or mid-drag: try again shortly
+            QTimer.singleShot(2000, self.reload_from_tribe)
+            return
+        self.flush_save()
+        newer, settings = self.tribe.maps.load(self.tribe_map_id)
+        if shared.flatten(newer) == shared.flatten(self.network_map):
+            return  # Only this computer's own changes coming back
+        newer.status_log = self.network_map.status_log  # Monitoring history is this computer's own
+        if self.history_map is self.network_map:
+            self.history_map = newer
+        self.watched_identity = (self.tribe_map_id, "None", newer.started)
+        self.network_map = newer
+        self.apply_tribe_settings(settings, {})
+        self.redraw_keeping_view()
+        self.update_watch_label()
+
+    def redraw_keeping_view(self, show=None, select=None):
+        """Draw the map open again, keeping the view where it was, what was selected and which hosts were open."""
+        network_map = self.network_map
+        expanded = {key for key, item in self.view.items_by_key.items() if item.expanded}
+        selected = [select] if select else self.view.selected_keys()
+        scroll = (self.view.horizontalScrollBar().value(), self.view.verticalScrollBar().value())
+        self.show_map(network_map, self.map_path)
+        for key in expanded | ({show.device} if show else set()):
+            if key in self.view.items_by_key and self.view.items_by_key[key].host_count:
+                self.view.items_by_key[key].set_expanded(True)
+        self.view.update_scene_rect()
+        self.view.horizontalScrollBar().setValue(scroll[0])
+        self.view.verticalScrollBar().setValue(scroll[1])
+        for key in selected:
+            if key in self.view.items_by_key:
+                self.view.items_by_key[key].setSelected(True)
+
     # ----------------------------------------------------------------- Files
 
     def open_map(self):
@@ -1725,6 +2186,9 @@ class NetworkMapTab(QWidget):
         except (OSError, ValueError) as error:
             QMessageBox.warning(self, "Open Network Map", f"Couldn't open {path.name}:\n\n{error}")
             return
+        self.flush_save()
+        self.tribe_map_id = None
+        self.update_tribe_label()
         self.show_map(network_map, path, fit=True)
         set_hint(self.status_label, f"Opened {path.name} (mapped {network_map.started.replace('T', ' ')}).", "info")
 
@@ -1745,10 +2209,15 @@ class NetworkMapTab(QWidget):
             return
         self.network_map.positions = self.view.positions()
         try:
-            self.map_path = store.save(self.network_map, path)
+            saved = store.save(self.network_map, path)
         except OSError as error:
             QMessageBox.critical(self, "Save Network Map", f"Couldn't save the map:\n\n{error}")
             return
+        if self.tribe_map_id is not None:  # A copy: the tribe's map stays open
+            set_hint(self.status_label, f"Saved a copy as {saved.name}. The tribe map is still the one open.",
+                     "success")
+            return
+        self.map_path = saved
         set_hint(self.status_label, f"Saved {self.map_path.name}.", "success")
 
     def export_path(self, title, extension, file_filter):
@@ -1814,6 +2283,7 @@ class NetworkMapTab(QWidget):
             widget.setEnabled(has_map or running)
         self.update_undo_buttons()
         self.monitor_check.setEnabled(has_map or self.monitor_check.isChecked())
+        self.watch_check.setEnabled(has_map or self.watch_check.isChecked())
         here = self.tabs.currentWidget()
         self.find_input.setEnabled(has_map or running or here is self.crawl_progress.tab)
 
@@ -1841,7 +2311,9 @@ def device_html(network_map, key, state=None):
     rows = [("Status", monitor_status_text(state)), ("Management IP", device.mgmt_ip),
             ("Group", network_map.device_group_label(key)), ("Found by", device.found_by),
             ("Hops from start", "" if device.manual else str(device.hops)),
-            ("Addresses", ", ".join(device.addresses)), ("Problem", device.error), ("Note", device.note)]
+            ("Addresses", ", ".join(device.addresses)), ("Problem", device.error), ("Note", device.note),
+            ("Corrected", "; ".join(f"{CORRECTED_NAMES[attribute]} (the crawl found {shown_value(attribute, found)})"
+                                    for attribute, (found, _) in device.corrected.items()))]
     for label, value in rows:
         if value:
             parts.append(f"<tr><td><b>{escape(label)}</b>&nbsp;</td><td>{escape(value)}</td></tr>")

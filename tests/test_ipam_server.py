@@ -400,3 +400,81 @@ def test_sweep_results_are_shared_but_not_history(server, tmp_path):
     sync_sightings(bob)
     sync_sightings(alice)
     assert alice.sightings(network.id)[0][ipaddress.ip_address("10.0.0.5")]["mac"] == "aa-bb"
+
+
+# --------------------------------------------------------------------- Tribe maps
+
+def tribe_maps(server, tmp_path, user):
+    from nomad.netmap.tribe import TribeMaps
+    key = key_for(server)
+    return TribeMaps(key.server_id, TeamClient(key, user=user, computer=user.upper()), tmp_path / f"{user}-maps.db")
+
+
+def small_map():
+    from nomad.netmap.model import Device, Link, NetworkMap
+    network_map = NetworkMap(seeds=["10.0.0.1"])
+    network_map.devices = {"core": Device("core", "core", "10.0.0.1", source="snmp"),
+                           "acc1": Device("acc1", "acc1", "10.0.0.11", source="snmp")}
+    network_map.links = [Link("core", "Gi1/0/1", "acc1", "Gi1/0/49", ["cdp"])]
+    network_map.positions = {"core": (0.0, 0.0), "acc1": (0.0, 100.0)}
+    return network_map
+
+
+def test_tribe_map_shared_edited_and_merged(server, tmp_path):
+    alice, bob = tribe_maps(server, tmp_path, "alice"), tribe_maps(server, tmp_path, "bob")
+    map_id = alice.create("HQ", small_map(), {"scope": ["10.0.0.0/8"]}, {"communities": ["s3cret"]})
+    bob.sync()
+    assert [item["name"] for item in bob.maps()] == ["HQ"]
+    assert bob.fetch_secrets(map_id) == {"communities": ["s3cret"]}
+    bobs, settings = bob.load(map_id)
+    assert set(bobs.devices) == {"core", "acc1"} and settings == {"scope": ["10.0.0.0/8"]}
+
+    # Both move a different device; alice is offline when she does
+    alices, _ = alice.load(map_id)
+    alices.positions["core"] = (50.0, 50.0)
+    alice.save(map_id, alices)
+    bobs.positions["acc1"] = (70.0, 70.0)
+    assert bob.save(map_id, bobs) == 1
+    bob.sync()
+    assert bob.pending_count() == 0
+    alice.sync()
+    merged, _ = alice.load(map_id)
+    assert merged.positions == {"core": (50.0, 50.0), "acc1": (70.0, 70.0)}
+    bob.sync()
+    assert bob.load(map_id)[0].positions == merged.positions
+
+
+def test_tribe_map_offline_changes_kept_until_sent(server, tmp_path):
+    alice = tribe_maps(server, tmp_path, "alice")
+    map_id = alice.create("HQ", small_map(), {}, {})
+    edited, _ = alice.load(map_id)
+    edited.devices["acc1"].note = "closet 2"
+    server.stop()
+    alice.save(map_id, edited)
+    with pytest.raises(ServerUnreachable):
+        alice.sync()
+    assert alice.pending_count(map_id) == 1 and not alice.online
+    assert alice.load(map_id)[0].devices["acc1"].note == "closet 2"  # Offline, still there
+
+
+def test_tribe_map_lease_and_wait(server, tmp_path):
+    alice, bob = tribe_maps(server, tmp_path, "alice"), tribe_maps(server, tmp_path, "bob")
+    map_id = alice.create("HQ", small_map(), {}, {})
+    assert alice.lease(map_id, "alice-gui")["yours"]
+    lease = bob.lease(map_id, "bob-gui")
+    assert not lease["yours"] and lease["computer"] == "ALICE"
+    bob.sync()
+    assert bob.leases[map_id]["holder"] == "alice-gui"
+    revision = bob.revision
+    waiter = TeamClient(key_for(server), user="bob")
+    result = []
+    thread = threading.Thread(target=lambda: result.append(waiter.wait_for_maps(revision, timeout=10)))
+    thread.start()
+    alice.rename(map_id, "Head office")
+    thread.join(10)
+    assert result and result[0] > revision
+    bob.sync()
+    assert bob.maps()[0]["name"] == "Head office"
+    alice.delete(map_id)
+    bob.sync()
+    assert bob.maps() == []

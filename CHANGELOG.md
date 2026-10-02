@@ -6,6 +6,29 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-10-02
+
+### Added
+
+- Network Map: watch for new devices. Tick **Watch** and the switches on the map are asked for their CDP and LLDP neighbors every few minutes; a switch with a new neighbor is read again at once (as Crawl from Here does), so a new switch, router, firewall or access point is added beside the port it was seen on, with its links and hosts. Every switch's MAC table is read again every hour (or as often as chosen) for new hosts. What's found is tagged NEW on the map (a green tag on a device, a dot beside a host) and in a New column on the Devices and Hosts tabs, until it's marked as seen (right-click > Mark as Seen, or Mark All as Seen); the Watch tab logs what was found and where. Hosts seen on the map in the last 30 days aren't news, and deleted devices stay off. Saved with the map.
+- Network Map: switches can tell NOMAD at once. With Listen ticked on the Watch tab, syslog (UDP 514) and SNMP traps (UDP 162) from a switch on the map have it read 45 seconds later when a port comes up, CDP or LLDP changes, or a MAC address is learned or moves (Cisco link up/down, CDP, LLDP and MAC-flap messages; linkUp, cold/warm start, LLDP and Cisco MAC-notification traps, v1 and v2c, informs answered). Several from one switch are one reading. The Watch tab lists the lines to paste into a Cisco switch. The Syslog page and watching share port 514.
+- Tribe maps: share a network map with the tribe through the IPAM server (Tribe > Share This Map with the Tribe...). Everyone with the tribe key can open it from Tribe; its community strings and scope go with it. Changes are sent as the items they touch (a device, a link, a host, a group, a device's place) and merged item by item, so people working on different parts of the map don't undo each other, and the later change wins on the same item. Changes reach other computers within seconds, and a tribe map opens and changes offline, sending its changes when the server is back. Tribe maps can be renamed, deleted (everyone keeps a copy as a file) or copied to this computer only. They're in the server's nightly backups.
+- Only one computer watches a tribe map at a time: the others say who ("watched by WS-12 (NOMAD)") and stand by, taking over if it stops, so the network isn't read twice. A computer that can't reach the tribe server watches anyway and sends what it found later.
+- Tools > Map Watcher Service: the NOMAD Map Watcher Windows service watches chosen tribe maps from a computer that's usually on and can reach the switches, with nobody signed in. It takes over from NOMAD left open elsewhere, listens for syslog and traps (opening UDP 514 and 162 in Windows Firewall), and adds what it finds to the tribe maps. `NOMAD.exe --map-watcher` runs it in a console for trying it out.
+
+- Network Map: correct a device the crawl found (right-click > Correct Device...): its name, management address (when CDP gave none, or the wrong one), kind, model or note. Corrections are kept over what later crawls find, the crawl asks the device at the corrected address, and Forget Corrections puts back what was found. Devices can be marked as servers.
+- Network Map: deleting a device the crawl found keeps it off the map when mapping again, and the crawl doesn't go through it (unless you start from it). Right-click the map's background > Deleted Devices to bring them back.
+- Network Map: SNMP Details on a device uses the community string it answered to during the crawl.
+- Network Map: several sites, buildings and rooms can be selected together (Ctrl+click or Shift-drag round their titles, with devices too) to drag, arrange, align or distribute them; each moves as one box.
+
+### Fixed
+
+- Closing a Terminal or SCP tab while it's still connecting (no answer yet, or waiting for a password) no longer leaves NOMAD waiting; the connection is dropped when it finishes.
+
+### Changed
+
+- The IPAM server (API level 6) keeps tribe maps in maps.db beside the IPAM database. Update the service (Tools > IPAM Server > Update Service) to share maps; older servers keep working for IPAM, and the map page says the server needs updating.
+
 ## [1.12.0] - 2026-10-01
 
 ### Added

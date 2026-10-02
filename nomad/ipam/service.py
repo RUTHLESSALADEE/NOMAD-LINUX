@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from .server import IpamServer, load_config, log_to_file, server_dir, set_up
@@ -34,6 +35,19 @@ FOLDER_GRANTS = ["*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "*S-1-5-20:(O
 
 class ServiceError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class ServiceSpec:
+    """One of NOMAD's Windows services: the IPAM server, or the Map Watcher."""
+    name: str
+    display_name: str
+    description: str
+    argument: str  # On NOMAD's command line, to run as the service
+    log_file: object  # () -> Path of its log, to explain a failed start
+
+
+IPAM = ServiceSpec(SERVICE_NAME, DISPLAY_NAME, DESCRIPTION, SERVICE_ARGUMENT, lambda: server_dir() / "server.log")
 
 
 def install_dir():
@@ -101,30 +115,30 @@ def run_service_dispatcher():
 
 # --------------------------------------------------------------------- Managing it (needs administrator rights)
 
-def status():
+def status(spec=IPAM):
     """NOT_INSTALLED, STOPPED, STARTING, RUNNING or STOPPING."""
     import pywintypes
     import win32service
     import win32serviceutil
     try:
-        state = win32serviceutil.QueryServiceStatus(SERVICE_NAME)[1]
+        state = win32serviceutil.QueryServiceStatus(spec.name)[1]
     except pywintypes.error:
         return NOT_INSTALLED
     return {win32service.SERVICE_STOPPED: STOPPED, win32service.SERVICE_START_PENDING: STARTING,
             win32service.SERVICE_RUNNING: RUNNING, win32service.SERVICE_STOP_PENDING: STOPPING}.get(state, STOPPED)
 
 
-def _command():
+def _command(argument=SERVICE_ARGUMENT):
     """(command line, account) for the service: the packaged exe copied to Program Files, or Python and Main.py."""
     if getattr(sys, "frozen", False):
         target = install_dir() / "NOMAD.exe"
         target.parent.mkdir(parents=True, exist_ok=True)
         if Path(sys.executable).resolve() != target.resolve():
             shutil.copy2(sys.executable, target)
-        return f'"{target}" {SERVICE_ARGUMENT}', NETWORK_SERVICE
+        return f'"{target}" {argument}', NETWORK_SERVICE
     python = Path(sys.executable).with_name("python.exe")
     main = Path(__file__).resolve().parents[2] / "Main.py"
-    return f'"{python}" "{main}" {SERVICE_ARGUMENT}', None  # None: Local System
+    return f'"{python}" "{main}" {argument}', None  # None: Local System
 
 
 def secure_folder(directory, grants=FOLDER_GRANTS):
@@ -139,17 +153,53 @@ def secure_folder(directory, grants=FOLDER_GRANTS):
         _run(["icacls", str(Path(directory) / "*"), "/reset", "/T", "/C", "/Q"])
 
 
-def open_firewall(port):
-    subprocess.run(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={FIREWALL_RULE}"],
+def open_firewall(port, rule=FIREWALL_RULE, protocol="TCP"):
+    close_firewall(rule)
+    _run(["netsh", "advfirewall", "firewall", "add", "rule", f"name={rule}", "dir=in", "action=allow",
+          f"protocol={protocol}", f"localport={port}", "profile=any"])
+
+
+def close_firewall(rule=FIREWALL_RULE):
+    subprocess.run(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule}"],
                    capture_output=True, creationflags=_hidden())
-    _run(["netsh", "advfirewall", "firewall", "add", "rule", f"name={FIREWALL_RULE}", "dir=in", "action=allow",
-          "protocol=TCP", f"localport={port}", "profile=any"])
+
+
+def register(spec):
+    """Create the service (or point it at this copy of NOMAD again), starting with Windows and restarting if it
+    fails. Returns the command line."""
+    import win32service
+    if status(spec) in (RUNNING, STARTING):
+        stop(spec)  # So the exe can be replaced
+    command, account = _command(spec.argument)
+    manager = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_ALL_ACCESS)
+    try:
+        try:
+            service = win32service.OpenService(manager, spec.name, win32service.SERVICE_ALL_ACCESS)
+            win32service.ChangeServiceConfig(service, win32service.SERVICE_WIN32_OWN_PROCESS,
+                                             win32service.SERVICE_AUTO_START, win32service.SERVICE_ERROR_NORMAL,
+                                             command, None, 0, None, account or "LocalSystem", "", spec.display_name)
+        except win32service.error:
+            service = win32service.CreateService(manager, spec.name, spec.display_name,
+                                                 win32service.SERVICE_ALL_ACCESS,
+                                                 win32service.SERVICE_WIN32_OWN_PROCESS,
+                                                 win32service.SERVICE_AUTO_START,
+                                                 win32service.SERVICE_ERROR_NORMAL, command, None, 0, None,
+                                                 account, None)
+        try:
+            win32service.ChangeServiceConfig2(service, win32service.SERVICE_CONFIG_DESCRIPTION, spec.description)
+            win32service.ChangeServiceConfig2(service, win32service.SERVICE_CONFIG_FAILURE_ACTIONS, {
+                "ResetPeriod": 86400, "RebootMsg": None, "Command": None,
+                "Actions": [(win32service.SC_ACTION_RESTART, 60000)] * 3})
+        finally:
+            win32service.CloseServiceHandle(service)
+    finally:
+        win32service.CloseServiceHandle(manager)
+    log.info("Installed the %s service: %s", spec.display_name, command)
+    return command
 
 
 def install(port=None):
     """Install (or update) and start the service. Returns the server's config."""
-    import win32service
-    import win32serviceutil
     directory = server_dir()
     directory.mkdir(parents=True, exist_ok=True)
     secure_folder(directory)  # First, so it also repairs a folder whose files can't be read
@@ -158,73 +208,50 @@ def install(port=None):
         from .server import save_config
         config["port"] = port
         save_config(config, directory)
-    if status() in (RUNNING, STARTING):
-        stop()  # So the exe can be replaced
-    command, account = _command()
-    manager = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_ALL_ACCESS)
-    try:
-        try:
-            service = win32service.OpenService(manager, SERVICE_NAME, win32service.SERVICE_ALL_ACCESS)
-            win32service.ChangeServiceConfig(service, win32service.SERVICE_WIN32_OWN_PROCESS,
-                                             win32service.SERVICE_AUTO_START, win32service.SERVICE_ERROR_NORMAL,
-                                             command, None, 0, None, account or "LocalSystem", "", DISPLAY_NAME)
-        except win32service.error:
-            service = win32service.CreateService(manager, SERVICE_NAME, DISPLAY_NAME,
-                                                 win32service.SERVICE_ALL_ACCESS,
-                                                 win32service.SERVICE_WIN32_OWN_PROCESS,
-                                                 win32service.SERVICE_AUTO_START,
-                                                 win32service.SERVICE_ERROR_NORMAL, command, None, 0, None,
-                                                 account, None)
-        try:
-            win32service.ChangeServiceConfig2(service, win32service.SERVICE_CONFIG_DESCRIPTION, DESCRIPTION)
-            win32service.ChangeServiceConfig2(service, win32service.SERVICE_CONFIG_FAILURE_ACTIONS, {
-                "ResetPeriod": 86400, "RebootMsg": None, "Command": None,
-                "Actions": [(win32service.SC_ACTION_RESTART, 60000)] * 3})
-        finally:
-            win32service.CloseServiceHandle(service)
-    finally:
-        win32service.CloseServiceHandle(manager)
+    register(IPAM)
     open_firewall(config["port"])
-    log.info("Installed the %s service: %s", DISPLAY_NAME, command)
     start()
     return config
 
 
-def start():
+def start(spec=IPAM):
     import win32serviceutil
-    win32serviceutil.StartService(SERVICE_NAME)
+    win32serviceutil.StartService(spec.name)
     deadline = time.monotonic() + START_WAIT_SECONDS
     while time.monotonic() < deadline:
-        state = status()
+        state = status(spec)
         if state == RUNNING:
             return
         if state == STOPPED:
             break
         time.sleep(0.5)
-    raise ServiceError(f"The service didn't start. {last_log_error()}")
+    raise ServiceError(f"The service didn't start. {last_log_error(spec)}")
 
 
-def stop():
+def stop(spec=IPAM):
     import win32serviceutil
     try:
-        win32serviceutil.StopServiceWithDeps(SERVICE_NAME, waitSecs=START_WAIT_SECONDS)
+        win32serviceutil.StopServiceWithDeps(spec.name, waitSecs=START_WAIT_SECONDS)
     except Exception as error:  # Already stopped, or it doesn't exist
         log.info("Stopping the service: %s", error)
 
 
+def remove(spec):
+    import win32serviceutil
+    stop(spec)
+    win32serviceutil.RemoveService(spec.name)
+
+
 def uninstall():
     """Stop and remove the service and its firewall rule. The data in %ProgramData%\\NOMAD\\server is kept."""
-    import win32serviceutil
-    stop()
-    win32serviceutil.RemoveService(SERVICE_NAME)
-    subprocess.run(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={FIREWALL_RULE}"],
-                   capture_output=True, creationflags=_hidden())
+    remove(IPAM)
+    close_firewall()
 
 
-def last_log_error():
-    """The last error in the server's log, to explain a failed start."""
+def last_log_error(spec=IPAM):
+    """The last error in the service's log, to explain a failed start."""
     try:
-        lines = (server_dir() / "server.log").read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = spec.log_file().read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return "Details may be in Event Viewer (Windows Logs > Application)."
     errors = [line for line in lines if " ERROR " in line or " CRITICAL " in line]

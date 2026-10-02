@@ -93,3 +93,52 @@ def test_clear_scrollback_drops_a_selection_there(app):
     view.clear_scrollback()
     assert view.view.selection is None
     view.shutdown()
+
+
+class StuckTransport:
+    """Connects slowly (no answer yet, or waiting on a password), then reports whether it was closed."""
+    enter = "\r"
+    description = notice = close_reason = ""
+
+    def __init__(self, release, asks):
+        self.release, self.asks, self.closed = release, asks, False
+
+    def connect(self):
+        self.release.wait(5)
+        if self.asks:
+            self.answer = self.prompter.secret("Password", "Password:", False)
+
+    def read(self):
+        return b""
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.mark.parametrize("asks", [False, True])
+def test_closing_while_connecting_lets_the_connection_finish_alone(app, monkeypatch, asks):
+    import threading
+    import nomad.ui.terminal_view as terminal_view
+    release = threading.Event()
+    transports = []
+
+    def make(session, prompter, size, vault):
+        transport = StuckTransport(release, asks)
+        transport.prompter = prompter
+        transports.append(transport)
+        return transport
+
+    monkeypatch.setattr(terminal_view, "make_transport", make)
+    view = make_view(app, 100)
+    view.connect_session()
+    thread = view.thread
+    view.shutdown()  # Closing the tab: this used to destroy the still-running thread, taking the program down
+    view.deleteLater()
+    app.processEvents()
+    assert thread.parent() is None and thread.isRunning()
+    release.set()  # The device finally answers (or the password is asked for, for a view that's gone)
+    assert thread.wait(3000)
+    app.processEvents()
+    assert transports[0].closed
+    if asks:
+        assert transports[0].answer is None

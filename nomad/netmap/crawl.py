@@ -17,8 +17,8 @@ from dataclasses import dataclass, field
 from ..oui import format_mac, vendor
 from ..snmp import V2C, SnmpClient, SnmpError, parse_oid
 from . import collect, l3
-from .model import AP, HOST, KIND_NAMES, NETWORK_KINDS, NO_SNMP, PHONE, SNMP, UNKNOWN, UNREACHABLE, Device, Host, \
-    Link, NetworkMap, Trace, display_name, normalize_name, port_key, short_port
+from .model import AP, HOST, KIND_NAMES, NETWORK_KINDS, NO_SNMP, PHONE, SERVER, SNMP, UNKNOWN, UNREACHABLE, Device, \
+    Host, Link, NetworkMap, Trace, display_name, normalize_name, port_key, short_port
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +50,12 @@ class CrawlSettings:
     trace: bool = True  # Traceroute to what SNMP couldn't show (for the logical view)
     max_traces: int = l3.MAX_TRACES
     workers: int = WORKERS
+    # Device key -> {attribute: value} corrected by hand on the map before: an address to ask it at (CDP gave none,
+    # or the wrong one), what kind it is (asked if a network device), its name. Kept over what the crawl finds.
+    corrections: dict = field(default_factory=dict)
+    # Device key -> [its addresses]: deleted from the map by hand, so left off it and not crawled through (unless
+    # it's where the crawl starts)
+    deleted: dict = field(default_factory=dict)
 
 
 def parse_networks(lines):
@@ -63,6 +69,20 @@ def parse_networks(lines):
     return networks
 
 
+def parse_overrides(overrides):
+    """[(subnet text, community)] as [(network, community)], the most specific subnet first."""
+    return sorted(((ipaddress.ip_network(subnet, strict=False), community) for subnet, community in overrides),
+                  key=lambda item: item[0].prefixlen, reverse=True)
+
+
+def communities_for(address, communities, overrides):
+    """The community strings to try for address, in order: those for the subnets it's in (overrides, as
+    parse_overrides gives them), then communities."""
+    ip = ipaddress.ip_address(address)
+    chosen = [community for network, community in overrides if ip.version == network.version and ip in network]
+    return list(dict.fromkeys(chosen + list(communities)))
+
+
 class Crawler:
     def __init__(self, settings, client_factory=SnmpClient, pinger=None, should_stop=lambda: False,
                  progress=lambda message: None, echo=None, events=lambda kind, *details: None, known=None):
@@ -74,6 +94,7 @@ class Crawler:
             ("counts", {...})                  read, reading, queued, found, no_snmp, unreachable
             ("map", NetworkMap)                a copy of the map so far (devices and links), every LIVE_INTERVAL
             ("phase", text)                    hosts, traceroute
+            ("community", address, community)  the community string it answered to
         known: a map this crawl adds to (Crawl from Here). Devices it read aren't read again, and keep their keys.
         """
         self.settings = settings
@@ -86,9 +107,7 @@ class Crawler:
         self.should_stop = should_stop
         self.progress = progress
         self.scope = parse_networks(settings.scope)
-        self.overrides = sorted(((ipaddress.ip_network(subnet, strict=False), community)
-                                 for subnet, community in settings.overrides),
-                                key=lambda item: item[0].prefixlen, reverse=True)
+        self.overrides = parse_overrides(settings.overrides)
         self.map = NetworkMap(seeds=list(settings.seeds))
         self.aliases = {}  # Address or normalized name -> device key
         self.tables = {}  # Device key -> DeviceTables, for placing hosts at the end
@@ -105,6 +124,10 @@ class Crawler:
                     if device.name:
                         self.aliases.setdefault(normalize_name(device.name), key)
             self.asked -= set(settings.seeds)  # Except where it starts from
+        seeds = set(settings.seeds)
+        self.deleted = {key for key, addresses in settings.deleted.items() if not seeds & set(addresses)}
+        self.deleted_addresses = {address for key in self.deleted for address in settings.deleted[key]}
+        self.left_out = set()  # Deleted devices seen as neighbors (logged once each)
 
     # ----------------------------------------------------------------- Scope
 
@@ -118,10 +141,7 @@ class Crawler:
         return ip.is_private and not ip.is_loopback and not ip.is_link_local
 
     def communities_for(self, address):
-        ip = ipaddress.ip_address(address)
-        chosen = [community for network, community in self.overrides if ip.version == network.version
-                  and ip in network]
-        return list(dict.fromkeys(chosen + list(self.settings.communities)))
+        return communities_for(address, self.settings.communities, self.overrides)
 
     # ----------------------------------------------------------------- Crawl
 
@@ -171,8 +191,12 @@ class Crawler:
                 self.events("log", f"Stopped, with {len(running)} being read and {len(queue)} still to read")
                 for future in running:
                     future.cancel()
+        self.map.remove_devices([key for key in self.map.devices if key in self.deleted])  # Reached another way
         self.report_counts(0, 0)
         self.events("map", self.snapshot())
+        for key, corrections in self.settings.corrections.items():  # Corrected by hand: kept over what was found
+            if key in self.map.devices:
+                self.map.devices[key].apply_corrections(corrections)
         if self.settings.collect_hosts:
             self.events("phase", "Placing hosts on switch ports")
         self.place_hosts()
@@ -245,6 +269,7 @@ class Crawler:
                                              timeout=self.settings.timeout, retries=self.settings.retries)
                 info = collect.system_info(client.get([parse_oid(collect.SYS_DESCR), parse_oid(collect.SYS_OBJECT_ID),
                                                        parse_oid(collect.SYS_NAME)]))
+                self.events("community", address, community)
                 return client, info, community
             except (SnmpError, OSError) as problem:
                 log.debug("SNMP to %s: %s", address, problem)
@@ -373,6 +398,11 @@ class Crawler:
     def find(self, address="", name=""):
         return self.aliases.get(address) or (self.aliases.get(normalize_name(name)) if name else None)
 
+    def found_address(self, key, address):
+        """The address to note on a device as found: not one it was only asked at because it was corrected by
+        hand (that's put back at the end, as a correction over what the crawl found)."""
+        return "" if address == self.settings.corrections.get(key, {}).get("mgmt_ip") else address
+
     def add_device(self, key, **details):
         device = self.map.devices.get(key)
         if device is None:
@@ -407,7 +437,7 @@ class Crawler:
         """Put a visit's results on the map. Returns the neighbors to visit next as [(address, hops, key)]."""
         if tables is None:
             key = key or self.find(address) or f"ip:{address}"
-            device = self.add_device(key, mgmt_ip=address)
+            device = self.add_device(key, mgmt_ip=self.found_address(key, address))
             if error == STOPPED:
                 self.events("finished", address, "stopped")
             elif device.source != SNMP:
@@ -431,7 +461,7 @@ class Crawler:
         elif existing and existing != key:
             self.merge(key, existing)  # Found under two names (a neighbor's view, and its own sysName)
             key = existing
-        device = self.add_device(key, mgmt_ip=address)
+        device = self.add_device(key, mgmt_ip=self.found_address(key, address))
         device.name = info.name or device.name  # Its own sysName over how a neighbor wrote it
         device.source, device.error, device.hops = SNMP, "", hops
         device.sys_descr, device.sys_object_id = info.descr, info.object_id
@@ -468,27 +498,41 @@ class Crawler:
             other = self.find(neighbor.address, neighbor.name) or normalize_name(neighbor.name)
             if other == key:
                 continue
+            if other in self.deleted or (neighbor.address and neighbor.address in self.deleted_addresses):
+                if other not in self.left_out:
+                    self.left_out.add(other)
+                    self.events("log", f"Left out {display_name(neighbor.name) or neighbor.address} (seen on "
+                                       f"{device.label}): it was deleted from the map")
+                continue
+            corrected = self.settings.corrections.get(other, {})  # By hand, on the map before
+            found_kind, kind = kind, corrected.get("kind", kind)  # What to note, and what decides whether it's asked
+            address = corrected.get("mgmt_ip") or neighbor.address
             fresh = other not in self.map.devices
             on_map = self.known is not None and other in self.known.devices  # From the map being added to
             known = not fresh or on_map
+            if address != neighbor.address:
+                self.aliases.setdefault(address, other)
             other_device = self.add_device(other, name=display_name(neighbor.name), mgmt_ip=neighbor.address,
                                            platform=neighbor.platform)
             if fresh:  # What the map says it is, if it's on it (an access point's port isn't an uplink)
-                other_device.kind = self.known.devices[other].kind if on_map else kind
+                other_device.kind = found_kind
+                if on_map:  # What the crawl found it to be before (the correction goes back on at the end)
+                    before = self.known.devices[other]
+                    other_device.kind = before.corrected.get("kind", [before.kind])[0]
                 other_device.hops = hops + 1
             self.capabilities.setdefault(other, set()).update(neighbor.capabilities)
             self.map.add_link(Link(key, short_port(neighbor.local_port), other, short_port(neighbor.port),
                                    [neighbor.protocol]))
-            if other_device.source == SNMP or (neighbor.address and neighbor.address in self.asked):
+            if other_device.source == SNMP or (address and address in self.asked):
                 continue
-            name = f"{other_device.label} ({neighbor.address})" if neighbor.address else other_device.label
+            name = f"{other_device.label} ({address})" if address else other_device.label
             if not known:
                 self.events("log", f"Found {name} through {neighbor.protocol.upper()} on {device.label} "
                                    f"{short_port(neighbor.local_port)}")
             why_not = ""
-            if not neighbor.address:
+            if not address:
                 why_not = "it didn't announce a management address"
-            elif not self.in_scope(neighbor.address):
+            elif not self.in_scope(address):
                 why_not = "it's outside the scope"
             elif hops + 1 > self.settings.max_hops:
                 why_not = f"it's more than {self.settings.max_hops} hops from the start"
@@ -504,8 +548,8 @@ class Crawler:
                 if not known:
                     self.events("log", f"Not asking {name}: {why_not}")
                 continue
-            self.asked.add(neighbor.address)
-            next_visits.append((neighbor.address, hops + 1, other))
+            self.asked.add(address)
+            next_visits.append((address, hops + 1, other))
         return next_visits
 
     def place_hosts(self):
@@ -563,7 +607,7 @@ class Crawler:
         uplinks = set()
         for link in self.map.links_of(key):
             other = self.map.devices.get(link.other(key))
-            if other is not None and other.kind not in (PHONE, HOST, AP):
+            if other is not None and other.kind not in (PHONE, HOST, AP, SERVER):
                 uplinks.add(port_key(link.port_on(key)))
         members = {}
         for member, parent in tables.lag_parents.items():
@@ -585,6 +629,7 @@ class Check:
     source: str  # SNMP, NO_SNMP or UNREACHABLE
     error: str = ""
     info: collect.SystemInfo = None
+    community: str = ""  # The community string it answered to
 
     def apply(self, device):
         """Note it on the device, as a crawl would: its sysName (if it hasn't a name), description and kind."""
@@ -600,9 +645,9 @@ def check_device(settings, address, client_factory=SnmpClient, pinger=None):
     """Ask one device for its system details with the communities a crawl would try; ping it if none answers.
     Returns a Check. Reads nothing else (no neighbors or tables): Crawl from Here does that."""
     crawler = Crawler(settings, client_factory=client_factory, pinger=pinger)
-    _, info, _ = crawler.connect(address)
+    _, info, community = crawler.connect(address)
     if info is not None:
-        return Check(SNMP, "", info)
+        return Check(SNMP, "", info, community)
     return Check(NO_SNMP, PINGS_NO_SNMP) if crawler.pinger(address) else Check(UNREACHABLE, NO_ANSWER)
 
 

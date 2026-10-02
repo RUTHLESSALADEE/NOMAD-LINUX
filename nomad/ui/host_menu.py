@@ -13,10 +13,11 @@ class HostActions:
     def __init__(self, window, parent):
         self.window, self.parent = window, parent
 
-    def add_to(self, menu, host, aliases=(), name="", folder=""):
+    def add_to(self, menu, host, aliases=(), name="", folder="", snmp=None):
         """Add the actions for host to menu. Returns {QAction: callable} for running the chosen one. aliases: the
         host's other addresses and names, for finding its saved sessions; name and folder: what to call a new
-        session to it, and the folder to suggest when it's saved."""
+        session to it, and the folder to suggest when it's saved; snmp: (community, version) for SNMP Details, when
+        the page knows what the host answers to."""
         actions = {}
         for label, page, protocol in (("SSH", self.window.terminal_tab, SSH), ("SCP", self.window.scp_tab, SSH),
                                       ("Telnet", self.window.terminal_tab, TELNET)):
@@ -40,7 +41,7 @@ class HostActions:
             menu.addAction("Traceroute"): lambda: self.trace(host),
             menu.addAction("Monitor Latency"): lambda: self.monitor_latency(host),
             menu.addAction("Scan Ports"): lambda: self.scan_ports(host),
-            menu.addAction("SNMP Details"): lambda: self.snmp(host),
+            menu.addAction("SNMP Details"): lambda: self.snmp(host, *(snmp or ())),
             menu.addAction("Capture Traffic..."): lambda: self.capture(host),
         })
         return actions
@@ -95,10 +96,10 @@ class HostActions:
             self.window.navigator.setCurrentWidget(self.window.ports_tab)
             self.window.ports_tab.scan_host(host)
 
-    def snmp(self, host):
+    def snmp(self, host, community=None, version=None):
         if host:
             self.window.navigator.setCurrentWidget(self.window.snmp_tab)
-            self.window.snmp_tab.query_host(host)
+            self.window.snmp_tab.query_host(host, community, version)
 
     def capture(self, host):
         """Fill in the host on the Packet Capture page; capturing needs a deliberate Start (and admin rights)."""

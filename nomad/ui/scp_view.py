@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import QFileDialog, QHBoxLayout, QInputDialog, QLabel, QMen
 
 from ..terminal.files import CANCELLED, DONE, DOWNLOAD, FAILED, OVERWRITE, PAUSED, QUEUED, RUNNING, UPLOAD, Entry, \
     FileConnection, RemoteError, SCP, Transfer, TransferRunner, chmod_tree, chown_tree, join, parent as remote_parent, remove_tree
-from .common import format_size, set_hint
+from .common import format_size, release_thread, set_hint
 from .file_panes import LocalPane, RemotePane
 from .prompts import PromptAnswers, UiPrompter
 from .remote_editor import EDITOR_LIMIT, ExternalEdit, RemoteEditor, edit_folder, looks_binary, open_in_program, \
@@ -205,6 +205,7 @@ class FileSessionView(PromptAnswers, QWidget):
         if self.state != DISCONNECTED:
             return
         self.set_state(CONNECTING)
+        self.prompter = UiPrompter(self)  # A fresh one: the last connection's was cancelled when it closed
         self.connection = FileConnection(self.session, self.prompter, self.store.vault if self.store else None,
                                          sudo=self.sudo)
         self.connect_thread = ConnectThread(self.connection, self)
@@ -284,7 +285,7 @@ class FileSessionView(PromptAnswers, QWidget):
             self.connection.close()  # Unblocks anything waiting on the network
         for thread in (self.connect_thread, self.transfer_worker, self.worker):
             if thread is not None:
-                thread.wait(3000)
+                release_thread(thread, 200 if thread is self.connect_thread else 3000)
         self.connect_thread = self.transfer_worker = self.worker = self.connection = None
         self.remote.worker = None
         self.remote.set_connected(False)

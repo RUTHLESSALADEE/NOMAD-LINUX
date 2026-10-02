@@ -266,6 +266,34 @@ class TeamClient:
     def edit(self, action, **arguments):
         return self.request("POST", "/api/edit", dict(arguments, action=action))
 
+    # ----------------------------------------------------------------- Tribe maps (server API 6)
+
+    def wait_for_maps(self, maps_since, timeout=25):
+        """Wait (up to `timeout` seconds) for a map change after `maps_since`. Returns the latest map revision (None
+        from a server without tribe maps)."""
+        reply = self.request("GET", f"/api/wait?since={2 ** 62}&timeout={timeout}&maps_since={int(maps_since)}")
+        return reply.get("maps")
+
+    def map_changes(self, since):
+        """Every map change after `since` (safe on a worker thread). Returns ({"maps", "items", "leases"},
+        revision)."""
+        payload, revision = {"maps": [], "items": [], "leases": {}}, since
+        while True:
+            reply = self.request("GET", f"/api/maps/changes?since={int(revision)}")
+            payload["maps"] += reply["maps"]
+            payload["items"] += reply["items"]
+            payload["leases"] = reply.get("leases", {})
+            revision = reply["revision"]
+            if not reply.get("more"):
+                return payload, revision
+
+    def map_request(self, action, **body):
+        """create, push, rename, delete, secrets or lease."""
+        return self.request("POST", f"/api/maps/{action}", body)
+
+    def map_secrets(self, map_id):
+        return self.request("GET", f"/api/maps/secrets?map_id={int(map_id)}")["secrets"]
+
     def import_networks(self, plans):
         return self.request("POST", "/api/import", {"plans": plans})
 

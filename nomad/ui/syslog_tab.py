@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QComboBo
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QSpinBox, QTableWidget, \
     QVBoxLayout, QWidget
 
-from ..syslog import SEVERITIES, SYSLOG_PORT, SyslogReceiver, format_line
+from ..syslog import SEVERITIES, SYSLOG_PORT, format_line, hub
 from ..system import allow_inbound_port
 from .common import SortableTableItem, set_hint
 from .theme import COLORS, accent_button
@@ -187,17 +187,16 @@ class SyslogTab(QWidget):
             except OSError as error:
                 set_hint(self.status_label, f"Couldn't open the log file {path}: {error}", "error")
                 return
-        receiver = SyslogReceiver(self.on_message, self.address_combo.currentData(), self.port_input.value(),
-                                  self.tcp_check.isChecked())
-        try:
-            receiver.start()
+        port = self.port_input.value()
+        try:  # Shared with the Map Watcher, if it's listening on the same port
+            hub.subscribe(self.on_message, port, self.address_combo.currentData(), self.tcp_check.isChecked())
         except OSError as error:
             self.close_log_file()
             reason = "another program (probably another syslog server) is using it" \
                 if getattr(error, "winerror", None) == 10048 else (error.strerror or str(error))
             set_hint(self.status_label, f"Couldn't listen on port {self.port_input.value()}: {reason}.", "error")
             return
-        self.receiver = receiver
+        self.receiver = port  # The port subscribed to
         self.timer.start(FLUSH_MILLISECONDS)
         protocols = "UDP and TCP" if self.tcp_check.isChecked() else "UDP"
         where = self.address_combo.currentData()
@@ -209,7 +208,7 @@ class SyslogTab(QWidget):
     def stop(self):
         if self.receiver is None:
             return
-        self.receiver.stop()
+        hub.unsubscribe(self.on_message, self.receiver)
         self.receiver = None
         self.flush()
         self.timer.stop()
