@@ -110,6 +110,22 @@ def admin_key(directory=None):
         return None
 
 
+def current_key(admin=False):
+    """The tribe key NOMAD uses on this computer: on the tribe server itself (NOMAD running as administrator), the
+    server's own admin key; otherwise the saved tribe key, or None."""
+    return (admin_key() if admin else None) or load_saved_key()
+
+
+def is_tribe_server():
+    """Whether the IPAM server is installed on this computer (its folder is only readable as administrator, so
+    this asks Windows about the service instead)."""
+    try:
+        from . import service
+        return service.status() != service.NOT_INSTALLED
+    except Exception:  # pywin32 missing, or not Windows
+        return False
+
+
 # --------------------------------------------------------------------- Saved connection (the secret encrypted)
 
 def settings_path():

@@ -16,6 +16,7 @@ from PyQt5.QtWidgets import QAbstractItemView, QActionGroup, QApplication, QChec
     QFileDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QShortcut, \
     QSplitter, QTabWidget, QTextBrowser, QToolButton, QVBoxLayout, QWidget
 
+from ..ipam.client import ADMIN, current_key, is_tribe_server, read_key_file, save_key
 from ..ipam.store import IpamError
 from ..netmap import diff, export, l3, monitor, shared, store, watch
 from ..netmap.crawl import MAX_WORKERS, WORKERS, CrawlSettings, Crawler, check_device, communities_for, \
@@ -147,7 +148,7 @@ class NetworkMapTab(QWidget):
         self.crawl_progress = CrawlProgress(self)
         self.monitor = NetworkMonitor(self)
         self.tribe_map_id = None  # The tribe map open (None: a map file, or none)
-        self.tribe = TribeSync(self)
+        self.tribe = TribeSync(self, key_loader=self.tribe_key)
         self.watcher = MapWatcher(self)
         self.history_map = None  # The map whose monitoring history the Monitor log is showing
         self.host_actions = HostActions(window, self)
@@ -2000,8 +2001,11 @@ class NetworkMapTab(QWidget):
         menu.clear()
         maps = self.tribe.ensure()
         if maps is None:
-            menu.addAction("No tribe key on this computer: join the tribe on the IP Addresses page "
-                           "(Tribe...)").setEnabled(False)
+            if is_tribe_server() and getattr(self.window, "admin", False) is not True:
+                menu.addAction("This is the tribe server: restart NOMAD as administrator (File > Restart as "
+                               "Administrator) to use its maps").setEnabled(False)
+                menu.addSeparator()
+            menu.addAction("Join the Tribe with a Key File...", self.join_tribe)
             return
         listed = maps.maps()
         if not listed:
@@ -2018,6 +2022,62 @@ class NetworkMapTab(QWidget):
             menu.addAction("Rename Tribe Map...", self.rename_tribe_map)
             menu.addAction("Keep a Copy on This Computer Only", self.leave_tribe_map)
             menu.addAction("Delete Tribe Map...", self.delete_tribe_map)
+        menu.addSeparator()
+        key = self.tribe_key()
+        if key is not None and key.role == ADMIN:
+            menu.addAction("This computer is the tribe server").setEnabled(False)
+        else:
+            menu.addAction("Join the Tribe with Another Key File...", self.join_tribe)
+            menu.addAction("Leave the Tribe...", self.leave_tribe)
+
+    def tribe_key(self):
+        """The key for the tribe's server: its own admin key on the server (as administrator), or the saved one."""
+        return current_key(getattr(self.window, "admin", False) is True)
+
+    def join_tribe(self):
+        """Save a tribe key file's key for this Windows account (the IP Addresses page uses it too)."""
+        path, _ = QFileDialog.getOpenFileName(self, "Join the Tribe", "", "NOMAD tribe key (*.nomadkey);;All files (*)")
+        if not path:
+            return
+        try:
+            key = read_key_file(path)
+            save_key(key)
+        except (IpamError, OSError) as error:
+            QMessageBox.warning(self, "Join the Tribe", str(error))
+            return
+        self.tribe_key_changed()
+        self.window.tribe_key_changed(self)
+        set_hint(self.status_label, "Joined the tribe. The key is saved, encrypted for your Windows account, and the IP "
+                 "Addresses page uses it too. Open the tribe's maps from Tribe (they arrive once the server has "
+                 "been reached), or share this one. You can delete the key file now, or keep it somewhere safe: "
+                 "anyone with it can change the tribe's maps and IPAM.", "success")
+
+    def leave_tribe(self):
+        """Stop using the tribe on this computer (as Tribe > Disconnect on the IP Addresses page)."""
+        unsent = self.unsent_tribe_changes()
+        warning = (f"\n\n{unsent} change{'s' if unsent != 1 else ''} to tribe maps haven't reached the server and "
+                   "will be lost." if unsent else "")
+        if QMessageBox.question(self, "Leave the Tribe", "Stop using the tribe on this computer? The saved tribe key "
+                                "and the copies of the tribe's maps and IPAM data are removed (a tribe map open here "
+                                "is kept as a file); your own maps and networks are kept." + warning) \
+                != QMessageBox.Yes:
+            return
+        self.window.leave_tribe(self)
+
+    def unsent_tribe_changes(self):
+        return self.tribe.maps.pending_count() if self.tribe.maps is not None else 0
+
+    def tribe_key_changed(self, forget=False):
+        """The tribe key was saved, changed or forgotten (here or on the IP Addresses page)."""
+        map_id = self.tribe_map_id
+        if map_id is not None and self.network_map is not None:
+            self.flush_save()
+        self.tribe.reset(forget=forget)
+        maps = self.tribe.ensure() if self.tribe_key() is not None else None
+        if map_id is not None and (maps is None or maps.map_info(map_id) is None):
+            self.leave_tribe_map("This computer no longer uses that tribe, so the tribe map that was open is kept as "
+                                 "a file on this computer.")
+        self.update_tribe_label()
 
     def flush_save(self):
         """Save a move waiting on the timer now (before the map open changes)."""

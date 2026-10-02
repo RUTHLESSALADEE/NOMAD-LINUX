@@ -874,6 +874,7 @@ class IpamTab(QWidget):
             set_hint(self.status_label, str(error), "error")
             return
         self.connect_team()
+        self.window.tribe_key_changed(self)
         set_hint(self.status_label, "Tribe key saved (encrypted for your Windows account). You can delete the key "
                                     "file now, or keep it somewhere safe: anyone with it can change the tribe's "
                                     "IPAM.", "success")
@@ -882,18 +883,28 @@ class IpamTab(QWidget):
         unsent = (self.team.pending_count() + len(self.team.refused())) if self.team is not None else 0
         warning = f"\n\n{unsent} change{'s' if unsent != 1 else ''} made offline haven't reached the server and " \
                   "will be lost." if unsent else ""
+        unsent_maps = self.window.unsent_tribe_map_changes() or 0
+        if unsent_maps:
+            warning += (f"\n\n{unsent_maps} change{'s' if unsent_maps != 1 else ''} to tribe maps haven't reached "
+                        "the server and will be lost.")
         if QMessageBox.question(self, "Disconnect from the Tribe",
-                                "Stop using the tribe's IPAM server on this computer? The saved tribe key and the "
-                                "copy of the tribe's networks are removed; your local networks are kept." +
-                                warning) != QMessageBox.Yes:
+                                "Stop using the tribe on this computer? The saved tribe key and the copies of the "
+                                "tribe's networks and maps are removed (a tribe map open is kept as a file); your "
+                                "local networks and maps are kept." + warning) != QMessageBox.Yes:
             return
         forget_key()
+        self.forget_team_copy()
+        self.connect_team()
+        self.fill_networks()
+        self.window.leave_tribe_maps()
+
+    def forget_team_copy(self):
+        """Empty and close the copy of the tribe's IPAM data (leaving the tribe)."""
         if self.team is not None:
+            self.stop_watching()
             self.team.reset_copy()
             self.team.close()
             self.team = None
-        self.connect_team()
-        self.fill_networks()
 
     def sync_now(self, announce=False):
         """Fetch the server's changes on a worker thread, then apply them here."""

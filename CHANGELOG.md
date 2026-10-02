@@ -6,6 +6,16 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.13.1] - 2026-10-02
+
+### Added
+
+- Network Map: join the tribe from the map page (Tribe > Join the Tribe with a Key File...), and leave it (Leave the Tribe...). The tribe isn't only for IPAM any more: joining or leaving on either page does both, and leaving warns about tribe map changes not sent yet.
+
+### Fixed
+
+- The tribe server didn't count as part of the tribe on the Network Map page: NOMAD on the server (running as administrator) now uses the server's own key for tribe maps, as the IP Addresses page does, and the Map Watcher service can be installed there. Not as administrator, the Tribe menu says to restart as administrator.
+
 ## [1.13.0] - 2026-10-02
 
 ### Added
