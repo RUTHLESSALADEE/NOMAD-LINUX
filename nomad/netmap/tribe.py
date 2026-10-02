@@ -62,6 +62,13 @@ class TribeMaps:
         with self.lock:
             self.db.close()
 
+    def clear(self):
+        """Forget the copy (leaving the tribe): maps, changes not sent and community strings."""
+        with self._transaction():
+            for table in ("maps", "base", "pending", "secrets"):
+                self.db.execute(f"DELETE FROM {table}")
+            self.db.execute("INSERT OR REPLACE INTO meta (name, value) VALUES ('revision', '0')")
+
     @contextmanager
     def _transaction(self):
         with self.lock, self.db:

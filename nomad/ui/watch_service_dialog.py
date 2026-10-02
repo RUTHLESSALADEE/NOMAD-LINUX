@@ -8,7 +8,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, \
     QListWidget, QListWidgetItem, QMessageBox, QPushButton, QVBoxLayout
 
-from ..ipam.client import load_saved_key
+from ..ipam.client import current_key
 from ..netmap import watch, watch_service
 from ..netmap.monitor import duration_text
 from .common import run_in_background, set_hint
@@ -104,8 +104,8 @@ class MapWatcherDialog(QDialog):
             combo.setCurrentIndex(choices.index(seconds) if seconds in choices else choices.index(default))
         self.listen_check.setChecked(config.get("listen", True))
         if maps is None:
-            set_hint(self.message_label, "This computer has no tribe key: join the tribe on the IP Addresses page "
-                                         "(Tribe...) first, then share a map with the tribe on the Network Map page.",
+            set_hint(self.message_label, "This computer has no tribe key: join the tribe first (Tribe > Join the "
+                                         "Tribe with a Key File on the Network Map page), then share a map with it.",
                      "warning")
         elif not maps.maps():
             set_hint(self.message_label, "There are no tribe maps yet: share one from the Network Map page "
@@ -158,10 +158,10 @@ class MapWatcherDialog(QDialog):
         if not chosen:
             set_hint(self.message_label, "Tick the maps for it to watch.", "warning")
             return
-        key = load_saved_key()
+        key = current_key(admin=True)  # On the tribe server itself, its own key (this needs administrator anyway)
         if key is None:
-            set_hint(self.message_label, "This computer has no tribe key: join the tribe on the IP Addresses page "
-                                         "first.", "error")
+            set_hint(self.message_label, "This computer has no tribe key: join the tribe first (Tribe > Join the "
+                                         "Tribe with a Key File on the Network Map page).", "error")
             return
         try:
             config = watch_service.make_config(key, chosen, self.listen_check.isChecked(),

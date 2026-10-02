@@ -194,3 +194,65 @@ def test_watching_stands_by_while_another_computer_watches(app, server, tmp_path
         bobs_sync.shutdown()
     finally:
         page.shutdown()
+
+
+def test_tribe_server_uses_its_own_key_for_maps(app, server, tmp_path, monkeypatch):
+    """NOMAD on the tribe server (as administrator) uses the server's admin key, as the IP Addresses page does."""
+    from nomad.ipam import client
+    from nomad.ipam.client import admin_key
+    key = admin_key(server.directory)
+    key.port = server.port
+    monkeypatch.setattr(client, "admin_key", lambda: key)
+    monkeypatch.setattr(client, "load_saved_key", lambda: None)
+    monkeypatch.setattr(store, "maps_dir", lambda: tmp_path)
+    window = Window()
+    window.admin = True
+    page = netmap_tab.NetworkMapTab(window)
+    page.tribe.maps_factory = lambda key: __import__("nomad.netmap.tribe", fromlist=["TribeMaps"]).TribeMaps(
+        key.server_id, client.TeamClient(key, user="admin", computer="SRV"), tmp_path / "server-maps.db")
+    try:
+        assert page.tribe_key() is key
+        page.fill_tribe_menu()
+        texts = [action.text() for action in page.tribe_menu.actions()]
+        assert "This computer is the tribe server" in texts and "Leave the Tribe..." not in texts
+        page.on_crawled(crawl(build_network()))
+        monkeypatch.setattr(QInputDialog, "getText", lambda *args, **kwargs: ("Server's map", True))
+        page.share_with_tribe()
+        assert page.tribe_map_id is not None
+        window.admin = False  # Not as administrator: no key, and the menu says why and offers to join
+        monkeypatch.setattr(netmap_tab, "is_tribe_server", lambda: True)
+        page.tribe_key_changed()
+        assert page.tribe_map_id is None and page.map_path is not None  # Kept as a file
+        page.fill_tribe_menu()
+        texts = [action.text() for action in page.tribe_menu.actions()]
+        assert texts[0].startswith("This is the tribe server: restart NOMAD as administrator")
+        assert "Join the Tribe with a Key File..." in texts
+    finally:
+        page.shutdown()
+
+
+def test_joining_the_tribe_from_the_map_page(app, server, tmp_path, monkeypatch):
+    from nomad.ipam import client
+    from nomad.ui.netmap_tab import QFileDialog
+    from test_ipam_server import key_for
+    saved = []
+    monkeypatch.setattr(client, "load_saved_key", lambda: saved[-1] if saved else None)
+    monkeypatch.setattr(netmap_tab, "save_key", saved.append)
+    monkeypatch.setattr(netmap_tab, "read_key_file", lambda path: key_for(server))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args, **kwargs: ("tribe.nomadkey", ""))
+    monkeypatch.setattr(netmap_tab, "is_tribe_server", lambda: False)  # This PC may have the IPAM service
+    page = make_tab(build_network(), tmp_path, monkeypatch)
+    page.tribe.maps_factory = lambda key: __import__("nomad.netmap.tribe", fromlist=["TribeMaps"]).TribeMaps(
+        key.server_id, client.TeamClient(key, user="carol"), tmp_path / "carol-maps.db")
+    notified = []
+    page.window.tribe_key_changed = notified.append
+    try:
+        page.fill_tribe_menu()
+        assert [action.text() for action in page.tribe_menu.actions()] == ["Join the Tribe with a Key File..."]
+        page.join_tribe()
+        assert saved and notified == [page] and "Joined the tribe" in page.status_label.text()
+        assert page.tribe.maps is not None
+        page.fill_tribe_menu()
+        assert "Leave the Tribe..." in [action.text() for action in page.tribe_menu.actions()]
+    finally:
+        page.shutdown()

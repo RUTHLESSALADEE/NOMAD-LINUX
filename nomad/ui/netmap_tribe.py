@@ -151,6 +151,18 @@ class TribeSync(QObject):
         when = datetime.datetime.fromtimestamp(self.last_sync).strftime("%H:%M") if self.last_sync else ""
         return f"Tribe map {name}: up to date" + (f" ({when})" if when else "")
 
+    def reset(self, forget=False):
+        """The tribe key changed (joined, left, or another one): start again with it on the next ensure(). forget:
+        also empty the copy of the maps (leaving the tribe)."""
+        self.shutdown()
+        if self.maps is not None:
+            if forget:
+                self.maps.clear()
+            self.maps.close()
+            self.maps = None
+        self.error, self.too_old, self.last_sync = "", False, 0.0
+        self.status_changed.emit()
+
     def shutdown(self):
         if self.thread is not None:
             self.thread.stop()

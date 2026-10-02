@@ -506,6 +506,30 @@ class MainWindow(QMainWindow):
         from .ipam_server_dialog import IpamServerDialog  # Loads pywin32 only when it's needed
         IpamServerDialog(self).exec_()
 
+    def tribe_key_changed(self, origin=None):
+        """A page saved or forgot the tribe key: the other pages that use the tribe start again with it."""
+        if origin is not self.netmap_tab:
+            self.netmap_tab.tribe_key_changed()
+        if origin is not self.ipam_tab and self.ipam_tab.local_store is not None:  # Opened: else it's read later
+            self.ipam_tab.connect_team()
+
+    def leave_tribe(self, origin=None):
+        """Stop using the tribe on this computer: forget the key and the copies of its maps and IPAM data."""
+        from ..ipam.client import forget_key
+        forget_key()
+        self.ipam_tab.forget_team_copy()
+        self.netmap_tab.tribe_key_changed(forget=True)
+        if self.ipam_tab.local_store is not None:
+            self.ipam_tab.connect_team()
+            self.ipam_tab.fill_networks()
+
+    def leave_tribe_maps(self):
+        """The IP Addresses page left the tribe: the map page forgets its copy of the tribe's maps too."""
+        self.netmap_tab.tribe_key_changed(forget=True)
+
+    def unsent_tribe_map_changes(self):
+        return self.netmap_tab.unsent_tribe_changes()
+
     def show_map_watcher(self):
         from .watch_service_dialog import MapWatcherDialog  # Loads pywin32 only when it's needed
         MapWatcherDialog(self).exec_()
