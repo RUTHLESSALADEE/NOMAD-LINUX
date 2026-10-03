@@ -255,6 +255,17 @@ def test_with_a_line_delay_lines_go_one_at_a_time(page):
     assert "Sending" not in one.status_label.text()
 
 
+def test_a_block_can_ask_for_a_delay_the_session_does_not_have(page):
+    one = connect(page, "one")
+    assert one.session.line_delay == 0
+    one.send_block("configure terminal\ncdp run\nend", min_delay=40)
+    assert one.transport.sent == b"configure terminal\r"
+    QTest.qWait(400)
+    assert one.transport.sent == b"configure terminal\rcdp run\rend\r"
+    one.send_block("a\nb")  # Later blocks go at the session's own pace again
+    assert one.transport.sent.endswith(b"a\rb\r")
+
+
 def test_stop_sending_drops_the_rest(page):
     one = connect(page, "one")
     one.session.line_delay = 1000

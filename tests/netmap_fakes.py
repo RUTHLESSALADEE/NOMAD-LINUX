@@ -36,10 +36,12 @@ def oid(*parts):
 
 
 class Device:
-    def __init__(self, name, descr, object_id, communities=("public",)):
+    def __init__(self, name, descr, object_id, communities=("public",), v3_users=()):
         self.communities = set(communities)
+        self.v3_users = set(v3_users)  # V3Users it answers to
         self.mib = {}
-        self.contexts = {}  # VLAN -> {oid: Value}, answered for community@vlan
+        self.contexts = {}  # VLAN -> {oid: Value}, answered for community@vlan (or a v3 user in context vlan-N)
+        self.vlan_instances = True  # False: like some IOS images, community@vlan and vlan- contexts don't answer
         self.set(collect.SYS_DESCR, string(descr))
         self.set(collect.SYS_OBJECT_ID, Value(OBJECT_ID, object_id))
         self.set(collect.SYS_NAME, string(name))
@@ -129,8 +131,9 @@ class FakeAgentClient:
         from test_snmp import FakeAgent
         self.agent = FakeAgent(community, device.mib)
 
-    def factory(self, host, community, version, timeout=2000, retries=1):
-        return SnmpClient(host, community, version, timeout=timeout, retries=retries, port=self.agent.port)
+    def factory(self, host, community, version, timeout=2000, retries=1, context=""):
+        return SnmpClient(host, community, version, timeout=timeout, retries=retries, port=self.agent.port,
+                          context=context)
 
     def close(self):
         self.agent.close()
@@ -151,8 +154,8 @@ class FakeNetwork:
         self.pingable.add(address)
         return device
 
-    def client(self, host, community, version, timeout=2000, retries=1):
-        return FakeClient(self, host, community)
+    def client(self, host, community, version, timeout=2000, retries=1, context=""):
+        return FakeClient(self, host, community, context)
 
     def ping(self, address):
         return address in self.pingable
@@ -172,11 +175,16 @@ class FakeNetwork:
 
 
 class FakeClient:
-    def __init__(self, network, host, community):
+    def __init__(self, network, host, community, context=""):
         self.network, self.host, self.community = network, host, community
         device = network.devices.get(host)
-        base, _, vlan = community.partition("@")
-        if device is None or base not in device.communities:
+        if not isinstance(community, str):  # A V3User: VLAN tables are in contexts vlan-N
+            base, vlan = community, context.partition("vlan-")[2]
+            known = device is not None and community in device.v3_users
+        else:
+            base, _, vlan = community.partition("@")
+            known = device is not None and base in device.communities
+        if not known or (vlan and not device.vlan_instances):
             self.mib = None
         elif vlan:
             self.mib = device.contexts.get(int(vlan), {})

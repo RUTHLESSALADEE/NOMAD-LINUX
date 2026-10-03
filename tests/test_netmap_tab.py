@@ -168,6 +168,30 @@ def test_settings_round_trip(tab, tmp_path, app):
     assert other.scope == ["10.0.0.0/8"] and other.max_hops == 3
 
 
+def test_v3_users_saved_encrypted_and_tried_in_order(tab, tmp_path, app):
+    from nomad.snmpv3 import V3User
+    user = V3User("nomad", "sha256", "authpass1", "aes256", "privpass1")
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat)
+    tab.communities, tab.v3_users, tab.v3_first = ["public"], [user], False
+    tab.overrides = [("10.20.0.0/16", user)]
+    tab.save_settings(settings)
+    settings.sync()
+    assert "privpass1" not in (tmp_path / "settings.ini").read_text(encoding="utf-8", errors="replace")
+    other = netmap_tab.NetworkMapTab(Window())
+    other.restore_settings(settings)
+    assert other.v3_users == [user] and other.overrides == [("10.20.0.0/16", user)] and not other.v3_first
+    assert other.credentials() == ["public", user]
+    assert other.crawl_settings(["10.0.0.1"]).communities == ["public", user]
+    assert other.snmp_access("10.20.1.1")[0] == user
+    other.v3_first = True
+    assert other.watch_options().communities == [user, "public"]
+    assert other.add_credential("fresh") and other.communities[0] == "fresh"
+    renamed = V3User("nomad", "sha", "authpass2", "aes128", "privpass2")
+    assert other.add_credential(renamed) and other.v3_users == [renamed]
+    assert other.overrides == [("10.20.0.0/16", renamed)]  # The subnet's user is the new one
+    assert not other.add_credential(renamed)
+
+
 def test_device_details_list_links_and_hosts(crawled):
     text = netmap_tab.device_html(crawled, "acc1")
     assert "Te1/1/1" in text and "core.corp.example" in text

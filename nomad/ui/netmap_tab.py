@@ -20,12 +20,13 @@ from ..ipam.client import ADMIN, current_key, is_tribe_server, read_key_file, sa
 from ..ipam.store import IpamError
 from ..netmap import diff, export, l3, monitor, shared, store, watch
 from ..netmap.crawl import MAX_WORKERS, WORKERS, CrawlSettings, Crawler, check_device, communities_for, \
-    parse_overrides
+    credentials_from_json, credentials_to_json, ordered_credentials, parse_overrides
 from ..netmap.layout import BOTTOM, CENTER, HORIZONTAL, LEFT, MIDDLE, RIGHT, STYLE_NAMES, TOP, TOP_DOWN, VERTICAL, \
     align, arrange, arrange_boxes_in_place, arrange_in_place, distribute, merge_positions
 from ..netmap.model import BUILDING, CORRECTED_NAMES, FIREWALL, GROUP_KINDS, KIND_NAMES, NO_SNMP, PARENT_KIND, \
     ROUTER, SNMP, SWITCH, UNCHECKED, UNREACHABLE, Group, NetworkMap, display_name, port_key, short_port
 from ..snmp import V2C
+from ..snmpv3 import is_v3
 from ..terminal.credentials import CredentialError, protect, unprotect
 from .common import SortableTableItem, StoppableThread, read_only_table, set_hint
 from .host_menu import HostActions
@@ -130,7 +131,8 @@ class NetworkMapTab(QWidget):
         self.network_map = None
         self.map_path = None
         self.communities, self.overrides = ["public"], []
-        self.answered = {}  # Address -> the community it answered to (kept for this session, never in the map file)
+        self.v3_users, self.v3_first = [], True  # SNMPv3 users (V3Users) to try too, and whether before communities
+        self.answered = {}  # Address -> the community or V3User it answered to (this session's, never in the map file)
         self.version, self.timeout = V2C, DEFAULTS["timeout"]
         self.scope, self.max_hops, self.max_devices = [], DEFAULTS["max_hops"], DEFAULTS["max_devices"]
         self.collect_hosts = True
@@ -148,6 +150,7 @@ class NetworkMapTab(QWidget):
         self.crawl_progress = CrawlProgress(self)
         self.monitor = NetworkMonitor(self)
         self.tribe_map_id = None  # The tribe map open (None: a map file, or none)
+        self.tribe_seen = None  # Its items as last loaded or saved here: saves send only what changed from them
         self.tribe = TribeSync(self, key_loader=self.tribe_key)
         self.watcher = MapWatcher(self)
         self.history_map = None  # The map whose monitoring history the Monitor log is showing
@@ -181,8 +184,9 @@ class NetworkMapTab(QWidget):
         self.seeds_input = QLineEdit()
         self.seeds_input.setPlaceholderText("Core switch or gateway to start from (IP addresses, separated by commas)")
         self.gateway_button = QPushButton("Adapter's Gateway")
-        self.communities_button = QPushButton("Communities...")
-        self.communities_button.setToolTip("The SNMP community strings to try, including ones for particular subnets.")
+        self.communities_button = QPushButton("Credentials...")
+        self.communities_button.setToolTip("The SNMP community strings and SNMPv3 users to try, including ones for "
+                                           "particular subnets.")
         self.scope_button = QPushButton("Scope...")
         self.scope_button.setToolTip("Which subnets the crawl may go into, how many hops, and whether to read "
                                      "MAC tables for hosts and traceroute for the logical view.")
@@ -359,7 +363,7 @@ class NetworkMapTab(QWidget):
             view.positions_changed.connect(self.record_layout)
             view.context_requested.connect(self.show_device_menu)
         self.view.group_context_requested.connect(self.show_group_menu)
-        self.view.groups_changed.connect(self.save_timer.start)
+        self.view.groups_changed.connect(self.groups_toggled)
         self.view.devices_dropped.connect(self.on_devices_dropped)
         self.devices_table.itemDoubleClicked.connect(lambda item: self.show_on_map("device", item.row()))
         self.links_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -387,8 +391,8 @@ class NetworkMapTab(QWidget):
     def save_settings(self, settings):
         settings.setValue("netmap/seeds", self.seeds_input.text())
         try:
-            settings.setValue("netmap/communities", protect(json.dumps({"communities": self.communities,
-                                                                        "overrides": self.overrides})))
+            settings.setValue("netmap/communities", protect(json.dumps(credentials_to_json(
+                self.communities, self.overrides, self.v3_users, self.v3_first))))
         except CredentialError as error:
             log.warning("Couldn't save the map's community strings: %s", error)
         settings.setValue("netmap/version", self.version)
@@ -404,8 +408,11 @@ class NetworkMapTab(QWidget):
         settings.setValue("netmap/last_map", f"tribe:{self.tribe_map_id}" if self.tribe_map_id is not None
                           else str(self.map_path) if self.map_path else "")
         settings.setValue("netmap/watch", self.watch_check.isChecked())
-        settings.setValue("netmap/watch_neighbors", self.watcher.neighbor_combo.currentData())
-        settings.setValue("netmap/watch_hosts", self.watcher.host_combo.currentData())
+        timers = self.watcher.timers.values()
+        settings.setValue("netmap/watch_neighbors", timers["neighbor_interval"])
+        settings.setValue("netmap/watch_hosts", timers["host_interval"])
+        settings.setValue("netmap/watch_recheck", timers["recheck_interval"])
+        settings.setValue("netmap/watch_trigger_delay", timers["trigger_delay"])
         settings.setValue("netmap/watch_listen", self.watcher.listen_check.isChecked())
         settings.setValue("netmap/splitter", self.splitter.saveState())
         settings.setValue("netmap/arrange_style", self.arrange_style)
@@ -417,9 +424,8 @@ class NetworkMapTab(QWidget):
         stored = settings.value("netmap/communities", "", str)
         if stored:
             try:
-                saved = json.loads(unprotect(stored))
-                self.communities = saved.get("communities") or self.communities
-                self.overrides = [tuple(item) for item in saved.get("overrides", [])]
+                self.communities, self.overrides, self.v3_users, self.v3_first = credentials_from_json(
+                    json.loads(unprotect(stored)), self.communities)
             except (CredentialError, ValueError, TypeError) as error:
                 log.warning("Couldn't read the map's saved community strings: %s", error)
         self.version = settings.value("netmap/version", V2C, int)
@@ -452,11 +458,11 @@ class NetworkMapTab(QWidget):
             self.interval_combo.setCurrentIndex(monitor.INTERVALS.index(interval))
         if settings.value("netmap/monitor", False, bool) and self.network_map is not None:
             self.monitor_check.setChecked(True)  # Carry on watching from where it was left
-        for combo, name, choices in ((self.watcher.neighbor_combo, "watch_neighbors", watch.NEIGHBOR_INTERVALS),
-                                     (self.watcher.host_combo, "watch_hosts", watch.HOST_INTERVALS)):
-            seconds = settings.value(f"netmap/{name}", combo.currentData(), int)
-            if seconds in choices:
-                combo.setCurrentIndex(choices.index(seconds))
+        self.watcher.timers.set_values({name: settings.value(f"netmap/{key}", default, int) for name, key, default in (
+            ("neighbor_interval", "watch_neighbors", watch.NEIGHBOR_INTERVAL),
+            ("host_interval", "watch_hosts", watch.HOST_INTERVAL),
+            ("recheck_interval", "watch_recheck", watch.RECHECK_INTERVAL),
+            ("trigger_delay", "watch_trigger_delay", watch.TRIGGER_DELAY))})
         self.watcher.listen_check.setChecked(settings.value("netmap/watch_listen", True, bool))
         if settings.value("netmap/watch", False, bool) and self.network_map is not None:
             self.watch_check.setChecked(True)
@@ -491,16 +497,44 @@ class NetworkMapTab(QWidget):
             self.seeds_input.setText(self.gateway())
 
     def edit_communities(self):
-        dialog = CommunitiesDialog(self.communities, self.overrides, self.version, self.timeout, self)
+        dialog = CommunitiesDialog(self.communities, self.overrides, self.version, self.timeout, self,
+                                   v3_users=self.v3_users, v3_first=self.v3_first)
         if dialog.exec_() == QDialog.Accepted:
-            self.communities, self.overrides, self.version, self.timeout = dialog.values()
-            if self.tribe_map_id is not None:  # Shared with the tribe's map
-                try:
-                    self.tribe.maps.set_secrets(self.tribe_map_id, self.tribe_secrets())
-                except IpamError as error:
-                    QMessageBox.warning(self, "Communities", "The community strings are changed on this computer, "
-                                        f"but couldn't be saved with the tribe map:\n\n{error}")
-                self.write_map(self.network_map, None)  # Version and timeout go with the map
+            self.communities, self.overrides, self.version, self.timeout, self.v3_users, self.v3_first = \
+                dialog.values()
+            self.credentials_changed()
+
+    def credentials_changed(self):
+        """After the credentials change: ask the devices that don't answer SNMP with them, and share them with the
+        tribe map, if it's one."""
+        self.watcher.recheck_now()
+        if self.tribe_map_id is not None:
+            try:
+                self.tribe.maps.set_secrets(self.tribe_map_id, self.tribe_secrets())
+            except IpamError as error:
+                QMessageBox.warning(self, "SNMP Credentials", "The credentials are changed on this computer, but "
+                                    f"couldn't be saved with the tribe map:\n\n{error}")
+            self.write_map(self.network_map, None)  # Version and timeout go with the map
+
+    def credentials(self):
+        """The community strings and SNMPv3 users a crawl tries, in order."""
+        return ordered_credentials(self.communities, self.v3_users, self.v3_first)
+
+    def add_credential(self, credential):
+        """Add a community string or V3User (from the SNMP Config page) to those tried, first. A user with the same
+        name is replaced. Returns whether anything changed."""
+        if is_v3(credential):
+            if credential in self.v3_users:
+                return False
+            self.v3_users = [credential] + [user for user in self.v3_users if user.user != credential.user]
+            self.overrides = [(subnet, credential if is_v3(item) and item.user == credential.user else item)
+                              for subnet, item in self.overrides]
+        else:
+            if credential in self.communities:
+                return False
+            self.communities = [credential] + list(self.communities)
+        self.credentials_changed()
+        return True
 
     def edit_scope(self):
         dialog = ScopeDialog(self.scope, self.max_hops, self.max_devices, self.collect_hosts, self.trace,
@@ -558,7 +592,7 @@ class NetworkMapTab(QWidget):
 
     def crawl_settings(self, seeds):
         devices = self.network_map.devices.values() if self.network_map else []
-        return CrawlSettings(seeds=seeds, communities=list(self.communities), overrides=list(self.overrides),
+        return CrawlSettings(seeds=seeds, communities=self.credentials(), overrides=list(self.overrides),
                              scope=list(self.scope), max_hops=self.max_hops, max_devices=self.max_devices,
                              version=self.version, timeout=self.timeout, collect_hosts=self.collect_hosts,
                              trace=self.trace, workers=self.workers,
@@ -830,10 +864,9 @@ class NetworkMapTab(QWidget):
             return
         enabled = count > 1 and self.worker is None
         what = "Selected" if not groups else "Selected Groups" if count == len(groups) else "Selected Items"
-        arranged = menu.addAction(f"Arrange the {count} {what} ({STYLE_NAMES[self.arrange_style]})"
-                                  if count > 1 else "Arrange Selected")
+        arranged = self.add_style_menu(menu, f"Arrange the {count} {what}" if count > 1 else "Arrange Selected",
+                                       lambda style: self.arrange_selected(view, keys, groups, style))
         arranged.setEnabled(enabled)
-        arranged.triggered.connect(lambda: self.arrange_selected(view, keys, groups))
         lining = menu.addMenu("Align")
         lining.setEnabled(enabled)
         for entry in ALIGNMENTS + [None, ("Distribute Horizontally", HORIZONTAL), ("Distribute Vertically", VERTICAL)]:
@@ -843,21 +876,32 @@ class NetworkMapTab(QWidget):
                 lining.addAction(entry[0]).triggered.connect(
                     lambda _, how=entry[1]: self.align_selected(view, keys, how, groups))
 
+    def add_style_menu(self, menu, title, chosen):
+        """A submenu of the arrangements, calling chosen(style); the one Re-arrange uses is marked."""
+        submenu = menu.addMenu(title)
+        for style, name in STYLE_NAMES.items():
+            action = submenu.addAction(name)
+            action.setCheckable(True)
+            action.setChecked(style == self.arrange_style)
+            action.triggered.connect(lambda _, style=style: chosen(style))
+        return submenu
+
     def selected_groups(self, view):
         return view.selected_groups() if view is self.view else []
 
-    def arrange_selected(self, view, keys, groups=()):
-        """Lay out just these devices, where they are; with groups, those groups' boxes (each with everything in
-        it) and the devices not in them."""
+    def arrange_selected(self, view, keys, groups=(), style=None):
+        """Lay out just these devices, where they are, in style (Re-arrange's, if None); with groups, those groups'
+        boxes (each with everything in it) and the devices not in them."""
+        style = style or self.arrange_style
         if groups:
             boxes = view.boxes(keys, groups)
             weight = self.arrange_options(view, [])["weight"]
-            view.move_boxes(arrange_boxes_in_place(boxes, view.box_links(boxes), style=self.arrange_style,
+            view.move_boxes(arrange_boxes_in_place(boxes, view.box_links(boxes), style=style,
                                                    weight=lambda key: 0 if key.startswith(GROUP_BOX) else weight(key)))
             return
         where = view.positions()
         positions = {key: where[key] for key in keys if key in where}
-        view.move_to(arrange_in_place(positions, style=self.arrange_style, **self.arrange_options(view, keys)))
+        view.move_to(arrange_in_place(positions, style=style, **self.arrange_options(view, keys)))
 
     def align_selected(self, view, keys, how, groups=()):
         """Line up devices (and with groups, those groups' boxes and the devices not in them) by their edges or
@@ -867,6 +911,14 @@ class NetworkMapTab(QWidget):
         sizes = {key: (width, height) for key, (_, _, width, height) in boxes.items()}
         line_up = distribute if how in (HORIZONTAL, VERTICAL) else align
         view.move_boxes(line_up(centers, how, sizes))
+
+    def groups_toggled(self):
+        """A group was collapsed or expanded. On a tribe map that's this computer's own: kept here now, with nothing
+        to send (and no saving the whole layout, which could cross with someone else's move). On a file, saved."""
+        if self.tribe_map_id is not None and self.tribe.maps is not None and self.network_map is not None:
+            self.tribe.maps.keep_collapsed(self.tribe_map_id, self.network_map)
+        else:
+            self.save_timer.start()
 
     def save_positions(self):
         if self.network_map is None or (self.map_path is None and self.tribe_map_id is None):
@@ -1021,14 +1073,14 @@ class NetworkMapTab(QWidget):
         return {"aliases": [alias for alias in aliases if alias], "name": display_name(device.name), "folder": folder}
 
     def snmp_access(self, address):
-        """(community, version) for SNMP Details on a device: the community it answered to on a crawl or check, or
-        else the first the map would try for it."""
+        """(community or V3User, version) for SNMP Details on a device: what it answered to on a crawl or check,
+        or else the first the map would try for it."""
         community = self.answered.get(address)
         if community is None:
             try:
-                candidates = communities_for(address, self.communities, parse_overrides(self.overrides))
+                candidates = communities_for(address, self.credentials(), parse_overrides(self.overrides))
             except ValueError:
-                candidates = list(self.communities)
+                candidates = self.credentials()
             community = candidates[0] if candidates else None
         return community, self.version
 
@@ -1329,7 +1381,7 @@ class NetworkMapTab(QWidget):
         actions[menu.addAction("Add Device Linked to This...")] = lambda: self.add_device(linked_to=key)
         edit = menu.addAction("Edit Device..." if device.manual else "Correct Device...")
         actions[edit] = lambda: self.edit_device(key)
-        if device.mgmt_ip and (device.manual or "mgmt_ip" in device.corrected):
+        if device.mgmt_ip and (device.manual or "mgmt_ip" in device.corrected or device.source != SNMP):
             check = menu.addAction("Checking SNMP..." if key in self.checking else "Check SNMP Again")
             check.setEnabled(key not in self.checking)
             actions[check] = lambda: self.check_devices([key], announce=True)
@@ -1573,8 +1625,23 @@ class NetworkMapTab(QWidget):
         announce = key in self.announce
         self.announce.discard(key)
         device = self.network_map.devices.get(key) if self.network_map else None
-        if device is None or device.mgmt_ip != address or not (device.manual or "mgmt_ip" in device.corrected):
-            return  # Deleted, found by a crawl, or given another address meanwhile
+        if device is None or device.mgmt_ip != address:
+            return  # Deleted, or given another address meanwhile
+        why = f" ({'; '.join(check.reasons)})" if check.reasons else ""
+        if not (device.manual or "mgmt_ip" in device.corrected):
+            # Found by a crawl: one that answers now is read, as the crawl would have
+            if check.source != SNMP:
+                if announce:
+                    set_hint(self.status_label, f"{device.label} still doesn't answer SNMP{why}.", "warning")
+                return
+            if self.worker is None:
+                self.crawl_from(address)
+                text = f"{device.label} answers SNMP now: reading it (Crawl from Here)."
+            else:
+                text = f"{device.label} answers SNMP now. Crawl from Here once the crawl going on has finished."
+            if announce:
+                set_hint(self.status_label, text, "success")
+            return
         check.apply(device)
         if self.worker is None:
             self.map_changed()
@@ -1583,9 +1650,9 @@ class NetworkMapTab(QWidget):
                 text, level = (f"{device.label} answers SNMP. Right-click it > Crawl from Here to read its neighbors "
                                "and hosts.", "success")
             elif check.source == NO_SNMP:
-                text, level = f"{device.label}: {check.error}", "warning"
+                text, level = f"{device.label}: {check.error}{why}", "warning"
             else:
-                text, level = f"{device.label} doesn't answer SNMP or ping.", "error"
+                text, level = f"{device.label} doesn't answer SNMP or ping{why}.", "error"
             set_hint(self.status_label, text, level)
 
     # ----------------------------------------------------------------- Sites, buildings and rooms
@@ -1624,8 +1691,7 @@ class NetworkMapTab(QWidget):
             lambda: self.view.set_collapsed(item, not group.collapsed)
         actions[menu.addAction("Select Its Devices")] = lambda: self.select_group_devices(key)
         if self.worker is None:
-            actions[menu.addAction(f"Arrange This {kind} ({STYLE_NAMES[self.arrange_style]})")] = \
-                lambda: self.arrange_group(key)
+            self.add_style_menu(menu, f"Arrange This {kind}", lambda style: self.arrange_group(key, style))
             self.add_selection_actions(menu, self.view, self.view.selected_keys())  # With others selected
             menu.addSeparator()
             actions[menu.addAction("Rename...")] = lambda: self.rename_group(key)
@@ -1718,13 +1784,13 @@ class NetworkMapTab(QWidget):
             self.view.set_collapsed(item, False)
         self.view.show_devices(self.network_map.members(key))
 
-    def arrange_group(self, key):
+    def arrange_group(self, key, style=None):
         item = self.view.group_items.get(key)
         if item is None:
             return
         if item.group.collapsed:
             self.view.set_collapsed(item, False)
-        self.arrange_selected(self.view, self.network_map.members(key))
+        self.arrange_selected(self.view, self.network_map.members(key), style=style)
 
     def groups_edited(self, message=None):
         """Redraw the groups after they changed, keeping the view where it was, and save."""
@@ -1905,7 +1971,7 @@ class NetworkMapTab(QWidget):
         self.watch_label.setStyleSheet(f"color: {COLORS['success' if new else 'muted']};")
 
     def watch_options(self):
-        return watch.WatchOptions(communities=list(self.communities), overrides=[list(item) for item in self.overrides],
+        return watch.WatchOptions(communities=self.credentials(), overrides=[list(item) for item in self.overrides],
                                   scope=list(self.scope), version=self.version, timeout=self.timeout,
                                   max_hops=self.max_hops, max_devices=self.max_devices, workers=self.workers)
 
@@ -1970,7 +2036,7 @@ class NetworkMapTab(QWidget):
         """Save the map where it belongs: the tribe map open, the file it came from, or a new file. Returns the
         file's path (None for a tribe map)."""
         if self.tribe_map_id is not None and self.tribe.maps is not None:
-            self.tribe.save(self.tribe_map_id, network_map, self.tribe_settings())
+            self.tribe.save(self.tribe_map_id, network_map, self.tribe_settings(), self.tribe_seen)
             self.update_tribe_label()
             return None
         return store.save(network_map, path) if path else store.save(network_map)
@@ -1982,7 +2048,7 @@ class NetworkMapTab(QWidget):
                 "trace": self.trace, "workers": self.workers, "seeds": self.seeds_input.text()}
 
     def tribe_secrets(self):
-        return {"communities": list(self.communities), "overrides": [list(item) for item in self.overrides]}
+        return credentials_to_json(self.communities, self.overrides, self.v3_users, self.v3_first)
 
     def apply_tribe_settings(self, settings, secrets):
         self.scope = list(settings.get("scope", self.scope))
@@ -1992,9 +2058,8 @@ class NetworkMapTab(QWidget):
         self.workers = max(1, min(MAX_WORKERS, self.workers))
         if settings.get("seeds"):
             self.seeds_input.setText(settings["seeds"])
-        if secrets.get("communities"):
-            self.communities = list(secrets["communities"])
-            self.overrides = [tuple(item) for item in secrets.get("overrides", [])]
+        if secrets.get("communities") or secrets.get("v3_users"):
+            self.communities, self.overrides, self.v3_users, self.v3_first = credentials_from_json(secrets, [])
 
     def fill_tribe_menu(self):
         menu = self.tribe_menu
@@ -2005,7 +2070,7 @@ class NetworkMapTab(QWidget):
                 menu.addAction("This is the tribe server: restart NOMAD as administrator (File > Restart as "
                                "Administrator) to use its maps").setEnabled(False)
                 menu.addSeparator()
-            menu.addAction("Join the Tribe with a Key File...", self.join_tribe)
+            menu.addAction("Connect to the Tribe with a Key File...", self.join_tribe)
             return
         listed = maps.maps()
         if not listed:
@@ -2027,8 +2092,7 @@ class NetworkMapTab(QWidget):
         if key is not None and key.role == ADMIN:
             menu.addAction("This computer is the tribe server").setEnabled(False)
         else:
-            menu.addAction("Join the Tribe with Another Key File...", self.join_tribe)
-            menu.addAction("Leave the Tribe...", self.leave_tribe)
+            menu.addAction("Connect to the Tribe with Another Key File...", self.join_tribe)
 
     def tribe_key(self):
         """The key for the tribe's server: its own admin key on the server (as administrator), or the saved one."""
@@ -2036,33 +2100,21 @@ class NetworkMapTab(QWidget):
 
     def join_tribe(self):
         """Save a tribe key file's key for this Windows account (the IP Addresses page uses it too)."""
-        path, _ = QFileDialog.getOpenFileName(self, "Join the Tribe", "", "NOMAD tribe key (*.nomadkey);;All files (*)")
+        path, _ = QFileDialog.getOpenFileName(self, "Connect to the Tribe", "", "NOMAD tribe key (*.nomadkey);;All files (*)")
         if not path:
             return
         try:
             key = read_key_file(path)
             save_key(key)
         except (IpamError, OSError) as error:
-            QMessageBox.warning(self, "Join the Tribe", str(error))
+            QMessageBox.warning(self, "Connect to the Tribe", str(error))
             return
         self.tribe_key_changed()
         self.window.tribe_key_changed(self)
-        set_hint(self.status_label, "Joined the tribe. The key is saved, encrypted for your Windows account, and the IP "
+        set_hint(self.status_label, "Connected to the tribe. The key is saved, encrypted for your Windows account, and the IP "
                  "Addresses page uses it too. Open the tribe's maps from Tribe (they arrive once the server has "
                  "been reached), or share this one. You can delete the key file now, or keep it somewhere safe: "
                  "anyone with it can change the tribe's maps and IPAM.", "success")
-
-    def leave_tribe(self):
-        """Stop using the tribe on this computer (as Tribe > Disconnect on the IP Addresses page)."""
-        unsent = self.unsent_tribe_changes()
-        warning = (f"\n\n{unsent} change{'s' if unsent != 1 else ''} to tribe maps haven't reached the server and "
-                   "will be lost." if unsent else "")
-        if QMessageBox.question(self, "Leave the Tribe", "Stop using the tribe on this computer? The saved tribe key "
-                                "and the copies of the tribe's maps and IPAM data are removed (a tribe map open here "
-                                "is kept as a file); your own maps and networks are kept." + warning) \
-                != QMessageBox.Yes:
-            return
-        self.window.leave_tribe(self)
 
     def unsent_tribe_changes(self):
         return self.tribe.maps.pending_count() if self.tribe.maps is not None else 0
@@ -2095,7 +2147,7 @@ class NetworkMapTab(QWidget):
                 QMessageBox.warning(self, "Open Tribe Map", "That map isn't shared with the tribe any more.")
             return
         self.flush_save()
-        network_map, settings = maps.load(map_id)
+        network_map, settings, seen = maps.snapshot(map_id)
         secrets = maps.secrets(map_id)
         if not secrets:
             try:
@@ -2103,7 +2155,7 @@ class NetworkMapTab(QWidget):
             except Exception as error:  # Offline: the communities already set here are used
                 log.info("Couldn't fetch a tribe map's community strings: %s", error)
         self.apply_tribe_settings(settings, secrets)
-        self.tribe_map_id = map_id
+        self.tribe_map_id, self.tribe_seen = map_id, seen
         self.show_map(network_map, None, fit=True)
         self.update_tribe_label()
         if not quiet:
@@ -2129,6 +2181,7 @@ class NetworkMapTab(QWidget):
             QMessageBox.warning(self, "Share with the Tribe", f"Couldn't share the map:\n\n{error}")
             return
         self.tribe_map_id, self.map_path = map_id, None
+        self.tribe_seen = maps.items(map_id)
         self.watched_identity = (map_id, "None", self.network_map.started)  # Same map: watching carries on
         if self.watcher.running:
             self.watcher.map_changed()
@@ -2151,7 +2204,7 @@ class NetworkMapTab(QWidget):
         """Carry on with the map as a file on this computer only."""
         self.flush_save()
         self.network_map.positions = self.view.positions()
-        self.tribe_map_id = None
+        self.tribe_map_id, self.tribe_seen = None, None
         try:
             self.map_path = store.save(self.network_map)
         except OSError as error:
@@ -2204,7 +2257,7 @@ class NetworkMapTab(QWidget):
             QTimer.singleShot(2000, self.reload_from_tribe)
             return
         self.flush_save()
-        newer, settings = self.tribe.maps.load(self.tribe_map_id)
+        newer, settings, self.tribe_seen = self.tribe.maps.snapshot(self.tribe_map_id)
         if shared.flatten(newer) == shared.flatten(self.network_map):
             return  # Only this computer's own changes coming back
         newer.status_log = self.network_map.status_log  # Monitoring history is this computer's own
@@ -2247,7 +2300,7 @@ class NetworkMapTab(QWidget):
             QMessageBox.warning(self, "Open Network Map", f"Couldn't open {path.name}:\n\n{error}")
             return
         self.flush_save()
-        self.tribe_map_id = None
+        self.tribe_map_id, self.tribe_seen = None, None
         self.update_tribe_label()
         self.show_map(network_map, path, fit=True)
         set_hint(self.status_label, f"Opened {path.name} (mapped {network_map.started.replace('T', ' ')}).", "info")

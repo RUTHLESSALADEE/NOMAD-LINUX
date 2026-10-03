@@ -1,6 +1,8 @@
 import re
 import threading
 
+import pytest
+
 from netmap_fakes import (ACC1_MAC, CORE_MAC, FW_MAC, LAB_MACS, PC1_MAC, PHONE_MAC, PRINTER_MAC, FakeAgentClient,
                           build_network)
 
@@ -215,3 +217,162 @@ def test_deleted_devices_are_left_out_and_not_crawled_through():
 def test_a_deleted_device_the_crawl_starts_from_is_mapped():
     network_map = crawl(build_network(), seeds=["10.0.0.12"], deleted={"acc2": ["10.0.0.12"]})
     assert "acc2" in network_map.devices
+
+
+def test_v3_only_switch_is_crawled_with_its_user_and_vlan_contexts():
+    from nomad.snmpv3 import V3User
+    user = V3User("nomad", "sha", "authpass1", "aes128", "privpass1")
+    network = build_network()
+    acc1 = network.devices["10.0.0.11"]
+    acc1.communities, acc1.v3_users = set(), {user}
+    events = []
+    settings = CrawlSettings(seeds=["10.0.0.1"], communities=["public", user],
+                             overrides=[("10.0.0.12/32", "secret")])
+    network_map = Crawler(settings, client_factory=network.client, pinger=network.ping, echo=network.echo,
+                          events=lambda kind, *details: events.append((kind, *details))).run()
+    assert network_map.devices["acc1"].source == SNMP
+    assert ("community", "10.0.0.11", user) in events
+    hosts = {host.mac: host for host in network_map.hosts}
+    assert hosts[PC1_MAC].device == "acc1" and hosts[PC1_MAC].vlan == 10  # From the VLAN 10 context
+    assert not any(isinstance(community, str) and community.startswith("public@") and host == "10.0.0.11"
+                   for host, community in network.requests)
+
+
+def test_a_switch_without_per_vlan_tables_has_its_one_table_read():
+    network = build_network()
+    acc1 = network.devices["10.0.0.11"]
+    acc1.vlan_instances = False  # Like IOL: VTP VLANs, but community@vlan doesn't answer
+    for table in acc1.contexts.values():
+        acc1.mib.update(table)  # Its one table has every VLAN's MACs
+    log = []
+    network_map = Crawler(CrawlSettings(seeds=["10.0.0.1"], overrides=[("10.0.0.12/32", "secret")]),
+                          client_factory=network.client, pinger=network.ping, echo=network.echo,
+                          events=lambda kind, *details: log.append(details[0]) if kind == "log" else None).run()
+    hosts = {host.mac: host for host in network_map.hosts}
+    assert hosts[PC1_MAC].device == "acc1" and hosts[PC1_MAC].port == "Gi1/0/5"
+    assert any("No per-VLAN MAC tables" in line for line in log)
+
+
+def advertise_acc1_at(network, address):
+    """The core's CDP says acc1 is at address (an old or out-of-scope one) instead of 10.0.0.11."""
+    from netmap_fakes import oid, string
+    from nomad.netmap import collect
+    import socket
+    network.devices["10.0.0.1"].mib[oid(collect.CDP_CACHE_ENTRY, 4, 1, 1)] = string(socket.inet_aton(address))
+
+
+def test_the_address_a_device_answered_at_is_its_management_address():
+    network = build_network()
+    advertise_acc1_at(network, "192.0.2.11")  # Not private, so not asked; acc1 is read from its own seed
+    network_map = crawl(network, seeds=["10.0.0.1", "10.0.0.11"])
+    assert network_map.devices["acc1"].source == SNMP
+    assert network_map.devices["acc1"].mgmt_ip == "10.0.0.11"  # Not the address CDP advertised
+
+
+def test_an_address_corrected_by_hand_still_wins():
+    network = build_network()
+    settings = CrawlSettings(seeds=["10.0.0.1"], overrides=[("10.0.0.12/32", "secret")],
+                             corrections={"acc1": {"mgmt_ip": "10.0.0.111"}})
+    network.add("10.0.0.111", network.devices["10.0.0.11"])
+    network_map = Crawler(settings, client_factory=network.client, pinger=network.ping, echo=network.echo).run()
+    assert network_map.devices["acc1"].mgmt_ip == "10.0.0.111"
+
+
+def namesake_network(names=("Switch", "Switch"), addresses=("10.0.0.2", "10.0.0.3")):
+    """A router with a switch on each of two ports, the switches both named names (a switch's default name, or the
+    same name in two domains), each with an access switch of its own behind it."""
+    from netmap_fakes import CISCO_ROUTER, CISCO_SWITCH, Device, FakeNetwork
+    network = FakeNetwork()
+    router = network.add("10.0.0.1", Device("R3", "Cisco IOS Software, ISR Software", CISCO_ROUTER))
+    router.address("10.0.0.1", 1)
+    for number, (name, address) in enumerate(zip(names, addresses), start=1):
+        router.interface(number, f"Ethernet0/{number}")
+        router.cdp(number, 1, name, "Ethernet0/0", address, "cisco WS-C2960", 0x28)
+        if not address:
+            continue
+        switch = network.add(address, Device(name, "Cisco IOS Software, Catalyst Software", CISCO_SWITCH))
+        switch.interface(1, "Ethernet0/0")
+        switch.interface(2, "Ethernet0/1")
+        switch.address(address, 1)
+        switch.cdp(1, 1, "R3", f"Ethernet0/{number}", "10.0.0.1", "cisco ISR4331", 0x01)
+        access = f"10.0.1.{number}"
+        switch.cdp(2, 1, f"acc{number}", "Ethernet0/0", access, "cisco WS-C2960", 0x28)
+        network.add(access, Device(f"acc{number}", "Cisco IOS Software, Catalyst Software", CISCO_SWITCH)) \
+            .address(access, 1)
+    return network
+
+
+def links_of(network_map):
+    """Links as {(device, port), (device, port)}, whichever end was read first."""
+    return {frozenset([(link.a, link.a_port), (link.b, link.b_port)]) for link in network_map.links}
+
+
+def link(a, a_port, b, b_port):
+    return frozenset([(a, a_port), (b, b_port)])
+
+
+
+@pytest.mark.parametrize("seeds", [["10.0.0.1"], ["10.0.0.2", "10.0.0.1"], ["10.0.0.3", "10.0.0.1"]])
+def test_two_switches_with_one_name_are_two_devices(seeds):
+    """Whichever is read first (and whether before or after the router that sees both), both are read, and keyed by
+    address."""
+    network_map = crawl(namesake_network(), seeds=seeds, overrides=[], workers=1, trace=False)
+    devices = network_map.devices
+    assert {key: devices[key].source for key in devices} == {
+        "r3": SNMP, "switch@10.0.0.2": SNMP, "switch@10.0.0.3": SNMP, "acc1": SNMP, "acc2": SNMP}
+    assert devices["switch@10.0.0.2"].mgmt_ip == "10.0.0.2" and devices["switch@10.0.0.3"].name == "Switch"
+    assert links_of(network_map) == {
+        link("r3", "Eth0/1", "switch@10.0.0.2", "Eth0/0"), link("r3", "Eth0/2", "switch@10.0.0.3", "Eth0/0"),
+        link("switch@10.0.0.2", "Eth0/1", "acc1", "Eth0/0"), link("switch@10.0.0.3", "Eth0/1", "acc2", "Eth0/0")}
+
+
+def test_one_name_in_two_domains_is_two_devices():
+    network_map = crawl(namesake_network(("idf1.site-a.corp", "idf1.site-b.corp")), overrides=[], trace=False)
+    devices = network_map.devices
+    assert devices["idf1@10.0.0.2"].name == "idf1.site-a.corp"
+    assert devices["idf1@10.0.0.3"].name == "idf1.site-b.corp"
+    assert {"acc1", "acc2"} <= set(devices)
+
+
+def test_switches_with_one_name_and_no_address_are_two_devices():
+    """Like IOL switches left named "Switch" with no IP: both on Ethernet0/0, so not one switch on two ports."""
+    network_map = crawl(namesake_network(addresses=("", "")), overrides=[], trace=False)
+    assert set(network_map.devices) == {"r3", "switch@r3/Eth0/1", "switch@r3/Eth0/2"}
+    assert links_of(network_map) == {link("r3", "Eth0/1", "switch@r3/Eth0/1", "Eth0/0"),
+                                     link("r3", "Eth0/2", "switch@r3/Eth0/2", "Eth0/0")}
+
+
+def test_a_switch_on_two_ports_with_no_address_is_one_device():
+    from netmap_fakes import oid, string
+    from nomad.netmap import collect
+    network = namesake_network(addresses=("", ""))
+    network.devices["10.0.0.1"].mib[oid(collect.CDP_CACHE_ENTRY, 7, 2, 1)] = string("Ethernet0/1")  # Its other port
+    network_map = crawl(network, overrides=[], trace=False)
+    assert set(network_map.devices) == {"r3", "switch"}
+    assert len(network_map.links) == 2
+
+
+def test_a_device_at_an_address_it_does_not_list_is_still_one_device():
+    """Like an NX-OS mgmt0 address (in its own VRF): the neighbors give it, the device answers there, but its address
+    table doesn't have it. Only enough is read to tell it's the same one."""
+    network = build_network()
+    network.devices["10.0.0.99"] = network.devices["10.0.0.1"]
+    network.devices["10.0.0.11"].cdp(1, 1, "core.corp.example(FOC999)", "TenGigabitEthernet1/0/1", "10.0.0.99",
+                                     "cisco C9500-24Y4C", 0x29)
+    network_map = crawl(network)
+    assert set(network_map.devices) == {"core", "acc1", "acc2", "rtr1", "pa-fw1"}
+    assert len(network_map.links) == 4
+    assert [community for host, community in network.requests if host == "10.0.0.99"] == ["public"] * 3
+
+
+def test_crawl_from_here_keeps_a_switch_with_the_name_of_one_on_the_map():
+    first = crawl(namesake_network(), seeds=["10.0.0.2"], scope=["10.0.0.2/32"], overrides=[], trace=False)
+    assert first.devices["switch"].source == SNMP
+    network = namesake_network()
+    newer = Crawler(CrawlSettings(seeds=["10.0.0.1"], trace=False), client_factory=network.client,
+                    pinger=network.ping, echo=network.echo, known=first).run()
+    first.merge_crawl(newer)
+    assert first.devices["switch"].mgmt_ip == "10.0.0.2" and first.devices["switch"].source == SNMP
+    assert first.devices["switch@10.0.0.3"].source == SNMP
+    assert link("r3", "Eth0/2", "switch@10.0.0.3", "Eth0/0") in links_of(first)
+    assert link("r3", "Eth0/2", "switch", "Eth0/0") not in links_of(first)

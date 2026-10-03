@@ -5,13 +5,13 @@ import logging
 import os
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, \
-    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QVBoxLayout
+from PyQt5.QtWidgets import QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, QListWidget, \
+    QListWidgetItem, QMessageBox, QPushButton, QVBoxLayout
 
 from ..ipam.client import current_key
-from ..netmap import watch, watch_service
-from ..netmap.monitor import duration_text
+from ..netmap import watch_service
 from .common import run_in_background, set_hint
+from .netmap_watch import WatchTimers
 from .theme import accent_button
 
 log = logging.getLogger(__name__)
@@ -37,15 +37,9 @@ class MapWatcherDialog(QDialog):
         self.maps_list = QListWidget()
         self.maps_list.setMaximumHeight(140)
         form.addRow("Maps to watch:", self.maps_list)
-        self.neighbor_combo = QComboBox()
-        for seconds in watch.NEIGHBOR_INTERVALS:
-            self.neighbor_combo.addItem(f"every {duration_text(seconds)}", seconds)
-        self.host_combo = QComboBox()
-        for seconds in watch.HOST_INTERVALS:
-            self.host_combo.addItem(f"every {duration_text(seconds)}", seconds)
+        self.timers = WatchTimers()
         self.listen_check = QCheckBox("Listen for syslog and SNMP traps (opens UDP 514 and 162 in Windows Firewall)")
-        form.addRow("New neighbors:", self.neighbor_combo)
-        form.addRow("New hosts:", self.host_combo)
+        form.addRow(self.timers)
         form.addRow("", self.listen_check)
         layout.addLayout(form)
         row = QHBoxLayout()
@@ -96,16 +90,12 @@ class MapWatcherDialog(QDialog):
             entry.setCheckState(Qt.Checked if item["id"] in chosen or (not chosen and item["id"] == page.tribe_map_id)
                                 else Qt.Unchecked)
             self.maps_list.addItem(entry)
-        for combo, name, choices, default in ((self.neighbor_combo, "neighbor_interval", watch.NEIGHBOR_INTERVALS,
-                                               watch.NEIGHBOR_INTERVAL),
-                                              (self.host_combo, "host_interval", watch.HOST_INTERVALS,
-                                               watch.HOST_INTERVAL)):
-            seconds = config.get(name, default)
-            combo.setCurrentIndex(choices.index(seconds) if seconds in choices else choices.index(default))
+        self.timers.set_values(watch_service.config_timers(config))
         self.listen_check.setChecked(config.get("listen", True))
         if maps is None:
-            set_hint(self.message_label, "This computer has no tribe key: join the tribe first (Tribe > Join the "
-                                         "Tribe with a Key File on the Network Map page), then share a map with it.",
+            set_hint(self.message_label, "This computer has no tribe key: connect to the tribe first (Tribe > Connect "
+                                         "to the Tribe with a Key File on the Network Map page), then share a map "
+                                         "with it.",
                      "warning")
         elif not maps.maps():
             set_hint(self.message_label, "There are no tribe maps yet: share one from the Network Map page "
@@ -160,12 +150,11 @@ class MapWatcherDialog(QDialog):
             return
         key = current_key(admin=True)  # On the tribe server itself, its own key (this needs administrator anyway)
         if key is None:
-            set_hint(self.message_label, "This computer has no tribe key: join the tribe first (Tribe > Join the "
-                                         "Tribe with a Key File on the Network Map page).", "error")
+            set_hint(self.message_label, "This computer has no tribe key: connect to the tribe first (Tribe > Connect "
+                                         "to the Tribe with a Key File on the Network Map page).", "error")
             return
         try:
-            config = watch_service.make_config(key, chosen, self.listen_check.isChecked(),
-                                               self.neighbor_combo.currentData(), self.host_combo.currentData())
+            config = watch_service.make_config(key, chosen, self.listen_check.isChecked(), self.timers.values())
         except Exception as error:
             set_hint(self.message_label, f"Couldn't prepare the service's settings: {error}", "error")
             return

@@ -92,6 +92,31 @@ def test_trap_receiver_over_udp():
     assert received and received[0][0].trap_oid == triggers.LINK_UP and received[0][1] == "127.0.0.1"
 
 
+def test_trap_receiver_takes_v3_traps_from_its_users_only():
+    from nomad.snmpv3 import V3User
+    from test_snmpv3 import trap_message
+    user = V3User("watcher", "sha", "authpass1", "aes128", "privpass1")
+    users = []
+    port = free_udp_port()
+    received = []
+    receiver = triggers.TrapReceiver(lambda trap, sender: received.append(trap), "127.0.0.1", port,
+                                     v3_users=lambda: users)
+    receiver.start()
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.sendto(trap_message(user, triggers.LINK_UP), ("127.0.0.1", port))  # Before the user is set up
+            time.sleep(0.3)
+            users.append(user)  # Set up while listening: no restart needed
+            sock.sendto(trap_message(user, triggers.LINK_UP), ("127.0.0.1", port))
+        deadline = time.monotonic() + 3
+        while not received and time.monotonic() < deadline:
+            time.sleep(0.02)
+    finally:
+        receiver.stop()
+    assert len(received) == 1 and received[0].trap_oid == triggers.LINK_UP and received[0].community == "watcher"
+    assert receiver.refused == {"127.0.0.1"}
+
+
 class FakeReceiver:
     started = []
 

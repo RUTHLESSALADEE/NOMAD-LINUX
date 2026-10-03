@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS base (map_id INTEGER NOT NULL, section TEXT NOT NULL,
 CREATE TABLE IF NOT EXISTS pending (map_id INTEGER NOT NULL, section TEXT NOT NULL, key TEXT NOT NULL, data TEXT,
                                     seq INTEGER NOT NULL, PRIMARY KEY (map_id, section, key));
 CREATE TABLE IF NOT EXISTS secrets (map_id INTEGER PRIMARY KEY, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS collapsed (map_id INTEGER PRIMARY KEY, groups TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS meta (name TEXT PRIMARY KEY, value TEXT);
 """
 
@@ -53,7 +54,7 @@ class TribeMaps:
         self.online, self.last_error = False, ""
         if self._meta("server_id") not in ("", server_id):  # Another server's maps: start again
             with self._transaction():
-                for table in ("maps", "base", "pending", "secrets"):
+                for table in ("maps", "base", "pending", "secrets", "collapsed"):
                     self.db.execute(f"DELETE FROM {table}")
                 self._set_meta("revision", 0)
         self._set_meta("server_id", server_id)
@@ -65,7 +66,7 @@ class TribeMaps:
     def clear(self):
         """Forget the copy (leaving the tribe): maps, changes not sent and community strings."""
         with self._transaction():
-            for table in ("maps", "base", "pending", "secrets"):
+            for table in ("maps", "base", "pending", "secrets", "collapsed"):
                 self.db.execute(f"DELETE FROM {table}")
             self.db.execute("INSERT OR REPLACE INTO meta (name, value) VALUES ('revision', '0')")
 
@@ -108,8 +109,9 @@ class TribeMaps:
         return {(row["section"], row["key"]): None if row["data"] is None else json.loads(row["data"])
                 for row in rows}
 
-    def items(self, map_id):
-        """{(section, key): data} of a map as this computer has it: the server's, with changes not sent on top."""
+    def items(self, map_id, raw=False):
+        """{(section, key): data} of a map as this computer has it: the server's, with changes not sent on top.
+        raw: as the server has them (groups shared by older NOMADs say whether they're collapsed)."""
         with self.lock:
             items = self._base(map_id)
             for key, data in self._pending(map_id).items():
@@ -117,12 +119,43 @@ class TribeMaps:
                     items.pop(key, None)
                 else:
                     items[key] = data
-            return items
+            return items if raw else {key: shared.shared_part(key[0], data) for key, data in items.items()}
 
     def load(self, map_id):
-        """(NetworkMap, settings) of a map."""
-        items = self.items(map_id)
-        return shared.build(items), shared.settings_of(items)
+        """(NetworkMap, settings) of a map, with the groups collapsed that were collapsed on this computer."""
+        network_map, settings, _ = self.snapshot(map_id)
+        return network_map, settings
+
+    def snapshot(self, map_id):
+        """(NetworkMap, settings, seen) of a map: as load, with the items it was built from, to save it with (so
+        only what's changed on it from then is sent)."""
+        with self.lock:
+            raw = self.items(map_id, raw=True)
+            collapsed = self.collapsed(map_id)
+        network_map = shared.build(raw)
+        if collapsed is None:  # Never opened here since groups stopped being collapsed for everyone: as shared
+            collapsed = {key for (section, key), data in raw.items()
+                         if section == shared.GROUP and isinstance(data, dict) and data.get("collapsed")}
+        for group in network_map.groups:
+            group.collapsed = group.key in collapsed
+        return network_map, shared.settings_of(raw), {key: shared.shared_part(key[0], data)
+                                                      for key, data in raw.items()}
+
+    def collapsed(self, map_id):
+        """The keys of the map's groups collapsed on this computer (None if none were ever kept for it)."""
+        with self.lock:
+            row = self.db.execute("SELECT groups FROM collapsed WHERE map_id = ?", (int(map_id),)).fetchone()
+        return None if row is None else set(json.loads(row["groups"]))
+
+    def keep_collapsed(self, map_id, network_map):
+        """Note which groups are collapsed here: each person's own, never sent."""
+        with self._transaction():
+            self._keep_collapsed(map_id, network_map)
+
+    def _keep_collapsed(self, map_id, network_map):
+        groups = sorted(group.key for group in network_map.groups if group.collapsed)
+        self.db.execute("INSERT OR REPLACE INTO collapsed (map_id, groups) VALUES (?, ?)",
+                        (int(map_id), json.dumps(groups)))
 
     def pending_count(self, map_id=None):
         with self.lock:
@@ -132,12 +165,23 @@ class TribeMaps:
 
     # ----------------------------------------------------------------- Changing
 
-    def save(self, map_id, network_map, settings=None):
-        """Note what changed on a map here, to send. Returns how many items changed."""
+    def save(self, map_id, network_map, settings=None, seen=None):
+        """Note what changed on a map here, to send (and which groups are collapsed, kept here only). Returns how
+        many items changed.
+
+        seen: the items the map was loaded as (snapshot's), for a copy kept open while others' changes arrive. Only
+        what changed on it since is sent, so their changes that arrived meanwhile (and aren't on it yet) aren't
+        undone; seen is then updated to the map as saved. Without it, the whole map is saved as it is."""
         with self._transaction():
-            current = shared.flatten(network_map, settings if settings is not None
-                                     else shared.settings_of(self.items(map_id)))
-            changes = shared.diff(self.items(map_id), current)
+            self._keep_collapsed(map_id, network_map)
+            items = self.items(map_id)
+            current = shared.flatten(network_map, settings if settings is not None else shared.settings_of(items))
+            changes = shared.diff(items if seen is None else seen, current)
+            if seen is not None:
+                seen.clear()
+                seen.update(current)
+                changes = [change for change in changes
+                           if items.get((change["section"], change["key"])) != change["data"]]
             if not changes:
                 return 0
             base = self._base(map_id)
@@ -165,6 +209,7 @@ class TribeMaps:
                             (map_id, name.strip(), reply["revision"]))
             self.db.executemany("INSERT OR REPLACE INTO base (map_id, section, key, data) VALUES (?, ?, ?, ?)",
                                 [(map_id, section, key, json.dumps(data)) for (section, key), data in items.items()])
+            self._keep_collapsed(map_id, network_map)
             self._cache_secrets(map_id, secrets)
         return map_id
 
@@ -179,7 +224,7 @@ class TribeMaps:
 
     def _forget(self, map_id):
         with self._transaction():
-            for table in ("base", "pending", "secrets"):
+            for table in ("base", "pending", "secrets", "collapsed"):
                 self.db.execute(f"DELETE FROM {table} WHERE map_id = ?", (int(map_id),))
             self.db.execute("UPDATE maps SET deleted = 1 WHERE id = ?", (int(map_id),))
 

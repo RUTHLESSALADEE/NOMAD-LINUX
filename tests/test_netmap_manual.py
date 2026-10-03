@@ -456,6 +456,42 @@ def test_the_snmp_page_takes_the_community_and_version(app):
     assert page.community_input.text() == "secret"
 
 
+def test_the_snmp_page_takes_a_v3_user(app):
+    from nomad.snmpv3 import V3User
+    user = V3User("nomad", "sha256", "authpass1", "aes256", "privpass1")
+    page = SnmpTab(Window())
+    page.start = lambda mode: None
+    assert page.v3_row.isHidden() and not page.community_input.isHidden()
+    page.query_host("10.0.0.5", user, None)
+    assert page.version_combo.currentText() == "v3" and page.v3_user() == user
+    assert not page.v3_row.isHidden() and page.community_input.isHidden()
+    page.auth_combo.setCurrentIndex(page.auth_combo.findData("none"))
+    assert not page.priv_combo.isEnabled() and page.v3_user().level == "noAuthNoPriv"
+
+
+def test_the_credentials_dialog_takes_v3_users_and_subnet_users(app):
+    from nomad.snmpv3 import V3User
+    from nomad.ui.netmap_dialogs import CommunitiesDialog
+    user = V3User("nomad", "sha", "authpass1", "aes128", "privpass1")
+    dialog = CommunitiesDialog(["public"], [("10.1.0.0/16", user)], V1, 2000, v3_users=[user], v3_first=False)
+    assert dialog.table.item(0, 1).text() == "v3:nomad"
+    communities, overrides, version, _, users, v3_first = dialog.values()
+    assert (communities, overrides, version, users, v3_first) == (["public"], [("10.1.0.0/16", user)], V1, [user],
+                                                                 False)
+    dialog.table.item(0, 1).setText("v3:ghost")
+    with pytest.raises(ValueError, match="ghost"):
+        dialog.values()
+    dialog.table.item(0, 1).setText("branch")
+    dialog.users_table.add_user()
+    dialog.users_table.cellWidget(1, 0).setText("second")
+    dialog.users_table.cellWidget(1, 2).setText("short")
+    with pytest.raises(ValueError, match="at least 8"):
+        dialog.values()
+    dialog.users_table.removeRow(1)
+    dialog.communities_input.setPlainText("")
+    assert dialog.values()[0] == [] and dialog.values()[4] == [user]  # Users alone are enough
+
+
 def test_deleting_a_device_the_crawl_found_keeps_it_off_the_map(tab, monkeypatch):
     tab.on_crawled(crawl())
     monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.Yes)
@@ -494,3 +530,20 @@ def test_delete_key_deletes_the_devices_selected(tab, monkeypatch):
                     if item.key() == QKeySequence(QKeySequence.Delete))
     shortcut.activated.emit()  # Offscreen windows aren't active, so a key press doesn't reach shortcuts
     assert "rtr1" not in tab.network_map.devices and "rtr1" in tab.network_map.deleted
+
+
+def test_check_snmp_again_on_a_device_the_crawl_found(tab, monkeypatch):
+    from netmap_fakes import CISCO_ROUTER, Device
+    tab.on_crawled(crawl())
+    network = build_network()
+    read = []
+    monkeypatch.setattr(tab, "crawl_from", read.append)
+    tab.check_device = lambda settings, address: check_device(settings, address, client_factory=network.client,
+                                                              pinger=network.ping)
+    tab.check_devices(["rtr1"], announce=True)
+    finish_checks(tab)
+    assert read == [] and "still doesn't answer SNMP" in tab.status_label.text()
+    network.add("10.0.0.254", Device("rtr1.corp.example", "Cisco IOS Software, ISR", CISCO_ROUTER))
+    tab.check_devices(["rtr1"], announce=True)
+    finish_checks(tab)
+    assert read == ["10.0.0.254"] and "answers SNMP now: reading it" in tab.status_label.text()

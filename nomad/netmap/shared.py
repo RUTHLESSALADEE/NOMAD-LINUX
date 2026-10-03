@@ -43,6 +43,14 @@ def _plain(value):
     return json.loads(json.dumps(value))
 
 
+def shared_part(section, data):
+    """An item as the tribe shares it: a group without whether it's collapsed, which is each person's own (kept on
+    their computer, so collapsing a group doesn't collapse it for everyone)."""
+    if section == GROUP and isinstance(data, dict):
+        return {name: value for name, value in data.items() if name != "collapsed"}
+    return data
+
+
 def flatten(network_map, settings=None):
     """{(section, key): data} for a map. settings: how it's crawled (scope, hops...), kept with it."""
     items = {(DEVICE, key): asdict(device) for key, device in network_map.devices.items()}
@@ -61,7 +69,7 @@ def flatten(network_map, settings=None):
                                "root": network_map.root}
     if settings is not None:
         items[(META, SETTINGS)] = dict(settings)
-    return {key: _plain(value) for key, value in items.items()}
+    return {key: shared_part(key[0], _plain(value)) for key, value in items.items()}
 
 
 def build(items):
@@ -82,7 +90,7 @@ def build(items):
     from .model import port_sort_key
     hosts.sort(key=lambda host: (devices[host.device].label.lower(), port_sort_key(host.port), host.mac))
     network_map.hosts = hosts
-    network_map.groups = [_build(Group, data) for _, data in sorted(sections[GROUP].items())]
+    network_map.groups = [_build(Group, shared_part(GROUP, data)) for _, data in sorted(sections[GROUP].items())]
     network_map.group_of = dict(sections[GROUP_OF])
     network_map.positions = {key: tuple(value) for key, value in sections[POSITION].items() if key in devices}
     network_map.l3_positions = {key: tuple(value) for key, value in sections[L3_POSITION].items()}
