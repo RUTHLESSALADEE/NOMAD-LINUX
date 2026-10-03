@@ -16,22 +16,39 @@ from dataclasses import dataclass, field, replace
 
 from ..snmp import SnmpError, parse_oid
 from . import collect
-from .crawl import CrawlSettings, Crawler
+from .crawl import CrawlSettings, Crawler, in_scope, parse_networks
 from .model import NETWORK_KINDS, SNMP, normalize_name
 
 log = logging.getLogger(__name__)
 
 NEIGHBOR_INTERVAL = 300  # Seconds between asking the switches for their neighbors
 HOST_INTERVAL = 3600  # Seconds between reading every switch's MAC table again
-NEIGHBOR_INTERVALS = [60, 120, 300, 600, 900, 1800]
-HOST_INTERVALS = [900, 1800, 3600, 7200, 14400, 43200, 86400]
+RECHECK_INTERVAL = 3600  # Seconds between asking devices that don't answer SNMP again
 TRIGGER_DELAY = 45  # Seconds after a syslog message or trap before reading the switch (CDP needs time to see it)
+# The watch timers, user adjustable: name -> (default, least, most), in seconds
+TIMERS = {"neighbor_interval": (NEIGHBOR_INTERVAL, 60, 3600), "host_interval": (HOST_INTERVAL, 300, 86400),
+          "recheck_interval": (RECHECK_INTERVAL, 300, 86400), "trigger_delay": (TRIGGER_DELAY, 0, 600)}
 HOST_NEW_DAYS = 30  # A host back on the map within this many days isn't news
 HOST_SEEN_KEEP_DAYS = 90  # host_seen entries older than this are dropped
+MAX_FALLBACKS = 8  # Other addresses of a switch tried when its management address doesn't answer
 CDP_DEVICE_ID = f"{collect.CDP_CACHE_ENTRY}.6"
 LLDP_SYS_NAME = f"{collect.LLDP_REM_ENTRY}.9"
 LLDP_CHASSIS_ID = f"{collect.LLDP_REM_ENTRY}.5"
 DEVICE, HOST = "device", "host"
+
+
+def timer_values(values=None):
+    """The watch timers ({name: seconds}) from saved values, each kept within its limits, with the defaults for any
+    missing or unreadable."""
+    values = values or {}
+    result = {}
+    for name, (default, least, most) in TIMERS.items():
+        try:
+            seconds = int(values.get(name, default))
+        except (TypeError, ValueError):
+            seconds = default
+        result[name] = max(least, min(most, seconds))
+    return result
 
 
 def news_ref(kind, key):
@@ -126,6 +143,99 @@ def read_signatures(targets, options, client_factory, should_stop=lambda: False,
         futures = {key: executor.submit(read_signature, address, options, client_factory, should_stop)
                    for key, address in targets.items()}
         return {key: future.result() for key, future in futures.items()}
+
+
+def unread_devices(network_map, scope):
+    """{key: address} of the devices on the map that don't answer SNMP (they only ping, don't answer at all, or
+    were only seen as a neighbor) and are inside the crawl's scope: the ones to ask again, as the credentials or
+    the devices' SNMP set-up may have changed since."""
+    networks = parse_networks(scope)
+    return {key: device.mgmt_ip for key, device in network_map.devices.items()
+            if device.source != SNMP and device.mgmt_ip and in_scope(device.mgmt_ip, networks)}
+
+
+def credential_text(credential):
+    """How an answer is logged: an SNMPv3 user by name and protocols, never a community string itself."""
+    return credential.label if hasattr(credential, "label") else "a community string"
+
+
+def recheck(targets, options, client_factory, should_stop=lambda: False, workers=16):
+    """Ask devices that don't answer SNMP (unread_devices) again with the credentials as they are now. Returns
+    {key: (address, Check)} of those that answer now. Runs on a worker thread."""
+    from concurrent.futures import ThreadPoolExecutor
+    from .crawl import check_device
+    if not targets:
+        return {}
+    settings = CrawlSettings(seeds=[], communities=list(options.communities),
+                             overrides=[tuple(item) for item in options.overrides], scope=list(options.scope),
+                             version=options.version, timeout=options.timeout)
+
+    def ask(item):
+        key, address = item
+        if should_stop():
+            return key, address, None
+        return key, address, check_device(settings, address, client_factory, pinger=lambda _: False)
+    with ThreadPoolExecutor(max_workers=min(workers, len(targets))) as executor:
+        results = list(executor.map(ask, targets.items()))
+    return {key: (address, check) for key, address, check in results
+            if check is not None and check.source == SNMP}
+
+
+def fallback_addresses(network_map, keys, scope):
+    """{key: [address]}: for each of these switches, the other addresses it reported having (inside the crawl's
+    scope) to ask when its management address stops answering, as when the management network is renumbered. Not
+    for a switch whose address was corrected by hand: that's the one to use."""
+    networks = parse_networks(scope)
+    result = {}
+    for key in keys:
+        device = network_map.devices.get(key)
+        if device is None or "mgmt_ip" in device.corrected:
+            continue
+        candidates = [address for address in list(device.addresses) + [item[0] for item in device.interfaces_l3]
+                      if address and address != device.mgmt_ip and in_scope(address, networks)]
+        if candidates:
+            result[key] = list(dict.fromkeys(candidates))[:MAX_FALLBACKS]
+    return result
+
+
+def read_switches(targets, fallbacks, options, client_factory, should_stop=lambda: False, workers=16):
+    """read_signatures, then, for switches that didn't answer at their management address, their other addresses
+    (fallbacks, from fallback_addresses) in turn. Returns ({key: signature or None}, {key: (old address, address
+    it answers at now)}). Runs on a worker thread."""
+    from concurrent.futures import ThreadPoolExecutor
+    signatures = read_signatures(targets, options, client_factory, should_stop, workers)
+    silent = [key for key, signature in signatures.items() if signature is None and fallbacks.get(key)]
+    moved = {}
+    if not silent or should_stop():
+        return signatures, moved
+
+    def try_others(key):
+        for address in fallbacks[key]:
+            if should_stop():
+                return None
+            signature = read_signature(address, options, client_factory, should_stop)
+            if signature is not None:
+                return address, signature
+        return None
+    with ThreadPoolExecutor(max_workers=min(workers, len(silent))) as executor:
+        for key, found in zip(silent, executor.map(try_others, silent)):
+            if found is not None:
+                moved[key] = (targets[key], found[0])
+                signatures[key] = found[1]
+    return signatures, moved
+
+
+def adopt_addresses(network_map, moved):
+    """Make the addresses switches answer at now their management addresses. Returns lines for the watch log."""
+    lines = []
+    for key, (old, new) in moved.items():
+        device = network_map.devices.get(key)
+        if device is None or device.mgmt_ip != old or "mgmt_ip" in device.corrected:
+            continue  # Gone, or its address changed meanwhile
+        device.mgmt_ip = new
+        lines.append(f"{device.label} doesn't answer at {old} any more but does at {new}: that's its management "
+                     "address now")
+    return lines
 
 
 def known_names(network_map):
@@ -228,6 +338,7 @@ def apply_refresh(network_map, crawled, now=None, by=""):
     WatchResult."""
     now = now or datetime.datetime.now()
     before_devices = set(network_map.devices)
+    before_addresses = {device.mgmt_ip for device in network_map.devices.values() if device.mgmt_ip}
     before_hosts = {host.mac: host for host in network_map.hosts if host.mac}
     recent = (now - datetime.timedelta(days=HOST_NEW_DAYS)).date().isoformat()
     added, read = network_map.merge_crawl(crawled)
@@ -236,8 +347,8 @@ def apply_refresh(network_map, crawled, now=None, by=""):
     when = now.isoformat(timespec="seconds")
     for key in added:
         device = network_map.devices.get(key)
-        if key in before_devices or device is None or device.manual:
-            continue
+        if key in before_devices or device is None or device.manual or                 any(device.owns(address) for address in before_addresses):
+            continue  # On the map before (perhaps under its address, before it answered SNMP)
         where = where_found(network_map, key)
         result.devices.append(key)
         network_map.news[news_ref(DEVICE, key)] = {"when": when, "where": where, "by": by}

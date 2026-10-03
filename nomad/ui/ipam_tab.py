@@ -21,7 +21,7 @@ from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QComboBo
     QTableWidget, QTableWidgetItem, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
 
 from ..ipam.history import network_as_of
-from ..ipam.client import OldServerError, ServerUnreachable, TeamKeyError, TeamStore, admin_key, forget_key, \
+from ..ipam.client import OldServerError, ServerUnreachable, TeamKeyError, TeamStore, admin_key, \
     load_saved_key, read_key_file, save_key
 from ..ipam.server import ConflictError, server_dir
 from ..ipam.spreadsheet import SpreadsheetError, parse_page, read_pages
@@ -525,7 +525,6 @@ class IpamTab(QWidget):
         team_menu = QMenu(self.team_button)
         self.connect_action = team_menu.addAction("Connect with Tribe Key File...", self.connect_with_key_file)
         self.sync_action = team_menu.addAction("Sync Now", lambda: self.sync_now(announce=True))
-        self.disconnect_action = team_menu.addAction("Disconnect from the Tribe...", self.disconnect_team)
         self.team_button.setMenu(team_menu)
         top.addWidget(self.team_button)
         self.server_label = QLabel()
@@ -879,24 +878,9 @@ class IpamTab(QWidget):
                                     "file now, or keep it somewhere safe: anyone with it can change the tribe's "
                                     "IPAM.", "success")
 
-    def disconnect_team(self):
-        unsent = (self.team.pending_count() + len(self.team.refused())) if self.team is not None else 0
-        warning = f"\n\n{unsent} change{'s' if unsent != 1 else ''} made offline haven't reached the server and " \
-                  "will be lost." if unsent else ""
-        unsent_maps = self.window.unsent_tribe_map_changes() or 0
-        if unsent_maps:
-            warning += (f"\n\n{unsent_maps} change{'s' if unsent_maps != 1 else ''} to tribe maps haven't reached "
-                        "the server and will be lost.")
-        if QMessageBox.question(self, "Disconnect from the Tribe",
-                                "Stop using the tribe on this computer? The saved tribe key and the copies of the "
-                                "tribe's networks and maps are removed (a tribe map open is kept as a file); your "
-                                "local networks and maps are kept." + warning) != QMessageBox.Yes:
-            return
-        forget_key()
-        self.forget_team_copy()
-        self.connect_team()
-        self.fill_networks()
-        self.window.leave_tribe_maps()
+    def unsent_tribe_changes(self):
+        """Changes made offline that haven't reached the server (waiting, or refused and not yet resolved)."""
+        return (self.team.pending_count() + len(self.team.refused())) if self.team is not None else 0
 
     def forget_team_copy(self):
         """Empty and close the copy of the tribe's IPAM data (leaving the tribe)."""
@@ -1007,7 +991,6 @@ class IpamTab(QWidget):
         team = self.team
         self.connect_action.setEnabled(team is None or not team.admin)
         self.sync_action.setEnabled(team is not None)
-        self.disconnect_action.setEnabled(team is not None and not team.admin)
         admin = team is not None and team.admin
         self.import_button.setText("Import to Tribe Server..." if admin else "Import Locally (Not Shared)...")
         if team is None:
@@ -1033,7 +1016,7 @@ class IpamTab(QWidget):
             set_hint(self.team_label, f"{who}: {team.last_error}", "error")
             set_hint(self.server_label, f"● {server} · tribe key not accepted", "error")
         elif team.online and self.server_outdated:
-            update = "use Tools > IPAM Server > Update Service here" if admin else "ask for it to be updated"
+            update = "use Tools > Tribe Management > Update Service here" if admin else "ask for it to be updated"
             set_hint(self.team_label, f"{who} · {synced}. The IPAM server is running an older version of NOMAD, so "
                                       f"changes arrive within {POLL_SECONDS} seconds instead of at once ({update}).",
                      "warning")

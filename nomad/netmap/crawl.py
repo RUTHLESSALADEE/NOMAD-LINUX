@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 
 from ..oui import format_mac, vendor
 from ..snmp import V2C, SnmpClient, SnmpError, parse_oid
+from ..snmpv3 import credential_from_json, credential_to_json, is_v3, users_from_json
 from . import collect, l3
 from .model import AP, HOST, KIND_NAMES, NETWORK_KINDS, NO_SNMP, PHONE, SERVER, SNMP, UNKNOWN, UNREACHABLE, Device, \
     Host, Link, NetworkMap, Trace, display_name, normalize_name, port_key, short_port
@@ -27,7 +28,7 @@ MAX_WORKERS = 64
 BULK_ROWS = 50  # Rows asked for in each SNMP GETBULK: fewer round trips than the usual 25
 VLAN_WORKERS = 4  # A Catalyst's per-VLAN MAC tables read at once
 STOPPED = "Stopped"
-PINGS_NO_SNMP = "Answers ping but not SNMP: check the community string and the device's SNMP ACL."
+PINGS_NO_SNMP = "Answers ping but not SNMP: check the community string (or SNMPv3 user) and the device's SNMP ACL."
 NO_ANSWER = "No answer to SNMP or ping."
 LIVE_INTERVAL = 1.5  # Seconds between snapshots of the map for drawing it while it's crawled
 ROUTE_ROWS = 20000  # Per column: a core with the full internet table shouldn't take all day
@@ -38,8 +39,9 @@ END_DEVICE_KINDS = {PHONE, HOST}  # Shown as hosts on their switch port, not as 
 @dataclass
 class CrawlSettings:
     seeds: list
+    # Community strings and V3Users (snmpv3.py) to try, in order: "communities" for short, as they were first
     communities: list = field(default_factory=lambda: ["public"])
-    overrides: list = field(default_factory=list)  # [(subnet text, community)]: tried first for addresses in it
+    overrides: list = field(default_factory=list)  # [(subnet text, community or V3User)]: tried first in the subnet
     scope: list = field(default_factory=list)  # Subnets the crawl may go into; empty means any private address
     max_hops: int = 6
     max_devices: int = 500
@@ -75,6 +77,40 @@ def parse_overrides(overrides):
                   key=lambda item: item[0].prefixlen, reverse=True)
 
 
+def in_scope(address, networks):
+    """Whether a crawl may ask address: inside networks (parse_networks'), or with none, any private address."""
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    if networks:
+        return any(ip.version == network.version and ip in network for network in networks)
+    return ip.is_private and not ip.is_loopback and not ip.is_link_local
+
+
+def ordered_credentials(communities, v3_users, v3_first=True):
+    """What a crawl tries on each device: the SNMPv3 users and the community strings, in the order chosen. Users
+    first by default: a device without the user says so at once (a Report), where a wrong community times out."""
+    return list(v3_users) + list(communities) if v3_first else list(communities) + list(v3_users)
+
+
+def credentials_to_json(communities, overrides, v3_users=(), v3_first=True):
+    """A map's SNMP credentials as kept (encrypted) in the settings and as a tribe map's secrets."""
+    return {"communities": list(communities),
+            "overrides": [[subnet, credential_to_json(credential)] for subnet, credential in overrides],
+            "v3_users": [user.to_json() for user in v3_users], "v3_first": bool(v3_first)}
+
+
+def credentials_from_json(data, communities=("public",)):
+    """(communities, overrides, v3 users, v3 first) from credentials_to_json's form (or an older one without
+    users). communities: what to use if it has none."""
+    data = data if isinstance(data, dict) else {}
+    overrides = [(str(item[0]), credential_from_json(item[1])) for item in data.get("overrides") or []
+                 if isinstance(item, (list, tuple)) and len(item) == 2]
+    return ([str(item) for item in data.get("communities") or []] or list(communities), overrides,
+            users_from_json(data.get("v3_users")), bool(data.get("v3_first", True)))
+
+
 def communities_for(address, communities, overrides):
     """The community strings to try for address, in order: those for the subnets it's in (overrides, as
     parse_overrides gives them), then communities."""
@@ -94,7 +130,7 @@ class Crawler:
             ("counts", {...})                  read, reading, queued, found, no_snmp, unreachable
             ("map", NetworkMap)                a copy of the map so far (devices and links), every LIVE_INTERVAL
             ("phase", text)                    hosts, traceroute
-            ("community", address, community)  the community string it answered to
+            ("community", address, community)  the community string (or V3User) it answered to
         known: a map this crawl adds to (Crawl from Here). Devices it read aren't read again, and keep their keys.
         """
         self.settings = settings
@@ -113,8 +149,17 @@ class Crawler:
         self.tables = {}  # Device key -> DeviceTables, for placing hosts at the end
         self.asked = set()  # Addresses already asked (or queued)
         self.capabilities = {}  # Device key -> what its neighbors' CDP/LLDP say it is (router, switch...)
+        # Names (normalized) that more than one device has: those devices are keyed by address, not found by name
+        self.ambiguous = set()
+        self.renamed = {}  # Old key -> new, for devices keyed by address once another turned up with their name
+        self.advertised = {}  # (device key, port key) -> the address its neighbor on that port was asked at
         self.known = known
         if known is not None:
+            names = {}
+            for device in known.devices.values():
+                if device.source == SNMP and not device.manual and device.name:
+                    names[normalize_name(device.name)] = names.get(normalize_name(device.name), 0) + 1
+            self.ambiguous = {name for name, count in names.items() if count > 1}
             for key, device in known.devices.items():
                 if device.source == SNMP and not device.manual:  # Already read: recognize it, but don't ask again
                     for address in [device.mgmt_ip] + list(device.addresses):
@@ -132,13 +177,7 @@ class Crawler:
     # ----------------------------------------------------------------- Scope
 
     def in_scope(self, address):
-        try:
-            ip = ipaddress.ip_address(address)
-        except ValueError:
-            return False
-        if self.scope:
-            return any(ip in network for network in self.scope)
-        return ip.is_private and not ip.is_loopback and not ip.is_link_local
+        return in_scope(address, self.scope)
 
     def communities_for(self, address):
         return communities_for(address, self.settings.communities, self.overrides)
@@ -160,18 +199,18 @@ class Crawler:
             while (queue or running) and not self.should_stop():
                 while queue and len(running) < self.settings.workers * 2:
                     address, hops, key = queue.pop(0)
-                    if key is not None and key not in self.map.devices:
-                        key = self.find(address)  # Merged into another device meanwhile
-                    if key is not None and self.map.devices[key].source == SNMP:
+                    key = self.current_key(key, address)  # Merged into another device meanwhile, or renamed
+                    device = self.map.devices.get(key) if key is not None else None
+                    if device is not None and device.source == SNMP and device.owns(address):
                         continue  # Reached at another address meanwhile
-                    running[executor.submit(self.visit, address)] = (address, hops, key)
+                    compare = [identity(self.tables[other]) for other in self.namesakes(key)]
+                    running[executor.submit(self.visit, address, compare)] = (address, hops, key)
                     self.events("started", address, key)
                 self.report_counts(len(running), len(queue))
                 finished, _ = wait(running, timeout=0.2, return_when=FIRST_COMPLETED)
                 for future in finished:
                     address, hops, key = running.pop(future)
-                    if key is not None and key not in self.map.devices:
-                        key = self.find(address)
+                    key = self.current_key(key, address)
                     done += 1
                     try:
                         tables, error = future.result()
@@ -192,6 +231,9 @@ class Crawler:
                 for future in running:
                     future.cancel()
         self.map.remove_devices([key for key in self.map.devices if key in self.deleted])  # Reached another way
+        read = {key for key, device in self.map.devices.items() if device.source == SNMP}
+        for gone, found in self.map.fold_unread_devices(read):
+            self.events("log", f"{gone.label} is {found.label} (it has that address)")
         self.report_counts(0, 0)
         self.events("map", self.snapshot())
         for key, corrections in self.settings.corrections.items():  # Corrected by hand: kept over what was found
@@ -257,13 +299,13 @@ class Crawler:
         self.map.stopped = self.should_stop()
 
     def connect(self, address):
-        """Find the community string a device answers to. Returns (client, SystemInfo, community), or Nones when it
-        answers none of them (or the crawl is stopping)."""
+        """Find the community string (or SNMPv3 user) a device answers to. Returns (client, SystemInfo, community),
+        or Nones when it answers none of them (or the crawl is stopping)."""
         communities = self.communities_for(address)
         for number, community in enumerate(communities, start=1):
             if self.should_stop():
                 break
-            self.events("step", address, f"Trying community {number} of {len(communities)}")
+            self.events("step", address, f"Trying {credential_kind(community)} {number} of {len(communities)}")
             try:
                 client = self.client_factory(address, community, self.settings.version,
                                              timeout=self.settings.timeout, retries=self.settings.retries)
@@ -273,11 +315,16 @@ class Crawler:
                 return client, info, community
             except (SnmpError, OSError) as problem:
                 log.debug("SNMP to %s: %s", address, problem)
-                self.events("log", f"{address}: no answer with community {number} of {len(communities)}")
+                if is_v3(community) and "No answer" not in str(problem):  # A Report: say what the device said
+                    self.events("log", str(problem))  # It names the device
+                else:
+                    self.events("log", f"{address}: no answer with {credential_kind(community)} {number} of "
+                                       f"{len(communities)}")
         return None, None, None
 
-    def visit(self, address):
-        """Read one device. Returns (DeviceTables or None, error). Runs on a worker thread."""
+    def visit(self, address, compare=()):
+        """Read one device. Returns (DeviceTables or None, error). Runs on a worker thread. compare: identities of
+        devices read already that it may be (its name's): when it's one of them, only enough to tell is read."""
         started = time.monotonic()
         client, info, community = self.connect(address)
         if client is None:
@@ -287,6 +334,12 @@ class Crawler:
             return None, PINGS_NO_SNMP if self.pinger(address) else NO_ANSWER
         tables = collect.DeviceTables(info=info)
         tables.timings["Finding the community string"] = time.monotonic() - started
+        if compare:
+            tables.addresses = collect.ip_addresses(self.walk(client, collect.IP_ADDR_ENTRY, tables, "IP addresses"))
+            tables.own_macs = collect.own_macs(self.walk(client, collect.IF_PHYS_ADDRESS, tables, "Interfaces"))
+            if any(same_device(identity(tables), other) for other in compare):
+                tables.timings["total"] = time.monotonic() - started
+                return tables, ""
         self.read_tables(client, tables, community)
         tables.timings["total"] = time.monotonic() - started
         return tables, ""
@@ -342,22 +395,29 @@ class Crawler:
         vlan_list = collect.vlans(self.walk(client, collect.VTP_VLAN_STATE, tables, "VLANs", timing="MAC tables")) \
             if info.object_id.startswith(collect.CISCO + ".") else []
         if vlan_list and "nx-os" not in info.descr.lower():
-            self.read_vlan_tables(client, tables, community, vlan_list)
-        else:
-            base_ports = self.walk(client, collect.BASE_PORT_IFINDEX, tables, "MAC table", timing="MAC tables")
-            q_rows = []
-            for column in (2, 3):  # Port and status: the index holds the VLAN and the MAC
-                q_rows += self.walk(client, f"{collect.Q_FDB_ENTRY}.{column}", tables, "MAC table by VLAN",
+            if self.read_vlan_tables(client, tables, community, vlan_list):
+                return
+            tables.notes.append("No per-VLAN MAC tables (community@vlan or SNMPv3 vlan- contexts): read its one "
+                                "MAC table instead")
+        self.read_mac_table(client, tables)
+
+    def read_mac_table(self, client, tables):
+        """The MAC table of a switch that keeps one for every VLAN (NX-OS, most non-Cisco switches)."""
+        base_ports = self.walk(client, collect.BASE_PORT_IFINDEX, tables, "MAC table", timing="MAC tables")
+        q_rows = []
+        for column in (2, 3):  # Port and status: the index holds the VLAN and the MAC
+            q_rows += self.walk(client, f"{collect.Q_FDB_ENTRY}.{column}", tables, "MAC table by VLAN",
+                                timing="MAC tables")
+        if not collect.fdb_by_vlan(q_rows, base_ports):
+            for column in (2, 3):
+                q_rows += self.walk(client, f"{collect.FDB_ENTRY}.{column}", tables, "MAC table",
                                     timing="MAC tables")
-            if not collect.fdb_by_vlan(q_rows, base_ports):
-                for column in (2, 3):
-                    q_rows += self.walk(client, f"{collect.FDB_ENTRY}.{column}", tables, "MAC table",
-                                        timing="MAC tables")
-            tables.fdb = collect.fdb_by_vlan(q_rows, base_ports) or collect.fdb(q_rows, base_ports)
+        tables.fdb = collect.fdb_by_vlan(q_rows, base_ports) or collect.fdb(q_rows, base_ports)
 
     def read_vlan_tables(self, client, tables, community, vlan_list):
-        """Catalyst IOS keeps a MAC table per VLAN, read with community@vlan. Only the VLANs its ports use (a VTP
-        domain can list hundreds the switch doesn't carry), several at once."""
+        """Catalyst IOS keeps a MAC table per VLAN, read with community@vlan (or, over SNMPv3, in context vlan-N).
+        Only the VLANs its ports use (a VTP domain can list hundreds the switch doesn't carry), several at once.
+        Returns whether any VLAN answered (some images, and v3 users without the vlan- context, have none)."""
         in_use = collect.vlans_in_use(
             self.walk(client, collect.VM_VLAN, tables, "VLANs in use", timing="MAC tables"),
             self.walk(client, collect.VM_VOICE_VLAN, tables, "VLANs in use", timing="MAC tables"),
@@ -371,10 +431,15 @@ class Crawler:
 
         def read(vlan):
             if self.should_stop():
-                return []
+                return None
             try:
-                vlan_client = self.client_factory(client.host, f"{community}@{vlan}", self.settings.version,
-                                                  timeout=self.settings.timeout, retries=self.settings.retries)
+                if is_v3(community):
+                    vlan_client = self.client_factory(client.host, community, self.settings.version,
+                                                      timeout=self.settings.timeout, retries=self.settings.retries,
+                                                      context=f"vlan-{vlan}")
+                else:
+                    vlan_client = self.client_factory(client.host, f"{community}@{vlan}", self.settings.version,
+                                                      timeout=self.settings.timeout, retries=self.settings.retries)
                 rows = []
                 for column in (2, 3):  # Port and status: the MAC is in the index
                     rows += list(vlan_client.walk(parse_oid(f"{collect.FDB_ENTRY}.{column}"),
@@ -382,21 +447,135 @@ class Crawler:
                 ports = list(vlan_client.walk(parse_oid(collect.BASE_PORT_IFINDEX), max_repetitions=BULK_ROWS,
                                               should_stop=self.should_stop))
             except (SnmpError, OSError):
-                return []  # A VLAN with no ports here doesn't answer on some models
+                return None  # A VLAN with no ports here doesn't answer on some models
             finally:
                 done[0] += 1
                 self.events("step", client.host, f"MAC tables: {done[0]} of {len(chosen)} VLANs read")
             return collect.fdb(rows, ports, vlan)
 
+        answered = False
         with ThreadPoolExecutor(max_workers=VLAN_WORKERS) as executor:
             for entries in executor.map(read, chosen):
-                tables.fdb += entries
+                if entries is not None:
+                    answered = True
+                    tables.fdb += entries
         tables.timings["MAC tables"] = tables.timings.get("MAC tables", 0) + time.monotonic() - started
+        return answered
 
     # ----------------------------------------------------------------- Putting results on the map
 
     def find(self, address="", name=""):
-        return self.aliases.get(address) or (self.aliases.get(normalize_name(name)) if name else None)
+        """The key of the device with this address, or this name (unless more than one device has it)."""
+        if self.aliases.get(address):
+            return self.aliases[address]
+        base = normalize_name(name) if name else ""
+        return self.aliases.get(base) if base and base not in self.ambiguous else None
+
+    def current_key(self, key, address):
+        """A queued visit's key now: the device may have been merged into another, or keyed by address."""
+        if key is None or key in self.map.devices:
+            return key
+        return self.renamed[key] if self.renamed.get(key) in self.map.devices else self.find(address)
+
+    def new_key(self, name, address="", seen_on=None):
+        """The key for a device first seen now: its name, or when more than one device has that name, its name and
+        address (or where it was seen, (device key, port), if it gave no address)."""
+        base = normalize_name(name)
+        if not base or base not in self.ambiguous:
+            return base
+        if address:
+            return f"{base}@{address}"
+        return f"{base}@{seen_on[0]}/{short_port(seen_on[1])}" if seen_on else base
+
+    def qualified_key(self, base, device):
+        """new_key's form for a device found before its name turned out to be shared."""
+        address = device.mgmt_ip or (device.addresses[0] if device.addresses else "")
+        if address:
+            return f"{base}@{address}"
+        link = next(iter(self.map.links_of(device.key)), None)
+        if link is None:
+            return f"{base}@{device.key}"
+        far = link.other(device.key)
+        return f"{base}@{far}/{link.port_on(far)}"
+
+    def rename(self, old, new):
+        """Key device old as new, everywhere the crawl keeps it. Returns new."""
+        device = self.map.devices.pop(old)
+        device.key = new
+        self.map.devices[new] = device
+        for link in self.map.links:
+            link.a, link.b = (new if link.a == old else link.a), (new if link.b == old else link.b)
+        for alias, key in self.aliases.items():
+            if key == old:
+                self.aliases[alias] = new
+        for table in (self.tables, self.capabilities):
+            if old in table:
+                table[new] = table.pop(old)
+        self.advertised = {(new if key == old else key, port): address
+                           for (key, port), address in self.advertised.items()}
+        self.renamed[old] = new
+        return new
+
+    def namesakes(self, key, name=""):
+        """Devices read in this crawl that device key (or one named name) could turn out to be: key itself, if it
+        was read, and those with its name."""
+        device = self.map.devices.get(key) if key is not None else None
+        base = normalize_name(name or (device.name if device is not None else ""))
+        return [other for other in self.tables if other in self.map.devices
+                and (other == key or (base and normalize_name(self.map.devices[other].name) == base))]
+
+    def known_identity(self, key):
+        """identity() of a device read before on the map this crawl adds to, or None."""
+        device = self.known.devices.get(key) if self.known is not None and key else None
+        if device is None or device.source != SNMP or device.manual:
+            return None
+        return {item[0] for item in device.interfaces_l3}, set()
+
+    def another_named(self, first, key, address, tables):
+        """The device read at address has the name of device first (read already) but isn't it: two devices with
+        one name (switches left named "Switch", or sw1.site-a and sw1.site-b). Both are keyed by address, so neither
+        key depends on which was read first, and the links its neighbors drew to first by name move to it. key: the
+        one its visit was queued under. Returns its key."""
+        base = normalize_name(tables.info.name)
+        first_device = self.map.devices.get(first) or self.known.devices[first]
+        if base and normalize_name(first_device.name) == base:
+            self.ambiguous.add(base)
+            if first == base and first in self.tables:
+                first = self.rename(first, self.qualified_key(base, first_device))
+                key = self.renamed.get(key, key)
+            new = f"{base}@{address}"
+        else:  # Found by an address a neighbor gave for first: it has a name of its own
+            new = self.new_key(tables.info.name, address) or f"ip:{address}"
+        mine = {ip for ip, _, _ in tables.addresses} | {address}
+        for ip in mine:
+            self.aliases[ip] = new
+        links, self.map.links = self.map.links, []
+        for link in links:
+            for end, far, far_port in (("a", link.b, link.b_port), ("b", link.a, link.a_port)):
+                if getattr(link, end) in (first, key) and self.advertised.get((far, port_key(far_port))) in mine:
+                    setattr(link, end, new)
+            if link.a != link.b:
+                self.map.add_link(link)
+        return new
+
+    def unaddressed_neighbor(self, other, key, neighbor):
+        """A neighbor that gave no address, found by name as device other. Unless the port it's on has a link to
+        somewhere else already: a port links to one place, so it's another device with that name. Returns its
+        key."""
+        if not neighbor.port:
+            return other
+        for link in self.map.links_of(other):
+            far = link.other(other)
+            if far != other and port_key(link.port_on(other)) == port_key(neighbor.port) \
+                    and (far, port_key(link.port_on(far))) != (key, port_key(neighbor.local_port)):
+                break
+        else:
+            return other
+        base = normalize_name(neighbor.name)
+        self.ambiguous.add(base)
+        if other == base:
+            self.rename(other, self.qualified_key(base, self.map.devices[other]))
+        return self.new_key(neighbor.name, "", (key, neighbor.local_port))
 
     def found_address(self, key, address):
         """The address to note on a device as found: not one it was only asked at because it was corrected by
@@ -451,17 +630,32 @@ class Crawler:
 
         info = tables.info
         existing = self.find(address, info.name)
-        if existing and existing in self.map.devices and self.map.devices[existing].source == SNMP:
-            self.aliases[address] = existing
+        # Devices read already that it may be: the one at this address, and those with its name. It's one of them
+        # if their IP addresses overlap (an SNMP agent gives the same table at each of its addresses).
+        read = list(dict.fromkeys(([existing] if existing in self.tables else []) + self.namesakes(key, info.name)))
+        same = next((other for other in read if same_device(identity(self.tables[other]), identity(tables))), None)
+        if same is not None:
+            if key is not None and key != same and key in self.map.devices and self.map.devices[key].source != SNMP:
+                self.merge(key, same)  # A neighbor's view of it, under another key
+            self.aliases[address] = same
             self.events("finished", address, "again")
-            self.events("log", f"{address} is {self.map.devices[existing].label} again (another of its addresses)")
+            self.events("log", f"{address} is {self.map.devices[same].label} again (another of its addresses)")
             return []  # Reached the same device at a second address
-        if key is None:
-            key = existing or normalize_name(info.name) or f"ip:{address}"
+        before = next((other for other in (key, existing) if self.known_identity(other) is not None), None)
+        if before is not None and same_device(self.known_identity(before), identity(tables)):
+            before = None  # On the map this crawl adds to: read again under its key
+        if read or before is not None:
+            key = self.another_named(read[0] if read else before, key, address, tables)
+        elif key is None:
+            key = existing or self.new_key(info.name, address) or f"ip:{address}"
         elif existing and existing != key:
             self.merge(key, existing)  # Found under two names (a neighbor's view, and its own sysName)
             key = existing
-        device = self.add_device(key, mgmt_ip=self.found_address(key, address))
+        device = self.add_device(key)
+        answered_at = self.found_address(key, address)
+        if answered_at:  # Where it answered SNMP, over an address a neighbor advertised (which may not answer)
+            device.mgmt_ip = answered_at
+            self.aliases.setdefault(answered_at, key)
         device.name = info.name or device.name  # Its own sysName over how a neighbor wrote it
         device.source, device.error, device.hops = SNMP, "", hops
         device.sys_descr, device.sys_object_id = info.descr, info.object_id
@@ -495,9 +689,12 @@ class Crawler:
             kind = collect.classify(capabilities=neighbor.capabilities, platform=neighbor.platform)
             if kind in END_DEVICE_KINDS:
                 continue  # Placed on its port as a host at the end
-            other = self.find(neighbor.address, neighbor.name) or normalize_name(neighbor.name)
+            other = self.find(neighbor.address, neighbor.name) \
+                or self.new_key(neighbor.name, neighbor.address, (key, neighbor.local_port))
             if other == key:
                 continue
+            if not neighbor.address and other in self.map.devices and self.map.devices[other].source != SNMP:
+                other = self.unaddressed_neighbor(other, key, neighbor)
             if other in self.deleted or (neighbor.address and neighbor.address in self.deleted_addresses):
                 if other not in self.left_out:
                     self.left_out.add(other)
@@ -523,7 +720,11 @@ class Crawler:
             self.capabilities.setdefault(other, set()).update(neighbor.capabilities)
             self.map.add_link(Link(key, short_port(neighbor.local_port), other, short_port(neighbor.port),
                                    [neighbor.protocol]))
-            if other_device.source == SNMP or (address and address in self.asked):
+            if address:
+                self.advertised[(key, port_key(neighbor.local_port))] = address
+            # Read already, unless found by name at an address it doesn't have: maybe another device with its name
+            if (other_device.source == SNMP and (not address or other_device.owns(address))) \
+                    or (address and address in self.asked):
                 continue
             name = f"{other_device.label} ({address})" if address else other_device.label
             if not known:
@@ -629,7 +830,8 @@ class Check:
     source: str  # SNMP, NO_SNMP or UNREACHABLE
     error: str = ""
     info: collect.SystemInfo = None
-    community: str = ""  # The community string it answered to
+    community: object = ""  # The community string (or V3User) it answered to
+    reasons: list = field(default_factory=list)  # Why it refused, when it said (an SNMPv3 user unknown, a password)
 
     def apply(self, device):
         """Note it on the device, as a crawl would: its sysName (if it hasn't a name), description and kind."""
@@ -641,14 +843,39 @@ class Check:
                 device.kind = collect.classify(self.info.object_id, self.info.descr, platform=device.platform)
 
 
+def identity(tables):
+    """What tells a device read over SNMP from another with its name: (its IP addresses, its own MACs)."""
+    return {ip for ip, _, _ in tables.addresses}, set(tables.own_macs)
+
+
+def same_device(one, other):
+    """Whether two identities are one device. An SNMP agent gives the same tables at each of its addresses, so its
+    addresses overlap (or failing those, its MACs). With nothing to compare, they're taken to be one."""
+    (addresses, macs), (other_addresses, other_macs) = one, other
+    if addresses and other_addresses:
+        return bool(addresses & other_addresses)
+    if macs and other_macs:
+        return bool(macs & other_macs)
+    return True
+
+
+def credential_kind(credential):
+    return "SNMPv3 user" if is_v3(credential) else "community"
+
+
 def check_device(settings, address, client_factory=SnmpClient, pinger=None):
     """Ask one device for its system details with the communities a crawl would try; ping it if none answers.
     Returns a Check. Reads nothing else (no neighbors or tables): Crawl from Here does that."""
-    crawler = Crawler(settings, client_factory=client_factory, pinger=pinger)
+    said = []
+    crawler = Crawler(settings, client_factory=client_factory, pinger=pinger,
+                      events=lambda kind, *details: said.append(details[0]) if kind == "log" else None)
     _, info, community = crawler.connect(address)
     if info is not None:
         return Check(SNMP, "", info, community)
-    return Check(NO_SNMP, PINGS_NO_SNMP) if crawler.pinger(address) else Check(UNREACHABLE, NO_ANSWER)
+    reasons = [line for line in dict.fromkeys(said) if "no answer with" not in line]
+    if crawler.pinger(address):
+        return Check(NO_SNMP, PINGS_NO_SNMP, reasons=reasons)
+    return Check(UNREACHABLE, NO_ANSWER, reasons=reasons)
 
 
 def timing_summary(timings):

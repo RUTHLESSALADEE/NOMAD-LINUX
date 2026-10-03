@@ -488,3 +488,20 @@ def test_group_menu_offers_arranging_the_selection(tab, crawled):
     assert texts[0].startswith("Arrange the 2 Selected Groups") and "Align" in texts
     tab.view.move_selection(QPointF(100, 50))  # Dragging one of them moves both
     assert tab.view.group_items[second.key].rect.isValid()
+
+
+def test_arranging_the_selection_in_another_style(tab, crawled, monkeypatch):
+    tab.on_crawled(crawled)
+    keys = sorted(crawled.devices)[:3]
+    for key in keys:
+        tab.view.items_by_key[key].setSelected(True)
+    tab.arrange_style = TOP_DOWN
+    menu = QMenu()
+    tab.add_selection_actions(menu, tab.view, tab.view.selected_keys())
+    styles = menu.actions()[0].menu().actions()
+    assert [action.text() for action in styles] == list(STYLE_NAMES.values())
+    assert [action.isChecked() for action in styles] == [style == TOP_DOWN for style in STYLE_NAMES]
+    chosen = []
+    monkeypatch.setattr(tab, "arrange_selected", lambda view, keys, groups, style: chosen.append(style))
+    styles[list(STYLE_NAMES).index(CIRCLE)].trigger()
+    assert chosen == [CIRCLE] and tab.arrange_style == TOP_DOWN  # Re-arrange's own style stays as it was

@@ -91,12 +91,14 @@ class TriggerQueue:
 
 class TrapReceiver:
     """Listens for SNMP traps on UDP 162 and calls on_trap(Trap, sender address) from its thread. Informs are
-    answered so the switch stops resending them."""
+    answered so the switch stops resending them. v3_users: a callable giving the V3Users whose v3 traps to take
+    (asked for each one, so changing them doesn't need a restart); other v3 traps are left out."""
 
-    def __init__(self, on_trap, address="0.0.0.0", port=TRAP_PORT):
-        self.on_trap, self.address, self.port = on_trap, address, port
+    def __init__(self, on_trap, address="0.0.0.0", port=TRAP_PORT, v3_users=lambda: ()):
+        self.on_trap, self.address, self.port, self.v3_users = on_trap, address, port, v3_users
         self.stopping = threading.Event()
         self.sock, self.thread = None, None
+        self.refused = set()  # Senders whose v3 traps couldn't be checked (logged once each)
 
     def start(self):
         """Raises OSError if the port can't be used."""
@@ -135,9 +137,13 @@ class TrapReceiver:
                     return
                 continue
             try:
-                trap = parse_trap(data)
+                trap = parse_trap(data, list(self.v3_users()))
             except ValueError as error:
-                log.debug("Not a trap from %s: %s", sender[0], error)
+                if "SNMPv3" in str(error) and sender[0] not in self.refused:
+                    self.refused.add(sender[0])
+                    log.info("Left out a trap from %s: %s", sender[0], error)
+                else:
+                    log.debug("Not a trap from %s: %s", sender[0], error)
                 continue
             if trap.inform:
                 try:
@@ -156,16 +162,3 @@ def device_for_address(network_map, address):
         if device.owns(address):
             return key
     return None
-
-
-def switch_config(address, community="public"):
-    """Lines to paste into a Cisco switch so it tells this computer when something's plugged in."""
-    return [
-        f"logging host {address}",
-        "logging trap notifications",
-        f"snmp-server host {address} version 2c {community}",
-        "snmp-server enable traps snmp linkup coldstart warmstart",
-        "snmp-server enable traps mac-notification change move",
-        "mac address-table notification change",
-        "! and on each access port: snmp trap mac-notification change added",
-    ]

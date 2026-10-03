@@ -457,6 +457,76 @@ def test_tribe_map_offline_changes_kept_until_sent(server, tmp_path):
     assert alice.load(map_id)[0].devices["acc1"].note == "closet 2"  # Offline, still there
 
 
+
+def test_tribe_map_groups_collapsed_by_each_person(server, tmp_path):
+    alice, bob = tribe_maps(server, tmp_path, "alice"), tribe_maps(server, tmp_path, "bob")
+    network_map = small_map()
+    hq = network_map.new_group("HQ")
+    network_map.set_group(["core"], hq.key)
+    lab = network_map.new_group("Lab")
+    network_map.set_group(["acc1"], lab.key)
+    hq.collapsed = True
+    map_id = alice.create("HQ", network_map, {}, {})
+    bob.sync()
+    bobs, _ = bob.load(map_id)
+    assert not any(group.collapsed for group in bobs.groups)  # Alice's collapsing stays hers
+
+    for group in bobs.groups:
+        group.collapsed = group.key == lab.key
+    assert bob.save(map_id, bobs) == 0 and bob.pending_count() == 0  # Nothing to send
+    alices, _ = alice.load(map_id)
+    alices.devices["acc1"].note = "closet 2"
+    alices.groups[[group.key for group in alices.groups].index(hq.key)].collapsed = False
+    assert alice.save(map_id, alices) == 1  # Just the note
+    alice.sync()
+    bob.sync()
+    bobs, _ = bob.load(map_id)
+    assert bobs.devices["acc1"].note == "closet 2"
+    assert {group.key for group in bobs.groups if group.collapsed} == {lab.key}  # Bob's own, kept
+    assert not any(group.collapsed for group in alice.load(map_id)[0].groups)
+
+
+def test_tribe_map_collapsed_groups_shared_by_older_nomads(server, tmp_path):
+    alice = tribe_maps(server, tmp_path, "alice")
+    network_map = small_map()
+    hq = network_map.new_group("HQ")
+    network_map.set_group(["core"], hq.key)
+    map_id = alice.create("HQ", network_map, {}, {})
+    TeamClient(key_for(server), user="old").map_request(  # An older NOMAD collapses it, for everyone
+        "push", map_id=map_id, changes=[{"section": "group", "key": hq.key,
+                                         "data": {"key": hq.key, "name": "HQ", "kind": hq.kind, "parent": "",
+                                                  "collapsed": True}}])
+    alice.sync()
+    assert not alice.load(map_id)[0].groups[0].collapsed  # Alice keeps her own
+    newcomer = tribe_maps(server, tmp_path, "bob")
+    newcomer.sync()
+    opened, _ = newcomer.load(map_id)
+    assert opened.groups[0].collapsed  # First opened here: as it was shared
+    assert newcomer.save(map_id, opened) == 0  # And nothing to send back
+
+
+def test_tribe_map_saved_while_others_changes_arrive(server, tmp_path):
+    alice, bob = tribe_maps(server, tmp_path, "alice"), tribe_maps(server, tmp_path, "bob")
+    map_id = alice.create("HQ", small_map(), {}, {})
+    alices, settings, seen = alice.snapshot(map_id)  # Open on Alice's page
+    bob.sync()
+    bobs, _ = bob.load(map_id)
+    bobs.positions["acc1"] = (70.0, 70.0)
+    bobs.devices["acc1"].note = "closet 2"
+    bob.save(map_id, bobs)
+    bob.sync()
+    alice.sync()  # Bob's changes reach Alice's copy, but her page hasn't redrawn yet
+
+    alices.positions["core"] = (50.0, 50.0)
+    assert alice.save(map_id, alices, settings, seen) == 1  # Just her move
+    alice.sync()
+    bob.sync()
+    merged, _ = bob.load(map_id)
+    assert merged.positions == {"core": (50.0, 50.0), "acc1": (70.0, 70.0)}
+    assert merged.devices["acc1"].note == "closet 2"
+    assert seen[("position", "core")] == [50.0, 50.0]
+    assert alice.save(map_id, alices, settings, seen) == 0  # Nothing new on her page
+
 def test_tribe_map_lease_and_wait(server, tmp_path):
     alice, bob = tribe_maps(server, tmp_path, "alice"), tribe_maps(server, tmp_path, "bob")
     map_id = alice.create("HQ", small_map(), {}, {})

@@ -8,8 +8,8 @@ import threading
 import time
 
 from PyQt5.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
-from PyQt5.QtWidgets import QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, \
-    QMessageBox, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QApplication, QCheckBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QMessageBox, \
+    QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget
 
 from ..netmap import triggers, watch
 from ..netmap.monitor import duration_text
@@ -26,8 +26,57 @@ LEASE_RENEW_SECONDS = 60
 UNKNOWN_SENDERS_LOGGED = 50
 
 
-class SignatureThread(QThread):
-    done = pyqtSignal(object)  # {key: signature or None}
+# The timers on the Watch tab (and in the Map Watcher service's settings): name -> (label, unit seconds, text,
+# tooltip)
+TIMER_FIELDS = {
+    "neighbor_interval": ("New neighbors:", 60, "every {} min",
+                          "How often each switch is asked for its CDP and LLDP neighbors (quick: two short tables). "
+                          "A switch with a new neighbor is read again at once."),
+    "host_interval": ("New hosts:", 60, "every {} min",
+                      "How often every switch's MAC table is read again, for hosts plugged in where nothing "
+                      "announced it (slower: like mapping again)."),
+    "recheck_interval": ("SNMP re-check:", 60, "every {} min",
+                         "How often devices on the map that don't answer SNMP are asked again with the map's "
+                         "credentials. One that answers now is read (Crawl from Here). Changing the credentials "
+                         "asks them at once."),
+    "trigger_delay": ("After a trap or syslog:", 1, "read the switch {} s later",
+                      "How long after a switch says a port came up (or a neighbor appeared) it's read: CDP needs a "
+                      "little time to see a new neighbor."),
+}
+
+
+class WatchTimers(QWidget):
+    """The watch timers as a form of spin boxes. values() is {name: seconds}, as watch.TIMERS has them."""
+    changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        form = QFormLayout(self)
+        form.setContentsMargins(0, 0, 0, 0)
+        self.boxes = {}
+        for name, (label, unit, text, tip) in TIMER_FIELDS.items():
+            default, least, most = watch.TIMERS[name]
+            box = QSpinBox()
+            box.setRange(max(least // unit, 0), most // unit)
+            prefix, _, suffix = text.partition("{}")
+            box.setPrefix(prefix)
+            box.setSuffix(suffix)
+            box.setValue(default // unit)
+            box.setToolTip(tip)
+            box.valueChanged.connect(lambda _: self.changed.emit())
+            self.boxes[name] = box
+            form.addRow(label, box)
+
+    def values(self):
+        return {name: box.value() * TIMER_FIELDS[name][1] for name, box in self.boxes.items()}
+
+    def set_values(self, values):
+        for name, seconds in watch.timer_values(values).items():
+            self.boxes[name].setValue(seconds // TIMER_FIELDS[name][1])
+
+
+class RecheckThread(QThread):
+    done = pyqtSignal(object, int)  # {key: (address, Check)} of those that answer SNMP now, how many were asked
 
     def __init__(self, targets, options, client_factory, parent=None):
         super().__init__(parent)
@@ -39,11 +88,32 @@ class SignatureThread(QThread):
 
     def run(self):
         try:
-            self.done.emit(watch.read_signatures(self.targets, self.options, self.client_factory,
-                                                 self.stop_event.is_set, self.options.workers))
+            self.done.emit(watch.recheck(self.targets, self.options, self.client_factory, self.stop_event.is_set,
+                                         self.options.workers), len(self.targets))
+        except Exception:
+            log.exception("Asking devices that don't answer SNMP again failed")
+            self.done.emit({}, 0)
+
+
+class SignatureThread(QThread):
+    done = pyqtSignal(object, object)  # {key: signature or None}, {key: (old address, address it answers at)}
+
+    def __init__(self, targets, options, client_factory, parent=None, fallbacks=None):
+        super().__init__(parent)
+        self.targets, self.options, self.client_factory = targets, options, client_factory
+        self.fallbacks = fallbacks or {}
+        self.stop_event = threading.Event()
+
+    def stop(self):
+        self.stop_event.set()
+
+    def run(self):
+        try:
+            self.done.emit(*watch.read_switches(self.targets, self.fallbacks, self.options, self.client_factory,
+                                                self.stop_event.is_set, self.options.workers))
         except Exception:
             log.exception("Asking switches for their neighbors failed")
-            self.done.emit({})
+            self.done.emit({}, {})
 
 
 class RefreshThread(QThread):
@@ -107,7 +177,8 @@ class MapWatcher(QObject):
         self.baseline = watch.NeighborBaseline()
         self.queue = triggers.TriggerQueue()
         self.to_refresh = {}  # Address -> reasons, waiting for the reading going on to finish
-        self.signature_thread = self.refresh_thread = self.lease_thread = None
+        self.signature_thread = self.refresh_thread = self.lease_thread = self.recheck_thread = None
+        self.recheck_again = False  # The credentials changed while devices were being asked: ask again after
         self.trap_receiver = None
         self.listening = []  # What's being listened on, for the tab
         self.unknown_senders = set()
@@ -115,11 +186,14 @@ class MapWatcher(QObject):
         self.lease_checked = 0.0
         self.holder = f"{socket.gethostname()}-{os.getpid()}"
         self.neighbor_interval, self.host_interval = watch.NEIGHBOR_INTERVAL, watch.HOST_INTERVAL
+        self.recheck_interval = watch.RECHECK_INTERVAL
         self.last_neighbors = self.last_hosts = None
         self.neighbor_timer = QTimer(self)
         self.neighbor_timer.timeout.connect(self.poll_neighbors)
         self.host_timer = QTimer(self)
         self.host_timer.timeout.connect(self.refresh_all)
+        self.recheck_timer = QTimer(self)
+        self.recheck_timer.timeout.connect(self.recheck_unread)
         self.tick_timer = QTimer(self)
         self.tick_timer.timeout.connect(self.tick)
         self.build_tab()
@@ -133,32 +207,27 @@ class MapWatcher(QObject):
         self.summary_label.setWordWrap(True)
         layout.addWidget(self.summary_label)
         form = QFormLayout()
-        self.neighbor_combo = QComboBox()
-        for seconds in watch.NEIGHBOR_INTERVALS:
-            self.neighbor_combo.addItem(f"every {duration_text(seconds)}", seconds)
-        self.neighbor_combo.setCurrentIndex(watch.NEIGHBOR_INTERVALS.index(watch.NEIGHBOR_INTERVAL))
-        self.neighbor_combo.setToolTip("How often each switch is asked for its CDP and LLDP neighbors (quick: two "
-                                       "short tables). A switch with a new neighbor is read again at once.")
-        self.host_combo = QComboBox()
-        for seconds in watch.HOST_INTERVALS:
-            self.host_combo.addItem(f"every {duration_text(seconds)}", seconds)
-        self.host_combo.setCurrentIndex(watch.HOST_INTERVALS.index(watch.HOST_INTERVAL))
-        self.host_combo.setToolTip("How often every switch's MAC table is read again, for hosts plugged in where "
-                                   "nothing announced it (slower: like mapping again).")
+        self.timers = WatchTimers()
         self.listen_check = QCheckBox(f"Listen for syslog (UDP {self.syslog_port}) and SNMP traps "
                                       f"(UDP {self.trap_port}) from the switches")
         self.listen_check.setChecked(True)
         self.listen_check.setToolTip("Read a switch as soon as it says a port came up, a CDP neighbor appeared or "
                                      "a MAC address was learned, instead of waiting for the next check. The "
                                      "switches have to be set up to send to this computer (see below).")
-        form.addRow("New neighbors:", self.neighbor_combo)
-        form.addRow("New hosts:", self.host_combo)
+        form.addRow(self.timers)
         form.addRow("", self.listen_check)
         layout.addLayout(form)
+        config_row = QHBoxLayout()
         self.config_label = QLabel()
         self.config_label.setWordWrap(True)
         self.config_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        layout.addWidget(self.config_label)
+        self.config_button = QPushButton("Switch SNMP Config...")
+        self.config_button.setToolTip("Build the configuration that lets the switches be read and has them send traps "
+                                      "and syslog here, and send it to a switch.")
+        self.config_button.clicked.connect(self.open_config_builder)
+        config_row.addWidget(self.config_label, 1)
+        config_row.addWidget(self.config_button)
+        layout.addLayout(config_row)
         buttons = QHBoxLayout()
         self.check_now_button = QPushButton("Check Now")
         self.check_now_button.setToolTip("Ask every switch for its neighbors now, and read again any with new ones.")
@@ -178,8 +247,7 @@ class MapWatcher(QObject):
         self.log_view.setFont(monospace_font())
         self.log_view.setLineWrapMode(QPlainTextEdit.NoWrap)
         layout.addWidget(self.log_view, 1)
-        self.neighbor_combo.currentIndexChanged.connect(lambda _: self.set_intervals())
-        self.host_combo.currentIndexChanged.connect(lambda _: self.set_intervals())
+        self.timers.changed.connect(self.set_intervals)
         self.listen_check.toggled.connect(lambda _: self.update_listening())
         self.check_now_button.clicked.connect(self.poll_neighbors)
         self.seen_button.clicked.connect(lambda: self.page.mark_seen(None))
@@ -221,19 +289,24 @@ class MapWatcher(QObject):
                     "be read twice). What it finds shows here as it's added. If it stops, this computer takes over.")
         else:
             parts = [f"Watching {len(watch.switches(self.page.network_map))} switches: neighbors every "
-                     f"{duration_text(self.neighbor_interval)}, hosts every {duration_text(self.host_interval)}."]
+                     f"{duration_text(self.neighbor_interval)}, hosts every {duration_text(self.host_interval)}; "
+                     f"devices that don't answer SNMP asked again every {duration_text(self.recheck_interval)}."]
             if self.last_neighbors:
                 parts.append(f"Last checked {datetime.datetime.fromtimestamp(self.last_neighbors):%H:%M:%S}.")
             if self.listening:
                 parts.append("Listening for " + " and ".join(self.listening) + ".")
             text = " ".join(parts)
         self.summary_label.setText(text)
-        address = self.local_address()
-        community = (self.page.communities or ["public"])[0]
-        lines = "<br>".join(triggers.switch_config(address, community))
-        self.config_label.setText(f"So a switch tells this computer at once, add to its configuration:<br>"
-                                  f"<code>{lines}</code>")
+        self.config_label.setText(f"So a switch tells this computer at once, it has to send its traps and syslog "
+                                  f"here ({self.local_address()}), with link-status logging on its access ports.")
         self.status_changed.emit()
+
+    def open_config_builder(self):
+        """The SNMP Config page, set up for this computer and the map's first credential."""
+        address = self.local_address()
+        credentials = self.page.credentials()
+        self.page.window.show_snmp_config(destination=address if not address.startswith("<") else "",
+                                          credential=credentials[0] if credentials else None)
 
     def local_address(self):
         adapter = self.page.window.current_adapter() if hasattr(self.page.window, "current_adapter") else None
@@ -262,10 +335,11 @@ class MapWatcher(QObject):
         if not self.running:
             return
         self.running = self.active = False
-        for timer in (self.neighbor_timer, self.host_timer, self.tick_timer):
+        for timer in (self.neighbor_timer, self.host_timer, self.recheck_timer, self.tick_timer):
             timer.stop()
         self.stop_listening()
-        for thread in (self.signature_thread, self.refresh_thread):
+        self.recheck_again = False
+        for thread in (self.signature_thread, self.refresh_thread, self.recheck_thread):
             if thread is not None:
                 thread.stop()
         if self.page.tribe_map_id is not None and self.page.tribe.maps is not None and not self.standing_by:
@@ -287,11 +361,16 @@ class MapWatcher(QObject):
             self.start()
 
     def set_intervals(self):
-        self.neighbor_interval = self.neighbor_combo.currentData()
-        self.host_interval = self.host_combo.currentData()
-        if self.running and self.active:
+        values = self.timers.values()
+        changed = (values["neighbor_interval"], values["host_interval"], values["recheck_interval"]) != \
+            (self.neighbor_interval, self.host_interval, self.recheck_interval)
+        self.neighbor_interval, self.host_interval = values["neighbor_interval"], values["host_interval"]
+        self.recheck_interval = values["recheck_interval"]
+        self.queue.delay = values["trigger_delay"]
+        if self.running and self.active and (changed or not self.neighbor_timer.isActive()):
             self.neighbor_timer.start(self.neighbor_interval * 1000)
             self.host_timer.start(self.host_interval * 1000)
+            self.recheck_timer.start(self.recheck_interval * 1000)
         self.update_summary()
 
     def go_active(self):
@@ -301,6 +380,7 @@ class MapWatcher(QObject):
         self.update_listening()
         if first:
             self.poll_neighbors()
+            self.recheck_unread()
         self.update_summary()
 
     def stand_by(self, who):
@@ -309,6 +389,7 @@ class MapWatcher(QObject):
         self.standing_by, self.active = who, False
         self.neighbor_timer.stop()
         self.host_timer.stop()
+        self.recheck_timer.stop()
         self.stop_listening()
         self.update_summary()
 
@@ -355,7 +436,7 @@ class MapWatcher(QObject):
         except OSError as error:
             self.log(f"Couldn't listen for syslog on UDP {self.syslog_port}: {error.strerror or error} (another "
                      "syslog server may have it). Watching by checking every so often only.")
-        receiver = triggers.TrapReceiver(self.on_trap, port=self.trap_port)
+        receiver = triggers.TrapReceiver(self.on_trap, port=self.trap_port, v3_users=lambda: list(self.page.v3_users))
         try:
             receiver.start()
             self.trap_receiver = receiver
@@ -414,7 +495,9 @@ class MapWatcher(QObject):
         targets = watch.switches(self.page.network_map)
         if not targets:
             return
-        self.signature_thread = SignatureThread(targets, self.page.watch_options(), self.client_factory, self)
+        options = self.page.watch_options()
+        fallbacks = watch.fallback_addresses(self.page.network_map, targets, options.scope)
+        self.signature_thread = SignatureThread(targets, options, self.client_factory, self, fallbacks)
         self.signature_thread.done.connect(self.on_signatures)
         self.signature_thread.finished.connect(self.on_signature_thread_finished)
         self.signature_thread.start()
@@ -424,11 +507,16 @@ class MapWatcher(QObject):
         self.signature_thread = None
         self.update_summary()
 
-    def on_signatures(self, signatures):
+    def on_signatures(self, signatures, moved=None):
         if not self.running or self.page.network_map is None:
             return
         self.last_neighbors = time.time()
         network_map = self.page.network_map
+        lines = watch.adopt_addresses(network_map, moved or {})
+        for line in lines:
+            self.log(line)
+        if lines:
+            self.applied.emit(watch.WatchResult(lines=lines))  # Saves the map with the new addresses
         silent = [key for key, signature in signatures.items() if signature is None and key in network_map.devices]
         if silent and len(silent) == len(signatures):
             self.log("No switch answered SNMP: check the network and the community strings")
@@ -437,6 +525,53 @@ class MapWatcher(QObject):
             if device is not None:
                 self.log(f"{device.label}: new CDP/LLDP neighbor: reading it")
                 self.queue_refresh(device.mgmt_ip, ["new neighbor"])
+        self.run_refresh()
+
+    def recheck_unread(self):
+        """Ask the devices that don't answer SNMP again, in the background."""
+        if not self.active or self.page.network_map is None:
+            return
+        if self.recheck_thread is not None:
+            self.recheck_again = True
+            return
+        options = self.page.watch_options()
+        targets = watch.unread_devices(self.page.network_map, options.scope)
+        if not targets:
+            return
+        self.recheck_thread = RecheckThread(targets, options, self.client_factory, self)
+        self.recheck_thread.done.connect(self.on_rechecked)
+        self.recheck_thread.finished.connect(self.on_recheck_thread_finished)
+        self.recheck_thread.start()
+        self.update_summary()
+
+    def recheck_now(self):
+        """The credentials changed: ask the devices that don't answer SNMP with them now."""
+        if self.running and self.active:
+            self.recheck_unread()
+
+    def on_recheck_thread_finished(self):
+        self.recheck_thread = None
+        if self.recheck_again:
+            self.recheck_again = False
+            self.recheck_unread()
+        self.update_summary()
+
+    def on_rechecked(self, found, asked):
+        if not self.running or self.page.network_map is None:
+            return
+        network_map = self.page.network_map
+        answering = []
+        for key, (address, check) in found.items():
+            device = network_map.devices.get(key)
+            if device is None or device.source == "snmp":
+                continue  # Gone, or read meanwhile
+            answering.append(device.label)
+            self.page.answered[address] = check.community
+            self.log(f"{device.label} answers SNMP now ({watch.credential_text(check.community)}): reading it")
+            self.queue_refresh(address, ["answers SNMP now"])
+        if asked and not answering:
+            what = "the device that doesn't" if asked == 1 else f"the {asked} devices that don't"
+            self.log(f"Asked {what} answer SNMP again: none do yet")
         self.run_refresh()
 
     def refresh_all(self):
@@ -490,7 +625,7 @@ class MapWatcher(QObject):
 
     def shutdown(self):
         self.stop(quiet=True)
-        for thread in (self.signature_thread, self.refresh_thread, self.lease_thread):
+        for thread in (self.signature_thread, self.refresh_thread, self.lease_thread, self.recheck_thread):
             if thread is not None:
                 if hasattr(thread, "stop"):
                     thread.stop()

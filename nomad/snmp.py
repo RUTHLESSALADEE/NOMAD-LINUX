@@ -1,6 +1,7 @@
-"""SNMP v1/v2c get and walk, for reading a switch's, router's or printer's details and interface counters.
+"""SNMP get and walk, for reading a switch's, router's or printer's details and interface counters.
 
-Speaks the protocol directly (BER encoding over UDP), so nothing extra needs installing.
+Speaks the protocol directly (BER encoding over UDP), so nothing extra needs installing. v1 and v2c here; SNMPv3
+(users, authentication and privacy) is in snmpv3.py, used when a client's credential is a V3User.
 """
 import os
 import socket
@@ -8,14 +9,14 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 SNMP_PORT = 161
-V1, V2C = 0, 1
-VERSIONS = {"v2c": V2C, "v1": V1}
+V1, V2C, V3 = 0, 1, 3
+VERSIONS = {"v2c": V2C, "v1": V1}  # The versions used with community strings
 
 # BER tags
 INTEGER, OCTET_STRING, NULL, OBJECT_ID, SEQUENCE = 0x02, 0x04, 0x05, 0x06, 0x30
 IP_ADDRESS, COUNTER32, GAUGE32, TIMETICKS, OPAQUE, COUNTER64 = 0x40, 0x41, 0x42, 0x43, 0x44, 0x46
 NO_SUCH_OBJECT, NO_SUCH_INSTANCE, END_OF_MIB_VIEW = 0x80, 0x81, 0x82
-GET, GET_NEXT, RESPONSE, GET_BULK = 0xA0, 0xA1, 0xA2, 0xA5
+GET, GET_NEXT, RESPONSE, GET_BULK, REPORT = 0xA0, 0xA1, 0xA2, 0xA5, 0xA8
 TRAP_V1, INFORM, TRAP_V2 = 0xA4, 0xA6, 0xA7
 TRAP_PORT = 162
 SNMP_TRAP_OID = (1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0)  # snmpTrapOID.0: which trap a v2c trap is
@@ -29,7 +30,7 @@ ERRORS = {1: "tooBig", 2: "noSuchName", 3: "badValue", 4: "readOnly", 5: "genErr
           8: "wrongLength", 9: "wrongEncoding", 10: "wrongValue", 11: "noCreation", 12: "inconsistentValue",
           13: "resourceUnavailable", 14: "commitFailed", 15: "undoFailed", 16: "authorizationError",
           17: "notWritable", 18: "inconsistentName"}
-NO_SUCH_NAME, TOO_BIG = 2, 1
+NO_SUCH_NAME, TOO_BIG, AUTHORIZATION_ERROR = 2, 1, 16
 MAX_ROWS = 200000
 
 SYSTEM = "1.3.6.1.2.1.1"
@@ -167,13 +168,18 @@ def encode_oid(oid):
     return tlv(OBJECT_ID, body)
 
 
-def build_request(version, community, pdu_type, request_id, oids, non_repeaters=0, max_repetitions=0):
+def build_pdu(pdu_type, request_id, oids, non_repeaters=0, max_repetitions=0):
+    """A request PDU: the part v1, v2c and v3 messages share."""
     varbinds = b"".join(tlv(SEQUENCE, encode_oid(oid) + tlv(NULL, b"")) for oid in oids)
     if pdu_type == GET_BULK:
         fields = encode_integer(request_id) + encode_integer(non_repeaters) + encode_integer(max_repetitions)
     else:
         fields = encode_integer(request_id) + encode_integer(0) + encode_integer(0)
-    pdu = tlv(pdu_type, fields + tlv(SEQUENCE, varbinds))
+    return tlv(pdu_type, fields + tlv(SEQUENCE, varbinds))
+
+
+def build_request(version, community, pdu_type, request_id, oids, non_repeaters=0, max_repetitions=0):
+    pdu = build_pdu(pdu_type, request_id, oids, non_repeaters, max_repetitions)
     return tlv(SEQUENCE, encode_integer(version) + tlv(OCTET_STRING, community.encode("utf-8")) + pdu)
 
 
@@ -235,25 +241,23 @@ def parse_response(data, request_id=None):
         pdu_type, pdu, _ = read_tlv(message, offset)
         if pdu_type != RESPONSE:
             raise ValueError("Not an SNMP response.")
-        fields = []
-        offset = 0
-        for _ in range(3):
-            _, raw, offset = read_tlv(pdu, offset)
-            fields.append(int.from_bytes(raw, "big", signed=True) if raw else 0)
-        response_id, error_status, error_index = fields
+        response_id, error_status, error_index, results = parse_pdu(pdu)
         if request_id is not None and response_id != request_id:
             raise ValueError("Response is for a different request.")
-        _, varbinds, _ = read_tlv(pdu, offset)
-        results = []
-        offset = 0
-        while offset < len(varbinds):
-            _, varbind, offset = read_tlv(varbinds, offset)
-            _, oid_raw, inner = read_tlv(varbind, 0)
-            value_tag, value_raw, _ = read_tlv(varbind, inner)
-            results.append((decode_oid(oid_raw), decode_value(value_tag, value_raw)))
         return error_status, error_index, results
     except IndexError:
         raise ValueError("Truncated response.") from None
+
+
+def parse_pdu(pdu):
+    """A PDU's contents as (request ID, error status, error index, [(oid, Value)]). Raises IndexError or ValueError
+    if it's cut short."""
+    fields, offset = [], 0
+    for _ in range(3):
+        _, raw, offset = read_tlv(pdu, offset)
+        fields.append(int.from_bytes(raw, "big", signed=True) if raw else 0)
+    _, varbinds, _ = read_tlv(pdu, offset)
+    return fields[0], fields[1], fields[2], _varbinds(varbinds)
 
 
 # ----------------------------------------------------------------- Traps
@@ -280,16 +284,20 @@ def _varbinds(raw):
     return results
 
 
-def parse_trap(data):
-    """A v1 Trap-PDU, v2c SNMPv2-Trap or inform. Raises ValueError if it isn't one."""
+def parse_trap(data, v3_users=()):
+    """A v1 Trap-PDU, v2c SNMPv2-Trap or inform, or a v3 trap from one of v3_users (V3Users). Raises ValueError if
+    it isn't one, or it's a v3 trap whose user and passwords aren't among v3_users."""
     try:
         tag, message, _ = read_tlv(data, 0)
         if tag != SEQUENCE:
             raise ValueError("Not an SNMP message.")
         _, version_raw, offset = read_tlv(message, 0)
+        version = int.from_bytes(version_raw, "big") if version_raw else 0
+        if version == V3:
+            from .snmpv3 import parse_v3_trap
+            return parse_v3_trap(data, v3_users)
         _, community, offset = read_tlv(message, offset)
         pdu_type, pdu, _ = read_tlv(message, offset)
-        version = int.from_bytes(version_raw, "big") if version_raw else 0
         community = bytes(community).decode("utf-8", "replace")
         if pdu_type == TRAP_V1:
             _, enterprise, offset = read_tlv(pdu, 0)
@@ -304,17 +312,17 @@ def parse_trap(data):
             agent = socket.inet_ntoa(agent_raw) if len(agent_raw) == 4 else ""
             return Trap(version, community, trap_oid, agent, _varbinds(varbinds))
         if pdu_type in (TRAP_V2, INFORM):
-            _, request_raw, offset = read_tlv(pdu, 0)
-            _, _, offset = read_tlv(pdu, offset)  # Error status
-            _, _, offset = read_tlv(pdu, offset)  # Error index
-            _, varbinds, _ = read_tlv(pdu, offset)
-            pairs = _varbinds(varbinds)
-            trap_oid = next((value.value for oid, value in pairs if oid == SNMP_TRAP_OID), ())
-            return Trap(version, community, tuple(trap_oid or ()), "", pairs, pdu_type == INFORM,
-                        int.from_bytes(request_raw, "big", signed=True) if request_raw else 0)
+            return v2_trap(version, community, pdu_type, pdu)
         raise ValueError("Not an SNMP trap.")
     except IndexError:
         raise ValueError("Truncated trap.") from None
+
+
+def v2_trap(version, community, pdu_type, pdu):
+    """A Trap from the contents of an SNMPv2-Trap or inform PDU (v2c's, or v3's once checked and decrypted)."""
+    request_id, _, _, pairs = parse_pdu(pdu)
+    trap_oid = next((value.value for oid, value in pairs if oid == SNMP_TRAP_OID), ())
+    return Trap(version, community, tuple(trap_oid or ()), "", pairs, pdu_type == INFORM, request_id)
 
 
 def inform_response(data):
@@ -345,17 +353,39 @@ def build_trap(community, trap_oid, varbinds=(), version=V2C, request_id=1, upti
 
 # ----------------------------------------------------------------- Talking to a device
 
+def random_id():
+    return int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF
+
+
 class SnmpClient:
-    def __init__(self, host, community="public", version=V2C, timeout=2000, retries=1, port=SNMP_PORT):
-        self.host, self.community, self.version = host, community, version
-        self.timeout, self.retries, self.port = timeout, retries, port
+    def __init__(self, host, community="public", version=V2C, timeout=2000, retries=1, port=SNMP_PORT, context=""):
+        """community: a community string, or a V3User (snmpv3.py) to speak SNMPv3 as that user whatever version
+        says. context: the v3 context name (Catalyst IOS keeps each VLAN's MAC table in context vlan-N)."""
+        self.host, self.community = host, community
+        self.v3 = not isinstance(community, str)
+        self.version = V3 if self.v3 else version
+        self.timeout, self.retries, self.port, self.context = timeout, retries, port, context
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_DGRAM)
         self.family, self.address = infos[0][0], infos[0][4]
 
     def request(self, pdu_type, oids, **bulk):
         """Send a request and return (error status, error index, varbinds). Raises SnmpError."""
-        request_id = int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF
+        if self.v3:
+            from .snmpv3 import request
+            return request(self, pdu_type, oids, **bulk)
+        request_id = random_id()
         packet = build_request(self.version, self.community, pdu_type, request_id, oids, **bulk)
+        return self.exchange(packet, lambda data: parse_response(data, request_id))
+
+    def refused(self, status):
+        if self.v3 and status == AUTHORIZATION_ERROR:
+            return (f"{self.host} won't let SNMPv3 user {self.community.user} read this at {self.community.level}: "
+                    "check the security level (auth or priv) and read view of the user's group")
+        return f"The device refused the request: {ERRORS.get(status, status)}"
+
+    def exchange(self, packet, parse):
+        """Send packet (again, up to retries times) until parse(a reply) returns rather than raising ValueError, and
+        return what it returned. Raises SnmpError when no reply does."""
         with socket.socket(self.family, socket.SOCK_DGRAM) as sock:
             sock.settimeout(self.timeout / 1000)
             for _ in range(self.retries + 1):
@@ -368,18 +398,18 @@ class SnmpClient:
                     except ConnectionResetError:
                         raise SnmpError(f"{self.host} isn't running SNMP (UDP port {self.port} is closed).") from None
                     try:
-                        return parse_response(data, request_id)
+                        return parse(data)
                     except ValueError:
                         continue
-        raise SnmpError(f"No answer from {self.host}. Check that SNMP is turned on, the community string is "
-                        "right, and the device allows SNMP from this computer.")
+        what = "the SNMPv3 user and its passwords are" if self.v3 else "the community string is"
+        raise SnmpError(f"No answer from {self.host}. Check that SNMP is turned on, {what} right, and the device "
+                        "allows SNMP from this computer.")
 
     def get(self, oids):
         """Values for exact OIDs. Returns [(oid, Value)]."""
         status, index, results = self.request(GET, oids)
         if status:
-            raise SnmpError(f"The device refused the request: {ERRORS.get(status, status)}"
-                            + (f" (item {index})" if index else "") + ".")
+            raise SnmpError(self.refused(status) + (f" (item {index})" if index else "") + ".")
         return results
 
     def walk(self, root, max_repetitions=25, should_stop=lambda: False, limit=MAX_ROWS):
@@ -399,7 +429,7 @@ class SnmpClient:
             if status == NO_SUCH_NAME and self.version == V1:
                 return  # v1's way of saying "end of the MIB"
             if status:
-                raise SnmpError(f"The device refused the request: {ERRORS.get(status, status)}.")
+                raise SnmpError(self.refused(status) + ".")
             if not results:
                 return
             for oid, value in results:

@@ -124,8 +124,8 @@ class TribeSync(QObject):
         self.pusher = threading.Thread(target=push, name="Tribe map changes", daemon=True)
         self.pusher.start()
 
-    def save(self, map_id, network_map, settings):
-        changed = self.maps.save(map_id, network_map, settings)
+    def save(self, map_id, network_map, settings, seen=None):
+        changed = self.maps.save(map_id, network_map, settings, seen)
         if changed:
             self.request_sync()
         return changed

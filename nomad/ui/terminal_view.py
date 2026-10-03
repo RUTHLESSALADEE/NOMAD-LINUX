@@ -506,6 +506,7 @@ class SessionView(PromptAnswers, QWidget):
         self.status_text = ""
         self.outbox = []  # Lines still to send, line_delay apart (a paste or a command button)
         self.outbox_total = 0
+        self.outbox_delay = 0  # At least this many ms between lines (a block that asked for it), besides line_delay
         self.outbox_timer = QTimer(self)
         self.outbox_timer.setSingleShot(True)
         self.outbox_timer.timeout.connect(self.send_next_line)
@@ -813,10 +814,11 @@ class SessionView(PromptAnswers, QWidget):
         """Send a command and this session's Enter (Send to All)."""
         return self.send_block(command)
 
-    def send_block(self, text, final_enter=True):
+    def send_block(self, text, final_enter=True, min_delay=0):
         """Send lines of text (a paste, a command button, Send to All), each with this session's Enter; the
-        last one too if final_enter (or the text ends with a line break). With a line delay set, one line at a
-        time, so slow consoles don't drop characters. Returns whether it's being sent."""
+        last one too if final_enter (or the text ends with a line break). With a line delay set (the session's, or
+        min_delay ms for a block that needs one, such as switch configuration), one line at a time, so slow
+        consoles don't drop characters. Returns whether it's being sent."""
         if self.state != CONNECTED or self.transport is None:
             return False
         normalized = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -828,10 +830,11 @@ class SessionView(PromptAnswers, QWidget):
         if lines:
             chunks.append(lines[-1] + (self.view.enter if final_enter else ""))
         chunks = [chunk for chunk in chunks if chunk]
-        if self.session.line_delay <= 0 or len(chunks) + len(self.outbox) <= 1:
+        if max(self.session.line_delay, min_delay) <= 0 or len(chunks) + len(self.outbox) <= 1:
             return self.send_text("".join(chunks)) or not chunks
         self.outbox += chunks
         self.outbox_total += len(chunks)
+        self.outbox_delay = max(self.outbox_delay, min_delay)
         if not self.outbox_timer.isActive():
             self.send_next_line()
         return True
@@ -842,7 +845,7 @@ class SessionView(PromptAnswers, QWidget):
             return
         self.send_text(self.outbox.pop(0))
         if self.outbox:
-            self.outbox_timer.start(self.session.line_delay)
+            self.outbox_timer.start(max(self.session.line_delay, self.outbox_delay))
             self.update_status()
         else:
             self.stop_sending()
@@ -852,6 +855,7 @@ class SessionView(PromptAnswers, QWidget):
         self.outbox_timer.stop()
         self.outbox = []
         self.outbox_total = 0
+        self.outbox_delay = 0
         self.update_status()
 
     def restart_idle_timer(self):

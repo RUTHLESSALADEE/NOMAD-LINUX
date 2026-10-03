@@ -1,4 +1,4 @@
-"""SNMP page: read a device's details, walk any part of its MIB, or summarize its interfaces and error counters."""
+"""SNMP Walk page: read a device's details, walk any part of its MIB, or summarize its interfaces and error counters."""
 import csv
 import logging
 import time
@@ -10,6 +10,7 @@ from PyQt5.QtWidgets import QAbstractItemView, QApplication, QComboBox, QFileDia
 
 from ..snmp import SYSTEM, VERSIONS, WALK_PRESETS, SnmpClient, SnmpError, community_is_valid, format_value, \
     interface_summary, oid_name, oid_text, parse_oid
+from ..snmpv3 import AUTH_NAMES, PRIV_NAMES, V3User, is_v3
 from .common import SortableTableItem, StoppableThread, set_hint, set_invalid
 from .theme import COLORS, accent_button
 
@@ -20,6 +21,7 @@ INTERFACE_COLUMNS = ["Index", "Name", "Description / Alias", "Type", "Admin", "S
                      "In Errors", "Out Errors", "In Discards", "Out Discards"]
 BATCH_SECONDS = 0.2
 CUSTOM_OID = "Custom OID"
+V3 = "v3"  # The version combo's SNMPv3 choice
 
 
 class SnmpThread(StoppableThread):
@@ -93,9 +95,9 @@ class SnmpTab(QWidget):
         self.community_input.setToolTip("The SNMP community string (a read-only one is enough). Devices often ship "
                                         "with \"public\".")
         self.version_combo = QComboBox()
-        self.version_combo.addItems(list(VERSIONS))
-        self.version_combo.setToolTip("v2c reads faster and supports 64-bit counters; use v1 for old devices. "
-                                      "SNMPv3 (with usernames and encryption) isn't supported yet.")
+        self.version_combo.addItems(list(VERSIONS) + [V3])
+        self.version_combo.setToolTip("v2c reads faster and supports 64-bit counters; use v1 for old devices, and v3 "
+                                      "for a user name with authentication and encryption.")
         self.timeout_input = QSpinBox()
         self.timeout_input.setRange(200, 20000)
         self.timeout_input.setSingleStep(500)
@@ -106,6 +108,32 @@ class SnmpTab(QWidget):
         access_row.addWidget(self.version_combo)
         access_row.addWidget(QLabel("Timeout (ms):"))
         access_row.addWidget(self.timeout_input)
+
+        self.v3_row = QWidget()
+        v3_layout = QHBoxLayout(self.v3_row)
+        v3_layout.setContentsMargins(0, 0, 0, 0)
+        self.user_input = QLineEdit()
+        self.user_input.setPlaceholderText("User")
+        self.auth_combo, self.priv_combo = QComboBox(), QComboBox()
+        for key, label in AUTH_NAMES.items():
+            self.auth_combo.addItem(label, key)
+        for key, label in PRIV_NAMES.items():
+            self.priv_combo.addItem(label, key)
+        self.auth_combo.setCurrentIndex(self.auth_combo.findData("sha"))
+        self.priv_combo.setCurrentIndex(self.priv_combo.findData("aes128"))
+        self.auth_password_input, self.priv_password_input = QLineEdit(), QLineEdit()
+        for widget, text in ((self.auth_password_input, "Authentication password"),
+                             (self.priv_password_input, "Privacy password")):
+            widget.setEchoMode(QLineEdit.Password)
+            widget.setPlaceholderText(text)
+        self.context_input = QLineEdit()
+        self.context_input.setPlaceholderText("Context (optional)")
+        self.context_input.setToolTip("The SNMPv3 context to read. Catalyst switches keep each VLAN's MAC address "
+                                      "table in context vlan-<number>.")
+        for widget in (self.user_input, self.auth_combo, self.auth_password_input, self.priv_combo,
+                       self.priv_password_input, self.context_input):
+            v3_layout.addWidget(widget, 1 if isinstance(widget, QLineEdit) else 0)
+        self.v3_label = QLabel("SNMPv3:")
 
         what_row = QHBoxLayout()
         self.preset_combo = QComboBox()
@@ -119,7 +147,9 @@ class SnmpTab(QWidget):
 
         form = QFormLayout()
         form.addRow("Device:", host_row)
-        form.addRow("Community:", access_row)
+        self.access_label = QLabel("Community:")
+        form.addRow(self.access_label, access_row)
+        form.addRow(self.v3_label, self.v3_row)
         form.addRow("Read:", what_row)
         layout.addLayout(form)
 
@@ -153,6 +183,10 @@ class SnmpTab(QWidget):
         layout.addWidget(self.table, 1)
 
         self.gateway_button.clicked.connect(self.use_gateway)
+        self.version_combo.currentIndexChanged.connect(lambda _: self.update_access())
+        self.auth_combo.currentIndexChanged.connect(lambda _: self.update_access())
+        self.priv_combo.currentIndexChanged.connect(lambda _: self.update_access())
+        self.update_access()
         self.preset_combo.activated.connect(self.on_preset_chosen)
         self.oid_input.textEdited.connect(self.on_oid_edited)
         self.oid_input.textChanged.connect(lambda: set_invalid(self.oid_input, False))
@@ -171,6 +205,10 @@ class SnmpTab(QWidget):
         settings.setValue("snmp/host", self.host_input.text())
         settings.setValue("snmp/community", self.community_input.text())
         settings.setValue("snmp/version", self.version_combo.currentText())
+        settings.setValue("snmp/v3_user", self.user_input.text())  # Not its passwords
+        settings.setValue("snmp/v3_auth", self.auth_combo.currentData())
+        settings.setValue("snmp/v3_priv", self.priv_combo.currentData())
+        settings.setValue("snmp/v3_context", self.context_input.text())
         settings.setValue("snmp/timeout", self.timeout_input.value())
         settings.setValue("snmp/oid", self.oid_input.text())
 
@@ -178,6 +216,11 @@ class SnmpTab(QWidget):
         self.host_input.setText(settings.value("snmp/host", "", str))
         self.community_input.setText(settings.value("snmp/community", "public", str))
         self.version_combo.setCurrentText(settings.value("snmp/version", "v2c", str))
+        self.user_input.setText(settings.value("snmp/v3_user", "", str))
+        self.auth_combo.setCurrentIndex(max(0, self.auth_combo.findData(settings.value("snmp/v3_auth", "sha", str))))
+        self.priv_combo.setCurrentIndex(max(0, self.priv_combo.findData(settings.value("snmp/v3_priv", "aes128",
+                                                                                       str))))
+        self.context_input.setText(settings.value("snmp/v3_context", "", str))
         self.timeout_input.setValue(settings.value("snmp/timeout", 2000, int))
         self.oid_input.setText(settings.value("snmp/oid", SYSTEM, str))
         self.on_oid_edited()
@@ -189,19 +232,51 @@ class SnmpTab(QWidget):
 
     def query_host(self, host, community=None, version=None):
         """Read a device's system details now (from the Sweep or Network Map page), with community and version
-        (V1 or V2C) when the page knows what the device answers to."""
+        (V1 or V2C), or a V3User, when the page knows what the device answers to."""
         self.host_input.setText(host)
-        if community:
+        if is_v3(community):
+            self.set_v3_user(community)
+        elif community:
             self.community_input.setText(community)
-        names = {number: name for name, number in VERSIONS.items()}
-        if version in names:
-            self.version_combo.setCurrentText(names[version])
+            names = {number: name for name, number in VERSIONS.items()}
+            if version in names:
+                self.version_combo.setCurrentText(names[version])
         self.oid_input.setText(SYSTEM)
         self.on_oid_edited()
         if self.worker is None:
             self.start("walk")
 
     # ----------------------------------------------------------------- Inputs
+
+    def is_v3(self):
+        return self.version_combo.currentText() == V3
+
+    def update_access(self):
+        """Community string for v1 and v2c; user, protocols and passwords for v3."""
+        v3 = self.is_v3()
+        self.community_input.setVisible(not v3)
+        self.access_label.setText("Access:" if v3 else "Community:")
+        self.v3_label.setVisible(v3)
+        self.v3_row.setVisible(v3)
+        auth = self.auth_combo.currentData() != "none"
+        self.auth_password_input.setEnabled(auth)
+        self.priv_combo.setEnabled(auth)
+        self.priv_password_input.setEnabled(auth and self.priv_combo.currentData() != "none")
+
+    def set_v3_user(self, user):
+        self.version_combo.setCurrentText(V3)
+        self.user_input.setText(user.user)
+        self.auth_combo.setCurrentIndex(max(0, self.auth_combo.findData(user.auth)))
+        self.priv_combo.setCurrentIndex(max(0, self.priv_combo.findData(user.priv)))
+        self.auth_password_input.setText(user.auth_password)
+        self.priv_password_input.setText(user.priv_password)
+
+    def v3_user(self):
+        auth = self.auth_combo.currentData()
+        priv = self.priv_combo.currentData() if auth != "none" else "none"
+        return V3User(self.user_input.text().strip(), auth,
+                      self.auth_password_input.text() if auth != "none" else "", priv,
+                      self.priv_password_input.text() if priv != "none" else "")
 
     def gateway(self):
         adapter = self.window.current_adapter()
@@ -236,7 +311,12 @@ class SnmpTab(QWidget):
             set_hint(self.status_label, "Enter the device to read.", "error")
             return
         set_invalid(self.host_input, False)
-        if not community_is_valid(community):
+        if self.is_v3():
+            community = self.v3_user()
+            if community.problem():
+                set_hint(self.status_label, community.problem(), "error")
+                return
+        elif not community_is_valid(community):
             set_hint(self.status_label, "Enter the community string (such as public).", "error")
             return
         oid = None
@@ -248,8 +328,9 @@ class SnmpTab(QWidget):
                 set_hint(self.status_label, str(error), "error")
                 return
         try:
-            client = SnmpClient(host, community, VERSIONS[self.version_combo.currentText()],
-                                self.timeout_input.value())
+            client = SnmpClient(host, community, VERSIONS.get(self.version_combo.currentText(), 1),
+                                self.timeout_input.value(), context=self.context_input.text().strip() if
+                                self.is_v3() else "")
         except OSError:
             set_hint(self.status_label, f"Couldn't find {host}.", "error")
             return

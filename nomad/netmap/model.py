@@ -191,7 +191,8 @@ class Group:
     name: str
     kind: str = SITE
     parent: str = ""  # A building's site or a room's building ("" if it isn't in one)
-    collapsed: bool = False  # Drawn as one box, with its links to the rest of the map
+    # Drawn as one box, with its links to the rest of the map. On a tribe map, each person's own (not shared)
+    collapsed: bool = False
 
 
 @dataclass
@@ -261,7 +262,8 @@ class NetworkMap:
             traces.update({item.target: item for item in newer.traces})
             self.traces = list(traces.values())
             self.finished, self.stopped = newer.finished, newer.stopped
-        return added, read
+        self.fold_unread_devices(read, new=set(added))
+        return [key for key in added if key in self.devices], read
 
     def preview_with(self, newer, positions=None):
         """This map with a crawl's devices and links so far added (for drawing Crawl from Here as it goes), leaving
@@ -365,32 +367,56 @@ class NetworkMap:
             found = self.found_for(manual) if manual.manual else None
             if found is None:
                 continue
-            for attribute in ("name", "mgmt_ip", "platform", "note"):
-                if not getattr(found, attribute):
-                    setattr(found, attribute, getattr(manual, attribute))
-            if found.kind == UNKNOWN:
-                found.kind = manual.kind
-            crawled_pairs = {frozenset((link.a, link.b)) for link in self.links if not link.manual}
-            links, self.links = self.links, []
-            for link in links:
-                if key in (link.a, link.b):
-                    link.a, link.b = (found.key if link.a == key else link.a), (found.key if link.b == key else link.b)
-                    if link.a == link.b or frozenset((link.a, link.b)) in crawled_pairs:
-                        continue
-                self.add_link(link)
-            for host in self.hosts:
-                if host.device == key:
-                    host.device = found.key
-            for positions in (self.positions, self.l3_positions):
-                if key in positions and (found.key in new or found.key not in positions):
-                    positions[found.key] = positions[key]
-            if key in self.group_of:
-                self.group_of.setdefault(found.key, self.group_of[key])
-            if self.root == key:
-                self.root = found.key
-            self.remove_devices([key])
+            self.fold_device(key, found, new)
             folded.append((manual, found))
         return folded
+
+    def fold_unread_devices(self, read, new=()):
+        """Devices that didn't answer SNMP that a crawl has now read under another key become the read ones (as
+        fold_manual_devices does): a seed that didn't answer is keyed by its address, and the same device seen as
+        a neighbor by its name, and only reading it shows they're one. read: keys of the devices the crawl read.
+        Returns [(Device folded in, read Device)]."""
+        folded = []
+        readers = [self.devices[key] for key in read if key in self.devices]
+        for key, device in list(self.devices.items()):
+            if device.manual or device.source == SNMP or key in read or not device.mgmt_ip:
+                continue
+            found = next((other for other in readers if other.key != key and other.owns(device.mgmt_ip)), None)
+            if found is not None:
+                self.fold_device(key, found, new)
+                folded.append((device, found))
+        return folded
+
+    def fold_device(self, key, found, new=()):
+        """Fold device key into found, the same device: its links, hosts, place and group move over, and what found
+        doesn't know (a name, an address, a model, a note) is filled in. A link drawn by hand is dropped when there's
+        a crawled one between the same two devices. A found device in new (just added to the map) takes key's
+        place rather than where the crawl drew it."""
+        old = self.devices[key]
+        for attribute in ("name", "mgmt_ip", "platform", "note"):
+            if not getattr(found, attribute):
+                setattr(found, attribute, getattr(old, attribute))
+        if found.kind == UNKNOWN:
+            found.kind = old.kind
+        crawled_pairs = {frozenset((link.a, link.b)) for link in self.links if not link.manual}
+        links, self.links = self.links, []
+        for link in links:
+            if key in (link.a, link.b):
+                link.a, link.b = (found.key if link.a == key else link.a), (found.key if link.b == key else link.b)
+                if link.a == link.b or (link.manual and frozenset((link.a, link.b)) in crawled_pairs):
+                    continue
+            self.add_link(link)
+        for host in self.hosts:
+            if host.device == key:
+                host.device = found.key
+        for positions in (self.positions, self.l3_positions):
+            if key in positions and (found.key in new or found.key not in positions):
+                positions[found.key] = positions[key]
+        if key in self.group_of:
+            self.group_of.setdefault(found.key, self.group_of[key])
+        if self.root == key:
+            self.root = found.key
+        self.remove_devices([key])
 
     def carry_manual_hosts(self, older):
         """Bring the hosts added by hand to an earlier map of the network over to this one. One that has since

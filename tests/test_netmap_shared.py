@@ -25,6 +25,16 @@ def test_flatten_and_build_round_trip():
     assert shared.flatten(rebuilt, settings={"scope": ["10.0.0.0/8"]}) == items
 
 
+
+def test_collapsing_a_group_isnt_shared():
+    network_map = crawled()
+    items = shared.flatten(network_map)
+    network_map.groups[0].collapsed = True
+    assert shared.flatten(network_map) == items  # Nothing to send
+    assert "collapsed" not in items[("group", network_map.groups[0].key)]
+    items[("group", network_map.groups[0].key)]["collapsed"] = True  # As an older NOMAD shares it
+    assert not shared.build(items).groups[0].collapsed
+
 def test_diff_lists_changed_and_gone_items():
     network_map = crawled()
     base = shared.flatten(network_map)

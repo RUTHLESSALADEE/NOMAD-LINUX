@@ -6,6 +6,31 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-10-03
+
+### Added
+
+- SNMP Config page (in the new SNMP section): builds the Cisco IOS / IOS-XE configuration that sets a Catalyst switch up for NOMAD (a read-only community string and/or SNMPv3 user behind an access list, traps and syslog to the computers watching, CDP and LLDP, link-status logging and MAC notifications on the access ports, write memory), with the commands to take it out again. Copy it, save it, or **Send to Session**: NOMAD types it into a connected terminal session, or one it opens to the switch, a line at a time, after checking it's at the enable (#) prompt. It can fill in the Network Map's credentials, and add its own to the map. The Network Map's Watch tab opens it set up for this computer, in place of the lines it used to list.
+- SNMPv3: the Network Map's crawls, checks and watching, the Map Watcher service and the SNMP Walk page can use SNMPv3 users (MD5, SHA-1 or SHA-2 authentication; DES or AES-128/192/256 privacy, with Cisco's key extension for AES-192/256). The map's **Communities...** is now **Credentials...**, with a list of v3 users (tried first, unless that's unticked) and per-subnet `v3:user` entries; Catalyst per-VLAN MAC tables are read in the `vlan-` contexts. A tribe map's users are shared with it, encrypted like its community strings (everyone needs this version to use them). The trap listeners take v3 traps from the map's users, and a device that refuses a user says why (unknown user, wrong password) in the crawl log.
+- Terminal sending can be paced for one block even when the session has no line delay (used by the SNMP Config page).
+- Watching asks devices on the map that don't answer SNMP again (hourly, and at once when the map's credentials change), and reads any that answer now, so a device set up for SNMP (or SNMPv3) after it was mapped turns solid without mapping again. The Map Watcher service does it too.
+- All the watch timers can be set, to any value, on the Watch tab and for the Map Watcher service: new neighbors, new hosts, the SNMP re-check, and how long after a trap or syslog message a switch is read (it was always 45 seconds).
+- Network Map: **Check SNMP Again** on any device that doesn't answer SNMP, not only ones added by hand. One the crawl found is read (Crawl from Here) when it answers, and one that doesn't says why when it can.
+
+### Fixed
+
+- Network Map: a starting address that didn't answer SNMP stayed on the map as a second device once the device was read (seen by a neighbor under its name): it's now folded into the device it is.
+- Network Map: a device's management address is now the one it answered SNMP at, not one a neighbor's CDP or LLDP advertised (which may not answer, such as an address outside the crawl's scope). Watching used that address, so it could keep asking a switch where it didn't answer.
+- Watching follows a switch whose management address stops answering (the management network was renumbered, or the map was made before this fix): it tries the switch's other addresses inside the crawl's scope, and the one that answers becomes its management address, noted in the watch log and saved with the map (and shared, on a tribe map). Addresses corrected by hand are left alone.
+- Network Map: a Cisco switch with VLANs but no per-VLAN MAC tables (community@vlan doesn't answer, as on some IOS images) had no hosts: its one MAC table is now read instead, and the crawl log says so.
+- Network Map: devices with the same name (switches left with the default name "Switch", or sw1.site-a and sw1.site-b, which both shorten to sw1) were drawn as one device, and the second wasn't read, so the crawl went no further past it. A device is now taken to be one already read only when their IP addresses overlap. Devices that share a name are told apart by address (or, with none, by the port they were seen on), so one already on a map may show as new once when another with its name turns up.
+
+### Changed
+
+- The sidebar has an SNMP section for the SNMP pages: Network Map and SNMP Walk (moved from Discover; SNMP Walk was called SNMP) and the new SNMP Config.
+- Tools > IPAM Server is now Tools > Tribe Management, since the tribe shares network maps as well as IPAM. Besides setting up the tribe server, it shows whether this computer is in a tribe, connects to one with a key file, and disconnects from it (warning about IPAM and map changes not sent yet, whichever page they're on). It's now the only place to leave the tribe: Disconnect is gone from the IP Addresses page's Tribe menu, and Leave the Tribe from the Network Map's.
+- Network Map: Tribe > Join the Tribe with a Key File is now Connect to the Tribe with a Key File, to match the IP Addresses page.
+
 ## [1.13.1] - 2026-10-02
 
 ### Added

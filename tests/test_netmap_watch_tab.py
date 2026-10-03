@@ -9,10 +9,11 @@ import pytest  # noqa: E402
 from netmap_fakes import build_network  # noqa: E402
 from PyQt5.QtWidgets import QApplication, QInputDialog, QMessageBox  # noqa: E402
 from test_netmap_tab import Window  # noqa: E402
-from test_netmap_watch import NEW_PC, plug_in_switch  # noqa: E402
+from test_netmap_watch import NEW_PC, plug_in_switch, renumber_acc1, renumbered_network, rtr1_answers  # noqa: E402
 
 from nomad.netmap import export, store, watch  # noqa: E402
 from nomad.netmap.crawl import CrawlSettings, Crawler  # noqa: E402
+from nomad.snmpv3 import V3User  # noqa: E402
 from nomad.ui import netmap_tab  # noqa: E402
 from nomad.ui.netmap_tribe import TribeSync  # noqa: E402
 
@@ -56,7 +57,8 @@ def crawl(network):
 
 def idle(page):
     watcher = page.watcher
-    return watcher.signature_thread is None and watcher.refresh_thread is None and not watcher.to_refresh
+    return watcher.signature_thread is None and watcher.refresh_thread is None and \
+        watcher.recheck_thread is None and not watcher.to_refresh
 
 
 def test_watching_adds_a_new_switch_tagged_new(app, tmp_path, monkeypatch):
@@ -84,6 +86,23 @@ def test_watching_adds_a_new_switch_tagged_new(app, tmp_path, monkeypatch):
         assert "device:acc3" in saved.news  # Saved with the map
         page.mark_seen(page.news_of_devices(["acc3"]))
         assert page.network_map.news == {} and page.view.items_by_key["acc3"].news_text == ""
+    finally:
+        page.shutdown()
+
+
+def test_watching_follows_a_switch_to_its_new_address(app, tmp_path, monkeypatch):
+    network = renumbered_network()
+    page = make_tab(network, tmp_path, monkeypatch)
+    try:
+        page.on_crawled(crawl(network))
+        page.watch_check.setChecked(True)
+        assert wait_for(app, lambda: idle(page) and page.watcher.last_neighbors)
+        renumber_acc1(network)
+        page.watcher.poll_neighbors()
+        assert wait_for(app, lambda: page.network_map.devices["acc1"].mgmt_ip == "10.18.0.11" and idle(page))
+        assert any("doesn't answer at 10.0.0.11 any more but does at 10.18.0.11" in line
+                   for line in page.watcher.lines)
+        assert store.load(page.map_path).devices["acc1"].mgmt_ip == "10.18.0.11"  # Saved
     finally:
         page.shutdown()
 
@@ -138,6 +157,7 @@ def test_tribe_map_shared_between_two_pages(app, server, tmp_path, monkeypatch):
     (tmp_path / "b").mkdir()
     try:
         alice.communities = ["public", "s3cret"]
+        alice.v3_users = [V3User("nomad", "sha", "authpass1", "aes128", "privpass1")]
         alice.on_crawled(crawl(network))
         monkeypatch.setattr(QInputDialog, "getText", lambda *args, **kwargs: ("HQ", True))
         alice.share_with_tribe()
@@ -149,6 +169,7 @@ def test_tribe_map_shared_between_two_pages(app, server, tmp_path, monkeypatch):
         bob.open_tribe_map(maps.maps()[0]["id"])
         assert set(bob.network_map.devices) == set(alice.network_map.devices)
         assert bob.communities == ["public", "s3cret"]  # The map's community strings came with it
+        assert bob.v3_users == alice.v3_users  # And its SNMPv3 users
 
         # Bob moves a device; Alice sees it
         bob.view.items_by_key["core"].setPos(1234, 567)
@@ -172,6 +193,68 @@ def test_tribe_map_shared_between_two_pages(app, server, tmp_path, monkeypatch):
         alice.shutdown()
         bob.shutdown()
 
+
+
+def test_tribe_map_groups_collapsed_on_each_page_alone(app, server, tmp_path, monkeypatch):
+    network = build_network()
+    alice = make_tab(network, tmp_path / "a", monkeypatch, tribe_for(server, tmp_path, "alice"))
+    bob = make_tab(network, tmp_path / "b", monkeypatch, tribe_for(server, tmp_path, "bob"))
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    try:
+        crawled = crawl(network)
+        site = crawled.new_group("HQ")
+        crawled.set_group(["core", "acc1"], site.key)
+        alice.on_crawled(crawled)
+        monkeypatch.setattr(QInputDialog, "getText", lambda *args, **kwargs: ("HQ", True))
+        alice.share_with_tribe()
+        maps = bob.tribe.ensure()
+        assert wait_for(app, lambda: [item["name"] for item in maps.maps()] == ["HQ"])
+        bob.open_tribe_map(maps.maps()[0]["id"])
+
+        # Alice collapses the site: nothing to send, so Bob's stays open
+        alice.view.set_collapsed(alice.view.group_items[site.key], True)
+        assert alice.tribe.maps.pending_count() == 0 and not alice.save_timer.isActive()
+
+        # Bob moves a device: Alice sees it, with her site still collapsed
+        bob.view.items_by_key["core"].setPos(1234, 567)
+        bob.save_positions()
+        assert wait_for(app, lambda: tuple(alice.network_map.positions.get("core", ())) == (1234.0, 567.0), 15)
+        assert alice.view.group_items[site.key].group.collapsed
+        assert not bob.view.group_items[site.key].group.collapsed
+    finally:
+        alice.shutdown()
+        bob.shutdown()
+
+
+
+def test_tribe_map_save_waiting_doesnt_undo_anothers_move(app, server, tmp_path, monkeypatch):
+    network = build_network()
+    alice = make_tab(network, tmp_path / "a", monkeypatch, tribe_for(server, tmp_path, "alice"))
+    bob = make_tab(network, tmp_path / "b", monkeypatch, tribe_for(server, tmp_path, "bob"))
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    try:
+        alice.on_crawled(crawl(network))
+        monkeypatch.setattr(QInputDialog, "getText", lambda *args, **kwargs: ("HQ", True))
+        alice.share_with_tribe()
+        maps = bob.tribe.ensure()
+        assert wait_for(app, lambda: [item["name"] for item in maps.maps()] == ["HQ"])
+        bob.open_tribe_map(maps.maps()[0]["id"])
+
+        # Alice drags a device; before her save is due, Bob's move of another arrives
+        alice.view.items_by_key["acc1"].setPos(-300, 800)
+        alice.save_timer.setInterval(60000)
+        alice.save_timer.start()
+        bob.view.items_by_key["core"].setPos(1234, 567)
+        bob.save_positions()
+        assert wait_for(app, lambda: tuple(alice.network_map.positions.get("core", ())) == (1234.0, 567.0), 15)
+        assert alice.network_map.positions["acc1"] == (-300.0, 800.0)  # Hers saved on the way, not lost
+        assert wait_for(app, lambda: tuple(bob.network_map.positions.get("acc1", ())) == (-300.0, 800.0), 15)
+        assert bob.network_map.positions["core"] == (1234.0, 567.0)  # And his not undone
+    finally:
+        alice.shutdown()
+        bob.shutdown()
 
 def test_watching_stands_by_while_another_computer_watches(app, server, tmp_path, monkeypatch):
     network = build_network()
@@ -214,7 +297,7 @@ def test_tribe_server_uses_its_own_key_for_maps(app, server, tmp_path, monkeypat
         assert page.tribe_key() is key
         page.fill_tribe_menu()
         texts = [action.text() for action in page.tribe_menu.actions()]
-        assert "This computer is the tribe server" in texts and "Leave the Tribe..." not in texts
+        assert "This computer is the tribe server" in texts and "Connect to the Tribe with Another Key File..." not in texts
         page.on_crawled(crawl(build_network()))
         monkeypatch.setattr(QInputDialog, "getText", lambda *args, **kwargs: ("Server's map", True))
         page.share_with_tribe()
@@ -226,7 +309,7 @@ def test_tribe_server_uses_its_own_key_for_maps(app, server, tmp_path, monkeypat
         page.fill_tribe_menu()
         texts = [action.text() for action in page.tribe_menu.actions()]
         assert texts[0].startswith("This is the tribe server: restart NOMAD as administrator")
-        assert "Join the Tribe with a Key File..." in texts
+        assert "Connect to the Tribe with a Key File..." in texts
     finally:
         page.shutdown()
 
@@ -248,11 +331,58 @@ def test_joining_the_tribe_from_the_map_page(app, server, tmp_path, monkeypatch)
     page.window.tribe_key_changed = notified.append
     try:
         page.fill_tribe_menu()
-        assert [action.text() for action in page.tribe_menu.actions()] == ["Join the Tribe with a Key File..."]
+        assert [action.text() for action in page.tribe_menu.actions()] == ["Connect to the Tribe with a Key File..."]
         page.join_tribe()
-        assert saved and notified == [page] and "Joined the tribe" in page.status_label.text()
+        assert saved and notified == [page] and "Connected to the tribe" in page.status_label.text()
         assert page.tribe.maps is not None
         page.fill_tribe_menu()
-        assert "Leave the Tribe..." in [action.text() for action in page.tribe_menu.actions()]
+        texts = [action.text() for action in page.tribe_menu.actions()]
+        assert "Connect to the Tribe with Another Key File..." in texts
+        assert not any("Leave" in text or "Disconnect" in text for text in texts)  # Only in Tools > Tribe Management
+    finally:
+        page.shutdown()
+
+
+def test_new_credentials_have_devices_that_dont_answer_asked_again(app, tmp_path, monkeypatch):
+    from nomad.snmpv3 import V3User
+    user = V3User("nomad", "sha", "authpass1", "aes128", "privpass1")
+    network = build_network()
+    page = make_tab(network, tmp_path, monkeypatch)
+    try:
+        page.on_crawled(crawl(network))
+        page.watch_check.setChecked(True)
+        assert wait_for(app, lambda: idle(page) and page.watcher.last_neighbors)
+        assert any("Asked the device that doesn't answer SNMP again: none do yet" in line
+                   for line in page.watcher.lines)
+        rtr1_answers(network, communities=(), v3_users=(user,))  # Set up with an SNMPv3 user
+        assert page.add_credential(user)  # The map gets the user: rtr1 is asked at once
+        assert wait_for(app, lambda: page.network_map.devices["rtr1"].source == "snmp" and idle(page))
+        assert any("rtr1.corp.example answers SNMP now (v3 user nomad (SHA-1, AES-128)): reading it" in line
+                   for line in page.watcher.lines)
+        assert store.load(page.map_path).devices["rtr1"].source == "snmp"
+    finally:
+        page.shutdown()
+
+
+def test_the_watch_timers_can_be_set(app, tmp_path, monkeypatch):
+    from PyQt5.QtCore import QSettings
+    network = build_network()
+    page = make_tab(network, tmp_path, monkeypatch)
+    try:
+        page.on_crawled(crawl(network))
+        page.watcher.timers.set_values({"neighbor_interval": 120, "host_interval": 1800, "recheck_interval": 900,
+                                        "trigger_delay": 10})
+        page.watch_check.setChecked(True)
+        assert wait_for(app, lambda: idle(page) and page.watcher.last_neighbors)
+        watcher = page.watcher
+        assert (watcher.neighbor_timer.interval(), watcher.host_timer.interval(), watcher.recheck_timer.interval(),
+                watcher.queue.delay) == (120000, 1800000, 900000, 10)
+        assert "asked again every 15 min" in watcher.summary_label.text()
+        settings = QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat)
+        page.save_settings(settings)
+        other = make_tab(network, tmp_path, monkeypatch)
+        other.restore_settings(settings)
+        assert other.watcher.timers.values() == watcher.timers.values()
+        other.shutdown()
     finally:
         page.shutdown()

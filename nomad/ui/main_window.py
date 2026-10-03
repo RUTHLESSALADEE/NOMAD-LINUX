@@ -36,6 +36,7 @@ from .routing_tab import RoutingTab
 from .scp_tab import ScpTab
 from .highlight_dialog import HighlightDialog
 from .session_tabs import LAYOUTS
+from .snmp_config_tab import SnmpConfigTab
 from .snmp_tab import SnmpTab
 from .subnet_tab import SubnetTab
 from .sweep_tab import SweepTab
@@ -154,6 +155,7 @@ class MainWindow(QMainWindow):
         self.syslog_tab = SyslogTab(self)
         self.tftp_tab = TftpTab(self)
         self.subnet_tab = SubnetTab(self)
+        self.snmp_config_tab = SnmpConfigTab(self)
         self.wake_tab = WakeTab(self)
         self.session_store = SessionStore()  # Shared by the Terminal and SCP pages
         self.terminal_tab = TerminalTab(self, self.session_store)
@@ -167,8 +169,10 @@ class MainWindow(QMainWindow):
             ("Manage", [(self.ipam_tab, "IP Addresses")]),
             ("Test", [(self.ping_tab, "Ping"), (self.latency_tab, "Latency"), (self.traceroute_tab, "Traceroute"),
                       (self.mtu_tab, "MTU"), (self.ports_tab, "Ports"), (self.iperf_tab, "iperf")]),
-            ("Discover", [(self.sweep_tab, "Sweep"), (self.netmap_tab, "Network Map"),
-                          (self.switch_tab, "Switch Port"), (self.dhcp_tab, "DHCP Servers"), (self.snmp_tab, "SNMP")]),
+            ("Discover", [(self.sweep_tab, "Sweep"), (self.switch_tab, "Switch Port"),
+                          (self.dhcp_tab, "DHCP Servers")]),
+            ("SNMP", [(self.netmap_tab, "Network Map"), (self.snmp_tab, "SNMP Walk"),
+                      (self.snmp_config_tab, "SNMP Config")]),
             ("DNS & Web", [(self.lookup_tab, "DNS Lookup"), (self.dns_servers_tab, "DNS Servers"),
                            (self.web_check_tab, "Web Check")]),
             ("Tools", [(self.capture_tab, "Packet Capture"), (self.syslog_tab, "Syslog"), (self.tftp_tab, "TFTP"),
@@ -291,7 +295,7 @@ class MainWindow(QMainWindow):
         tools_menu.addSeparator()
         tools_menu.addAction("&Flush DNS Cache", self.flush_dns)
         tools_menu.addAction("Saved Password &Protection...", lambda: self.terminal_tab.manager.show_protection())
-        tools_menu.addAction("&IPAM Server...", self.show_ipam_server)
+        tools_menu.addAction("&Tribe Management...", self.show_tribe_management)
         tools_menu.addAction("&Map Watcher Service...", self.show_map_watcher)
         tools_menu.addSeparator()
         tools_menu.addAction("Add &PuTTY to PATH", self.sweep_tab.add_putty_to_path)
@@ -307,6 +311,12 @@ class MainWindow(QMainWindow):
         """Switch to the Terminal page, then do something there (so what it adds is on screen)."""
         self.navigator.setCurrentWidget(self.terminal_tab)
         then()
+
+    def show_snmp_config(self, destination="", credential=None):
+        """The SNMP Config page, sending traps and syslog to destination, with credential (from the map's Watch
+        tab)."""
+        self.navigator.setCurrentWidget(self.snmp_config_tab)
+        self.snmp_config_tab.prefill(destination, credential)
 
     # ----------------------------------------------------------------- Settings
 
@@ -502,9 +512,9 @@ class MainWindow(QMainWindow):
             self.restart_as_admin()
         return False
 
-    def show_ipam_server(self):
-        from .ipam_server_dialog import IpamServerDialog  # Loads pywin32 only when it's needed
-        IpamServerDialog(self).exec_()
+    def show_tribe_management(self):
+        from .tribe_dialog import TribeDialog  # Loads pywin32 only when it's needed
+        TribeDialog(self).exec_()
 
     def tribe_key_changed(self, origin=None):
         """A page saved or forgot the tribe key: the other pages that use the tribe start again with it."""
@@ -513,7 +523,26 @@ class MainWindow(QMainWindow):
         if origin is not self.ipam_tab and self.ipam_tab.local_store is not None:  # Opened: else it's read later
             self.ipam_tab.connect_team()
 
-    def leave_tribe(self, origin=None):
+    def confirm_leave_tribe(self, parent):
+        """Ask, then stop using the tribe on this computer (Tools > Tribe Management is the one place to leave).
+        Returns whether it left."""
+        self.ipam_tab.open_store()  # Open both copies, so changes waiting in them are counted and then emptied
+        self.netmap_tab.tribe.ensure()
+        warning = ""
+        for unsent, what in ((self.ipam_tab.unsent_tribe_changes(), "made offline to tribe networks"),
+                             (self.netmap_tab.unsent_tribe_changes(), "to tribe maps")):
+            if unsent:
+                warning += (f"\n\n{unsent} change{'s' if unsent != 1 else ''} {what} haven't reached the server "
+                            "and will be lost.")
+        if QMessageBox.question(parent, "Disconnect from the Tribe",
+                                "Stop using the tribe on this computer? The saved tribe key and the copies of the "
+                                "tribe's networks and maps are removed (a tribe map open is kept as a file); your "
+                                "own networks and maps are kept." + warning) != QMessageBox.Yes:
+            return False
+        self.leave_tribe()
+        return True
+
+    def leave_tribe(self):
         """Stop using the tribe on this computer: forget the key and the copies of its maps and IPAM data."""
         from ..ipam.client import forget_key
         forget_key()
@@ -522,13 +551,6 @@ class MainWindow(QMainWindow):
         if self.ipam_tab.local_store is not None:
             self.ipam_tab.connect_team()
             self.ipam_tab.fill_networks()
-
-    def leave_tribe_maps(self):
-        """The IP Addresses page left the tribe: the map page forgets its copy of the tribe's maps too."""
-        self.netmap_tab.tribe_key_changed(forget=True)
-
-    def unsent_tribe_map_changes(self):
-        return self.netmap_tab.unsent_tribe_changes()
 
     def show_map_watcher(self):
         from .watch_service_dialog import MapWatcherDialog  # Loads pywin32 only when it's needed

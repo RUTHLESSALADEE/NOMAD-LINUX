@@ -1,4 +1,4 @@
-"""Network Map settings: the SNMP community strings to try, and how far the crawl may go; and the dialogs for
+"""Network Map settings: the SNMP credentials to try, and how far the crawl may go; and the dialogs for
 hosts added by hand and for sites, buildings and rooms."""
 import ipaddress
 from dataclasses import replace
@@ -15,31 +15,126 @@ from ..netmap.model import AP, CORRECTED_NAMES, FIREWALL, GROUP_KINDS, KIND_NAME
     SITE, SWITCH, UNCHECKED, UNKNOWN, Device, Host, Link, normalize_name, port_sort_key, short_port
 from ..oui import format_mac, vendor
 from ..snmp import VERSIONS, community_is_valid
+from ..snmpv3 import AUTH_NAMES, PRIV_NAMES, V3User, is_v3
 from .theme import COLORS
 
 CHANGE_COLORS = {diff.ADDED: "success", diff.REMOVED: "error", diff.CHANGED: "warning", diff.MOVED: "link"}
 
 
+class V3UsersTable(QTableWidget):
+    """SNMPv3 users, one per row: name, authentication protocol and password, privacy protocol and password. Used by
+    the map's SNMP Credentials and the SNMP Config page."""
+    COLUMNS = ["User", "Authentication", "Auth Password", "Privacy", "Privacy Password"]
+
+    def __init__(self, users=(), parent=None):
+        super().__init__(0, len(self.COLUMNS), parent)
+        self.setHorizontalHeaderLabels(self.COLUMNS)
+        self.verticalHeader().setVisible(False)
+        self.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        for user in users:
+            self.add_user(user)
+
+    def add_user(self, user=None):
+        user = user or V3User("", "sha", "", "aes128", "")
+        row = self.rowCount()
+        self.insertRow(row)
+        name = QLineEdit(user.user)
+        auth, priv = QComboBox(), QComboBox()
+        for key, label in AUTH_NAMES.items():
+            auth.addItem(label, key)
+        for key, label in PRIV_NAMES.items():
+            priv.addItem(label, key)
+        auth.setCurrentIndex(max(0, auth.findData(user.auth)))
+        priv.setCurrentIndex(max(0, priv.findData(user.priv)))
+        passwords = []
+        for text in (user.auth_password, user.priv_password):
+            password = QLineEdit(text)
+            password.setEchoMode(QLineEdit.Password)
+            passwords.append(password)
+        for column, widget in enumerate((name, auth, passwords[0], priv, passwords[1])):
+            self.setCellWidget(row, column, widget)
+        auth.currentIndexChanged.connect(lambda _: self.update_enabled())
+        priv.currentIndexChanged.connect(lambda _: self.update_enabled())
+        self.update_enabled()
+        if not user.user:
+            name.setFocus()
+
+    def update_enabled(self):
+        for row in range(self.rowCount()):
+            auth = self.cellWidget(row, 1).currentData()
+            self.cellWidget(row, 2).setEnabled(auth != "none")
+            self.cellWidget(row, 3).setEnabled(auth != "none")
+            self.cellWidget(row, 4).setEnabled(auth != "none" and self.cellWidget(row, 3).currentData() != "none")
+
+    def remove_selected(self):
+        for row in sorted({index.row() for index in self.selectedIndexes()}, reverse=True):
+            self.removeRow(row)
+
+    def users(self):
+        """The users, without empty rows. Raises ValueError for one that isn't valid."""
+        users = []
+        for row in range(self.rowCount()):
+            name = self.cellWidget(row, 0).text().strip()
+            auth = self.cellWidget(row, 1).currentData()
+            priv = self.cellWidget(row, 3).currentData() if auth != "none" else "none"
+            user = V3User(name, auth, self.cellWidget(row, 2).text() if auth != "none" else "", priv,
+                          self.cellWidget(row, 4).text() if priv != "none" else "")
+            if not name and not user.auth_password and not user.priv_password:
+                continue
+            problem = user.problem()
+            if problem:
+                raise ValueError(problem)
+            if any(other.user == name for other in users):
+                raise ValueError(f"There are two SNMPv3 users named {name}.")
+            users.append(user)
+        return users
+
+
+V3_PREFIX = "v3:"  # A per-subnet entry naming an SNMPv3 user instead of a community string
+
+
 class CommunitiesDialog(QDialog):
-    def __init__(self, communities, overrides, version, timeout, parent=None):
+    """The map's SNMP credentials: community strings, SNMPv3 users, and which to try first for some subnets."""
+
+    def __init__(self, communities, overrides, version, timeout, parent=None, v3_users=(), v3_first=True):
         super().__init__(parent)
-        self.setWindowTitle("SNMP Community Strings")
-        self.resize(520, 480)
+        self.setWindowTitle("SNMP Credentials")
+        self.resize(680, 640)
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Community strings to try on each device, in order (one per line). The first one "
-                                "that answers is used for that device."))
+        layout.addWidget(QLabel("Community strings (v1/v2c) to try on each device, in order, one per line. The first "
+                                "one that answers is used for that device."))
         self.communities_input = QPlainTextEdit("\n".join(communities))
         self.communities_input.setTabChangesFocus(True)
         layout.addWidget(self.communities_input, 1)
 
-        layout.addWidget(QLabel("Per-subnet community strings, tried first for addresses in the subnet:"))
+        layout.addWidget(QLabel("SNMPv3 users to try:"))
+        self.users_table = V3UsersTable(v3_users)
+        layout.addWidget(self.users_table, 1)
+        user_buttons = QHBoxLayout()
+        add_user = QPushButton("Add User")
+        remove_user = QPushButton("Remove User")
+        add_user.clicked.connect(lambda: self.users_table.add_user())
+        remove_user.clicked.connect(self.users_table.remove_selected)
+        self.v3_first_check = QCheckBox("Try SNMPv3 users before community strings")
+        self.v3_first_check.setToolTip("A device that doesn't have the user says so at once, while a wrong community "
+                                       "string waits for the timeout, so users first is usually faster.")
+        self.v3_first_check.setChecked(v3_first)
+        user_buttons.addWidget(add_user)
+        user_buttons.addWidget(remove_user)
+        user_buttons.addStretch()
+        user_buttons.addWidget(self.v3_first_check)
+        layout.addLayout(user_buttons)
+
+        layout.addWidget(QLabel(f"Per-subnet credentials, tried first for addresses in the subnet (a community "
+                                f"string, or {V3_PREFIX}user for an SNMPv3 user above):"))
         self.table = QTableWidget(0, 2)
-        self.table.setHorizontalHeaderLabels(["Subnet", "Community"])
+        self.table.setHorizontalHeaderLabels(["Subnet", "Community or v3:user"])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         for subnet, community in overrides:
-            self.add_row(subnet, community)
+            self.add_row(subnet, V3_PREFIX + community.user if is_v3(community) else community)
         layout.addWidget(self.table, 1)
         row_buttons = QHBoxLayout()
         add_button = QPushButton("Add")
@@ -61,11 +156,12 @@ class CommunitiesDialog(QDialog):
         self.timeout_input.setValue(timeout)
         self.timeout_input.setSuffix(" ms")
         self.timeout_input.setToolTip("How long to wait for each SNMP answer. Devices that don't answer are tried "
-                                      "with each community string, so a long timeout slows the crawl down.")
-        form.addRow("SNMP version:", self.version_combo)
+                                      "with each credential, so a long timeout slows the crawl down.")
+        form.addRow("Community string version:", self.version_combo)
         form.addRow("Timeout:", self.timeout_input)
         layout.addLayout(form)
-        note = QLabel("Saved encrypted for your Windows account.")
+        note = QLabel("Saved encrypted for your Windows account. The SNMP Config page builds switch configuration "
+                      "for these.")
         note.setEnabled(False)
         layout.addWidget(note)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -86,10 +182,13 @@ class CommunitiesDialog(QDialog):
             self.table.removeRow(row)
 
     def values(self):
-        """(communities, overrides, version, timeout). Raises ValueError for anything that isn't valid."""
+        """(communities, overrides, version, timeout, v3 users, v3 first). Raises ValueError for anything that isn't
+        valid."""
         communities = [line.strip() for line in self.communities_input.toPlainText().splitlines() if line.strip()]
-        if not communities:
-            raise ValueError("Enter at least one community string, such as public.")
+        users = self.users_table.users()
+        if not communities and not users:
+            raise ValueError("Enter at least one community string (such as public) or SNMPv3 user.")
+        by_name = {user.user: user for user in users}
         overrides = []
         for row in range(self.table.rowCount()):
             subnet = (self.table.item(row, 0).text() if self.table.item(row, 0) else "").strip()
@@ -101,18 +200,25 @@ class CommunitiesDialog(QDialog):
             except ValueError:
                 raise ValueError(f"'{subnet}' isn't a subnet. Use CIDR notation, such as 10.20.0.0/16.") from None
             if not community:
-                raise ValueError(f"Enter the community string for {subnet}.")
-            overrides.append((subnet, community))
-        for community in communities + [community for _, community in overrides]:
+                raise ValueError(f"Enter the community string (or {V3_PREFIX}user) for {subnet}.")
+            if community.lower().startswith(V3_PREFIX):
+                name = community[len(V3_PREFIX):].strip()
+                if name not in by_name:
+                    raise ValueError(f"{subnet} uses SNMPv3 user {name}, who isn't in the users list.")
+                overrides.append((subnet, by_name[name]))
+            else:
+                overrides.append((subnet, community))
+        for community in communities + [community for _, community in overrides if not is_v3(community)]:
             if not community_is_valid(community):
                 raise ValueError("Community strings can't be longer than 255 bytes or contain control characters.")
-        return communities, overrides, VERSIONS[self.version_combo.currentText()], self.timeout_input.value()
+        return (communities, overrides, VERSIONS[self.version_combo.currentText()], self.timeout_input.value(),
+                users, self.v3_first_check.isChecked())
 
     def accept(self):
         try:
             self.values()
         except ValueError as error:
-            QMessageBox.warning(self, "SNMP Community Strings", str(error))
+            QMessageBox.warning(self, "SNMP Credentials", str(error))
             return
         super().accept()
 
