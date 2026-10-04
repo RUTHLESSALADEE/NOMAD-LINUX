@@ -12,9 +12,9 @@ from PyQt5.QtWidgets import QMenu  # noqa: E402
 
 from nomad.netmap import export, store  # noqa: E402
 from nomad.netmap.crawl import CrawlSettings, Crawler  # noqa: E402
-from nomad.netmap.layout import CIRCLE, GRID, GROUP_PAD, GROUP_TITLE, HORIZONTAL, LEFT, LEFT_RIGHT, MIDDLE, \
-    NODE_HEIGHT, NODE_WIDTH, STYLE_NAMES, TOP_DOWN, align, arrange, arrange_boxes_in_place, arrange_in_place, \
-    distribute  # noqa: E402
+from nomad.netmap.layout import BOTTOM_UP, CIRCLE, GRID, GROUP_PAD, GROUP_TITLE, HORIZONTAL, LEFT, LEFT_RIGHT, \
+    MIDDLE, NODE_HEIGHT, NODE_WIDTH, RIGHT_LEFT, SPACING_NAMES, SPACINGS, STYLE_NAMES, TOP_DOWN, align, arrange, \
+    arrange_boxes_in_place, arrange_in_place, distribute  # noqa: E402
 from nomad.netmap.model import BUILDING, ROOM, SITE, Device, NetworkMap  # noqa: E402
 from nomad.ui.netmap_dialogs import GroupDialog  # noqa: E402
 from nomad.ui.netmap_view import GROUP_BOX, GroupItem, LinkItem  # noqa: E402
@@ -122,10 +122,11 @@ def test_groups_carried_to_a_new_crawl():
 # ----------------------------------------------------------------- Arranging
 
 
+@pytest.mark.parametrize("spacing", list(SPACINGS.values()))
 @pytest.mark.parametrize("style", list(STYLE_NAMES))
-def test_every_arrangement_places_everything_clear(style):
+def test_every_arrangement_places_everything_clear(style, spacing):
     nodes, edges = campus()
-    positions = arrange(nodes, edges, style)
+    positions = arrange(nodes, edges, style, spacing=spacing)
     assert set(positions) == set(nodes)
     no_overlaps(positions)
 
@@ -136,6 +137,17 @@ def test_arrangements_differ_in_shape():
     left_right = arrange(nodes, edges, LEFT_RIGHT)
     assert top_down["core"][1] < top_down["dist1"][1] < top_down["a0"][1]  # Layers down the page
     assert left_right["core"][0] < left_right["dist1"][0] < left_right["a0"][0]  # Layers across it
+    bottom_up, right_left = arrange(nodes, edges, BOTTOM_UP), arrange(nodes, edges, RIGHT_LEFT)
+    assert bottom_up["core"][1] > bottom_up["dist1"][1] > bottom_up["a0"][1]  # Layers up the page
+    assert right_left["core"][0] > right_left["dist1"][0] > right_left["a0"][0]  # Layers back across it
+    for flipped, original, axis in ((bottom_up, top_down, 1), (right_left, left_right, 0)):  # The other way round
+        assert {key: point[1 - axis] for key, point in flipped.items()} == \
+            {key: point[1 - axis] for key, point in original.items()}
+
+        def length(positions):
+            return max(point[axis] for point in positions.values()) - min(point[axis] for point in positions.values())
+
+        assert length(flipped) == pytest.approx(length(original))
     circle = arrange(nodes, edges, CIRCLE)
     center = circle["core"]
     distance = {key: ((x - center[0]) ** 2 + (y - center[1]) ** 2) ** 0.5 for key, (x, y) in circle.items()}
@@ -159,6 +171,51 @@ def test_arranging_by_group_keeps_each_group_in_its_own_box(style):
         point = positions[key]
         for group in (north, south):
             assert not (group[0] <= point[0] <= group[2] and group[1] <= point[1] <= group[3])
+
+
+def test_linked_groups_are_arranged_as_their_links_go():
+    # The core (in no group) links to sites A and C; site B hangs off A alone. Tiled by name, B would sit between
+    # A and C with links running past it; laid out by their links, B goes under A
+    nodes = ["core", "a1", "a2", "b1", "b2", "c1", "c2"]
+    edges = [("core", "a1"), ("a1", "a2"), ("a1", "b1"), ("b1", "b2"), ("core", "c1"), ("c1", "c2")]
+    path_of = {"a1": ["A"], "a2": ["A"], "b1": ["B"], "b2": ["B"], "c1": ["C"], "c2": ["C"]}
+    positions = arrange(nodes, edges, TOP_DOWN, root="core", path_of=path_of)
+    no_overlaps(positions)
+    a, b, c = (box(positions, [f"{name}1", f"{name}2"]) for name in "abc")
+    assert positions["core"][1] < a[1] and positions["core"][1] < c[1]  # The core's on top
+    assert a[3] <= b[1]  # B below A
+    assert abs((b[0] + b[2]) / 2 - (a[0] + a[2]) / 2) < abs((b[0] + b[2]) / 2 - (c[0] + c[2]) / 2)  # Under A
+    for one, other in ((a, b), (a, c), (b, c)):
+        assert apart(one, other)
+
+
+def test_linked_groups_bottom_to_top():
+    # As above, the other way up: the core at the bottom, B above A
+    nodes = ["core", "a1", "a2", "b1", "b2", "c1", "c2"]
+    edges = [("core", "a1"), ("a1", "a2"), ("a1", "b1"), ("b1", "b2"), ("core", "c1"), ("c1", "c2")]
+    path_of = {"a1": ["A"], "a2": ["A"], "b1": ["B"], "b2": ["B"], "c1": ["C"], "c2": ["C"]}
+    positions = arrange(nodes, edges, BOTTOM_UP, root="core", path_of=path_of)
+    no_overlaps(positions)
+    a, b, c = (box(positions, [f"{name}1", f"{name}2"]) for name in "abc")
+    assert positions["core"][1] > a[3] and positions["core"][1] > c[3]  # The core's at the bottom
+    assert b[3] <= a[1]  # B above A
+    assert positions["a1"][1] > positions["a2"][1]  # Inside a group too, what links out of it is nearest the core
+    for one, other in ((a, b), (a, c), (b, c)):
+        assert apart(one, other)
+
+
+@pytest.mark.parametrize("style", list(STYLE_NAMES))
+def test_spacing_stretches_the_gaps(style):
+    nodes, edges = campus()
+    path_of = {"a0": ["north"], "a1": ["north"], "a4": ["south"], "a5": ["south"]}
+
+    def area(positions):  # Taken up by the boxes (a grid, or tiled groups, may wrap differently)
+        return ((max(x for x, _ in positions.values()) - min(x for x, _ in positions.values()) + NODE_WIDTH)
+                * (max(y for _, y in positions.values()) - min(y for _, y in positions.values()) + NODE_HEIGHT))
+
+    for groups in (None, path_of):
+        areas = [area(arrange(nodes, edges, style, path_of=groups, spacing=SPACINGS[key])) for key in SPACING_NAMES]
+        assert areas == sorted(set(areas)), (style, areas)  # Compact, normal, roomy, spacious: each further apart
 
 
 def test_arranging_some_keeps_them_where_they_were():
@@ -187,13 +244,14 @@ def test_align_and_distribute():
 
 
 
+@pytest.mark.parametrize("spacing", list(SPACINGS.values()))
 @pytest.mark.parametrize("style", list(STYLE_NAMES))
-def test_arranging_boxes_of_different_sizes(style):
+def test_arranging_boxes_of_different_sizes(style, spacing):
     boxes = {"north": (0, 0, 600, 400), "south": (50, 20, 300, 900), "east": (10, 10, 200, 150),
              "core": (5, 5, NODE_WIDTH, NODE_HEIGHT)}
     edges = [("core", "north"), ("core", "south"), ("core", "east")]
     placed = arrange_boxes_in_place({key: (x + 1000, y + 500, w, h) for key, (x, y, w, h) in boxes.items()},
-                                    edges, style)
+                                    edges, style, spacing=spacing)
     rects = {key: (x - boxes[key][2] / 2, y - boxes[key][3] / 2, x + boxes[key][2] / 2, y + boxes[key][3] / 2)
              for key, (x, y) in placed.items()}
     keys = list(rects)
@@ -356,8 +414,26 @@ def test_rearranging_in_each_style_keeps_groups_apart(tab, crawled):
         a, b = tab.view.group_items[first.key].rect, tab.view.group_items[second.key].rect
         assert not a.intersects(b), style
     assert tab.arrange_style == list(STYLE_NAMES)[-1]
+    tab.rearrange(TOP_DOWN)
     tab.fill_arrange_menu()
-    assert [action.text() for action in tab.arrange_menu.actions()][:4] == list(STYLE_NAMES.values())
+    actions = tab.arrange_menu.actions()
+    assert [action.text() for action in actions][:len(STYLE_NAMES)] == list(STYLE_NAMES.values())
+    spacing = next(action.menu() for action in actions if action.text() == "Spacing")
+    assert [action.text() for action in spacing.actions()] == list(SPACING_NAMES.values())
+    assert [action.isChecked() for action in spacing.actions()] == [key == "normal" for key in SPACING_NAMES]
+    tab.view.items_by_key[keys[4]].moveBy(400, -90)  # Somewhere of the user's own
+    tab.view.positions_changed.emit()
+    before = tab.view.positions()
+    spacing.actions()[-1].trigger()  # Spacious: further apart, but as they were
+    assert tab.arrange_spacing == "spacious"  # And Re-arrange's from now on
+    after = tab.view.positions()
+    assert same_shape(before, after) > 1.1  # Each where it was among the rest, the lot stretched
+    tab.flush_save()  # As after a drag, saved a moment later
+    assert tab.network_map.positions == after
+    a, b = tab.view.group_items[first.key].rect, tab.view.group_items[second.key].rect
+    assert not a.intersects(b)
+    tab.undo()  # Undo puts them back
+    assert tab.view.positions() == before
 
 
 def test_aligning_the_selection(tab, crawled):
@@ -468,8 +544,7 @@ def test_arranging_and_aligning_groups(tab, crawled):
     tab.align_selected(tab.view, [], "vertical", [first.key, second.key])
     assert a.rect.bottom() <= b.rect.top() or b.rect.bottom() <= a.rect.top()
     for style in STYLE_NAMES:
-        tab.arrange_style = style
-        tab.arrange_selected(tab.view, [lone], [first.key, second.key])
+        tab.arrange_selected(tab.view, [lone], [first.key, second.key], style)
         lone_rect = tab.view.items_by_key[lone].sceneBoundingRect()
         assert not a.rect.intersects(b.rect) and not a.rect.intersects(lone_rect) \
             and not b.rect.intersects(lone_rect), style
@@ -505,3 +580,97 @@ def test_arranging_the_selection_in_another_style(tab, crawled, monkeypatch):
     monkeypatch.setattr(tab, "arrange_selected", lambda view, keys, groups, style: chosen.append(style))
     styles[list(STYLE_NAMES).index(CIRCLE)].trigger()
     assert chosen == [CIRCLE] and tab.arrange_style == TOP_DOWN  # Re-arrange's own style stays as it was
+
+
+def same_shape(before, after):
+    """How much after is before stretched (about some point), each where it was among the rest: fails if they were
+    moved any other way."""
+    keys = sorted(before)
+    first, last = max(((a, b) for a in keys for b in keys),
+                      key=lambda pair: abs(before[pair[0]][0] - before[pair[1]][0]) +
+                      abs(before[pair[0]][1] - before[pair[1]][1]))
+    span = max(abs(before[last][0] - before[first][0]), abs(before[last][1] - before[first][1]))
+    axis = 0 if abs(before[last][0] - before[first][0]) == span else 1
+    scale = (after[last][axis] - after[first][axis]) / (before[last][axis] - before[first][axis])
+    for key in keys:
+        for axis in (0, 1):
+            assert after[key][axis] - after[first][axis] == pytest.approx(
+                scale * (before[key][axis] - before[first][axis]), abs=0.01), key
+    return scale
+
+
+def menu_entry(menu, text):
+    return next(action for action in menu.actions() if action.text().startswith(text))
+
+
+def test_spacing_the_selection_moves_only_it(tab, crawled):
+    tab.on_crawled(crawled)
+    keys = sorted(crawled.devices)
+    chosen, others = keys[:3], keys[3:]
+    before = tab.view.positions()
+    for key in chosen:
+        tab.view.items_by_key[key].setSelected(True)
+    tab.fill_arrange_menu()  # Re-arrange's Spacing is for the selection while there is one
+    spacing = menu_entry(tab.arrange_menu, "Spacing").menu()
+    assert menu_entry(tab.arrange_menu, "Spacing").text() == "Spacing of the 3 Selected"
+    assert sum(action.text().startswith("Spacing") for action in tab.arrange_menu.actions()) == 1  # Only once
+    spacing.actions()[list(SPACING_NAMES).index("compact")].trigger()
+    after = tab.view.positions()
+    assert all(after[key] == before[key] for key in others)  # The rest left where they were
+    assert tab.arrange_spacing == "normal"  # Re-arrange's own spacing stays as it was
+    compact = {key: after[key] for key in chosen}
+
+    tab.arrange_selected(tab.view, chosen, style=LEFT_RIGHT)
+    menu = QMenu()
+    tab.add_selection_actions(menu, tab.view, chosen)  # As on the right-click menu
+    styles, spaced = menu_entry(menu, "Arrange the 3").menu(), menu_entry(menu, "Spacing of the 3 Selected").menu()
+    assert [action.isChecked() for action in styles.actions()] == [style == LEFT_RIGHT for style in STYLE_NAMES]
+    assert [action.isChecked() for action in spaced.actions()] == [key == "compact" for key in SPACING_NAMES]
+    arranged = {key: tab.view.positions()[key] for key in chosen}
+    spaced.actions()[list(SPACING_NAMES).index("spacious")].trigger()  # Further apart, still left to right
+    spacious = {key: tab.view.positions()[key] for key in chosen}
+    assert same_shape(arranged, spacious) > 1
+    assert tab.last_arranged[1:] == (LEFT_RIGHT, "spacious")
+
+    def width(points):
+        return max(x for x, _ in points.values()) - min(x for x, _ in points.values())
+
+    assert width(spacious) > width(compact)
+    assert all(tab.view.positions()[key] == before[key] for key in others)
+
+    tab.view.scene().clearSelection()
+    tab.fill_arrange_menu()  # Nothing selected: the whole map's
+    assert menu_entry(tab.arrange_menu, "Spacing").text() == "Spacing"
+
+
+def test_group_menu_offers_spacing(tab, crawled, monkeypatch):
+    tab.on_crawled(crawled)
+    keys = sorted(crawled.devices)
+    site = make_site(tab, keys[:3], "A")
+    shown = []
+    monkeypatch.setattr(QMenu, "exec_", lambda menu, *args: shown.append(
+        [(action.text(), action.menu()) for action in menu.actions()]))
+    tab.show_group_menu(site.key, None)
+    entries = dict(shown[0])
+    spacing = entries["Spacing of This Site"]
+    assert [action.text() for action in spacing.actions()] == list(SPACING_NAMES.values())
+    before = tab.view.positions()
+    spacing.actions()[-1].trigger()  # Spacious: the site's devices further apart, as they were
+    after = tab.view.positions()
+    assert same_shape({key: before[key] for key in keys[:3]}, {key: after[key] for key in keys[:3]}) > 1
+    assert all(after[key] == before[key] for key in keys[3:])  # The rest left where they were
+
+
+def test_device_menu_offers_spacing_with_the_arranging(tab, crawled, monkeypatch):
+    tab.on_crawled(crawled)
+    keys = sorted(crawled.devices)
+    shown = []
+    monkeypatch.setattr(tab.host_actions, "add_to", lambda *args, **kwargs: {})  # Not what this is about
+    monkeypatch.setattr(QMenu, "exec_", lambda menu, *args: shown.append([action.text() for action in menu.actions()]))
+    tab.show_device_menu(keys[0], None)  # On its own: no arranging, no spacing
+    assert not any(text.startswith(("Arrange", "Spacing")) for text in shown[-1])
+    for key in keys[:2]:
+        tab.view.items_by_key[key].setSelected(True)
+    tab.show_device_menu(keys[0], None)
+    texts = shown[-1]
+    assert texts.index("Spacing of the 2 Selected") == texts.index("Arrange the 2 Selected") + 1

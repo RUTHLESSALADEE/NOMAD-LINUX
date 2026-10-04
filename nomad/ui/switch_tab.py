@@ -130,7 +130,7 @@ class SwitchTab(QWidget):
         log.info("Listening for LLDP/CDP for up to %s seconds", seconds)
         self.worker = DiscoveryThread(seconds, self)
         self.worker.found.connect(self.add_neighbor)
-        self.worker.progress.connect(lambda elapsed, total: self.progress_bar.setValue(int(elapsed)))
+        self.worker.progress.connect(self.show_progress)
         self.worker.finished_discovery.connect(self.on_finished)
         self.worker.finished.connect(self.on_thread_finished)
         self.worker.start()
@@ -142,6 +142,9 @@ class SwitchTab(QWidget):
             self.worker.stop()
             self.stop_button.setEnabled(False)
             set_hint(self.status_label, "Stopping (checking what was heard so far)...", "info")
+
+    def show_progress(self, elapsed, total):
+        self.progress_bar.setValue(int(elapsed))
 
     def on_finished(self, message, kind):
         if kind == "success":

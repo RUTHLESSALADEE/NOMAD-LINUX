@@ -1498,13 +1498,12 @@ class IpamTab(QWidget):
         self.sweep_worker = SweepThread(hosts, sweep_page.workers_input.value(), sweep_page.timeout_input.value(),
                                         arp_networks, sweep_page.arp_check.isChecked(),
                                         sweep_page.names_check.isChecked(), self)
-        self.sweep_worker.found.connect(lambda address, hit: self.on_sweep_found(results, address, hit))
-        self.sweep_worker.host_details.connect(lambda address, name, mac: self.on_sweep_name(results, address,
-                                                                                             name, mac))
+        self.sweep_worker.sweep_results, self.sweep_worker.sweep_block = results, block  # For its handlers
+        self.sweep_worker.found.connect(self.on_sweep_found)
+        self.sweep_worker.host_details.connect(self.on_sweep_name)
         self.sweep_worker.progress.connect(self.on_sweep_progress)
-        self.sweep_worker.looking_up_names.connect(
-            lambda remaining: self.sweep_status.setText(f"Looking up names for {remaining} hosts..."))
-        self.sweep_worker.finished_sweep.connect(lambda message: self.on_sweep_finished(results, block, message))
+        self.sweep_worker.looking_up_names.connect(self.on_sweep_looking_up_names)
+        self.sweep_worker.finished_sweep.connect(self.on_sweep_finished)
         self.sweep_worker.finished.connect(self.on_sweep_thread_done)
         self.sweep_progress.setRange(0, len(hosts) * SWEEP_PASSES)
         self.sweep_progress.setValue(0)
@@ -1517,13 +1516,19 @@ class IpamTab(QWidget):
         log.info("Sweeping %s from the IP Addresses page", network)
         self.refresh_current()
 
-    def on_sweep_found(self, results, address, hit):
-        results.found(address, hit.rtt, hit.mac)
+    # Worker signals go to methods, never lambdas: a lambda's signal still waiting to be delivered when its sender is freed
+    # crashes Qt, where a method's is dropped with the page
+
+    def on_sweep_found(self, address, hit):
+        self.sender().sweep_results.found(address, hit.rtt, hit.mac)
         self.sweep_refresh.start(300)
 
-    def on_sweep_name(self, results, address, name, mac):
-        results.add_name(address, name, mac)
+    def on_sweep_name(self, address, name, mac):
+        self.sender().sweep_results.add_name(address, name, mac)
         self.sweep_refresh.start(300)
+
+    def on_sweep_looking_up_names(self, remaining):
+        self.sweep_status.setText(f"Looking up names for {remaining} hosts...")
 
     def on_sweep_progress(self, done, total, pass_number, remaining):
         self.sweep_progress.setValue(done)
@@ -1533,7 +1538,8 @@ class IpamTab(QWidget):
         what = f"{remaining:,} addresses" if pass_number == 1 else f"retrying {remaining:,}"
         self.sweep_status.setText(f"Pass {pass_number} of {SWEEP_PASSES}: {what} · {found} answered")
 
-    def on_sweep_finished(self, results, block, message):
+    def on_sweep_finished(self, message):
+        results, block = self.sender().sweep_results, self.sender().sweep_block
         complete = self.sweep_worker is not None and not self.sweep_worker.stopping
         swept = [results.finish(block)] if complete else []
         if not complete:

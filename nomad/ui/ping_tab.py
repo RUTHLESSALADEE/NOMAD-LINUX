@@ -200,10 +200,13 @@ class PingTab(QWidget):
         self.summary_label.clear()
         self.worker = PingThread(host, count, size, timeout, self.df_check.isChecked(), self)
         self.worker.line.connect(self.output.appendPlainText)
-        self.worker.stats.connect(lambda stats: self.summary_label.setText(stats.summary() if stats.sent else ""))
+        self.worker.stats.connect(self.show_stats)
         self.worker.finished.connect(self.on_finished)
         self.worker.start()
         self.update_buttons()
+
+    def show_stats(self, stats):
+        self.summary_label.setText(stats.summary() if stats.sent else "")
 
     def stop_ping(self):
         if self.worker is not None:

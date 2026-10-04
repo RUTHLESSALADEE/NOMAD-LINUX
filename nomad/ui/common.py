@@ -2,8 +2,10 @@
 import logging
 import threading
 
-from PyQt5.QtCore import QObject, QRunnable, QThread, QThreadPool, pyqtSignal
-from PyQt5.QtWidgets import QAbstractItemView, QHeaderView, QTableWidget, QTableWidgetItem
+from PyQt5 import sip
+from PyQt5.QtCore import QObject, QRunnable, Qt, QThread, QThreadPool, pyqtSignal
+from PyQt5.QtGui import QPainter
+from PyQt5.QtWidgets import QAbstractItemView, QHeaderView, QLabel, QSizePolicy, QTableWidget, QTableWidgetItem
 
 from .theme import COLORS
 
@@ -86,23 +88,28 @@ class _Task(QRunnable):
             self.signals.succeeded.emit(result)
 
 
-_running_signals = set()  # Keeps signal objects alive until their task finishes
+_running_signals = set()  # Keeps signal objects alive until their task finishes and Qt frees them
+
+
+def forget_deleted(objects):
+    """Drop from a set the Qt objects Qt has freed."""
+    for item in [item for item in objects if sip.isdeleted(item)]:
+        objects.discard(item)
 
 
 def run_in_background(function, on_success=None, on_error=None):
     """Run function() on a worker thread and call on_success(result) / on_error(exception) on the UI thread."""
+    forget_deleted(_running_signals)
     signals = _TaskSignals()
     _running_signals.add(signals)
-
-    def finished():
-        _running_signals.discard(signals)
-
     if on_success:
         signals.succeeded.connect(on_success)
     if on_error:
         signals.failed.connect(on_error)
-    signals.succeeded.connect(finished)
-    signals.failed.connect(finished)
+    # Freed by Qt once it has said how it went (its own slot, after on_success or on_error): freeing it from a lambda
+    # (dropping the last reference to it) while its signal is being delivered isn't safe
+    signals.succeeded.connect(signals.deleteLater)
+    signals.failed.connect(signals.deleteLater)
     QThreadPool.globalInstance().start(_Task(function, signals))
 
 
@@ -135,5 +142,48 @@ def release_thread(thread, wait_ms=3000):
     except TypeError:
         pass
     thread.setParent(None)
+    forget_deleted(_orphaned_threads)
     _orphaned_threads.add(thread)
-    thread.finished.connect(lambda: _orphaned_threads.discard(thread))
+    thread.finished.connect(thread.deleteLater)  # Freed by Qt once it has finished (its own slot, not a lambda)
+    if thread.isFinished():  # Finished just now, before that was connected
+        thread.deleteLater()
+
+
+class OneLineLabel(QLabel):
+    """A label that can be kept to one line (set_one_line): what doesn't fit is cut short with "...", the whole of
+    it in the tooltip. text() is always the whole text. wraps: whether it wraps when it isn't kept to one line."""
+
+    def __init__(self, text="", parent=None, wraps=False):
+        super().__init__(text, parent)
+        self.wraps, self.one_line = wraps, False
+        self.setWordWrap(wraps)
+
+    def set_one_line(self, on, width=None):
+        """width: keep to that many pixels, taking the same room whatever it says (rather than whatever's left)."""
+        self.one_line = on
+        self.setWordWrap(self.wraps and not on)
+        if on and width:
+            self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+            self.setFixedWidth(width)
+        else:
+            self.setSizePolicy(QSizePolicy.Ignored if on else QSizePolicy.Preferred, QSizePolicy.Preferred)
+            self.setMinimumWidth(0)
+            self.setMaximumWidth(16777215)
+        self.setToolTip(self.text() if on else "")
+        self.updateGeometry()
+        self.update()
+
+    def setText(self, text):
+        super().setText(text)
+        if self.one_line:
+            self.setToolTip(text)
+
+    def paintEvent(self, event):
+        if not self.one_line:
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        rect = self.contentsRect()
+        text = self.fontMetrics().elidedText(self.text(), Qt.ElideRight, rect.width())
+        self.style().drawItemText(painter, rect, int(self.alignment()), self.palette(), self.isEnabled(), text,
+                                  self.foregroundRole())

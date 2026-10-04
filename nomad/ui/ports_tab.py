@@ -255,11 +255,9 @@ class PortsTab(QWidget):
         set_hint(self.status_label, f"Resolving {host}...", "info")
         log.info("Scanning %s on %s", count, host)
         self.worker = PortScanThread(host, ports, self.workers_input.value(), self.timeout_input.value(), self)
-        self.worker.resolved.connect(
-            lambda address: set_hint(self.status_label, f"Scanning {count} on {host}"
-                                                        f"{'' if address == host else f' [{address}]'}...", "info"))
+        self.worker.resolved.connect(self.on_resolved)
         self.worker.result.connect(self.add_result)
-        self.worker.progress.connect(lambda done, total: self.progress_bar.setValue(done))
+        self.worker.progress.connect(self.show_progress)
         self.worker.finished_scan.connect(self.on_scan_finished)
         self.worker.finished.connect(self.on_thread_finished)
         self.worker.start()
@@ -293,6 +291,14 @@ class PortsTab(QWidget):
         if self.restart_when_stopped:
             self.restart_when_stopped = False
             self.start_scan()
+
+    def on_resolved(self, address):
+        count, host = self.port_count, self.scanned_host
+        set_hint(self.status_label, f"Scanning {count:,} port{'' if count == 1 else 's'} on {host}"
+                                    f"{'' if address == host else f' [{address}]'}...", "info")
+
+    def show_progress(self, done, total):
+        self.progress_bar.setValue(done)
 
     def add_result(self, result):
         self.results.append(result)

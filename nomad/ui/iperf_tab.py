@@ -227,6 +227,9 @@ class IperfTab(QWidget):
         self.output.clear()
         self.result_label.clear()
 
+    def show_progress(self, interval):
+        self.progress_bar.setValue(int(interval.end))
+
     def show_interval(self, interval):
         if not self.interval_header_shown:
             header = "Interval           Transfer         Bitrate"
@@ -289,7 +292,7 @@ class IperfTab(QWidget):
         self.client_worker = IperfClientThread(host, port, params, self)
         self.client_worker.line.connect(self.output.appendPlainText)
         self.client_worker.interval.connect(self.show_interval)
-        self.client_worker.interval.connect(lambda interval: self.progress_bar.setValue(int(interval.end)))
+        self.client_worker.interval.connect(self.show_progress)
         self.client_worker.result.connect(self.show_result)
         self.client_worker.failed.connect(self.show_failure)
         self.client_worker.finished.connect(self.on_client_finished)

@@ -5,7 +5,8 @@ from netmap_fakes import build_network
 
 from nomad.netmap import export, store
 from nomad.netmap.crawl import CrawlSettings, Crawler
-from nomad.netmap.layout import H_GAP, NODE_HEIGHT, NODE_WIDTH, layout, merge_positions
+from nomad.netmap.layout import H_GAP, NODE_HEIGHT, NODE_WIDTH, SPACINGS, STYLE_NAMES, arrange, layout, \
+    merge_positions, neighbors_of, order_layers, respace, spacing_of, tangle
 from nomad.netmap.model import NetworkMap
 
 
@@ -112,3 +113,104 @@ def test_star_of_single_link_devices_hangs_below():
     positions = layout(["core", "a", "b", "c"], [("core", "a"), ("core", "b"), ("core", "c")])
     assert all(positions[node][1] > positions["core"][1] for node in "abc")
     no_overlaps(positions)
+
+
+def test_layers_are_ordered_so_links_do_not_cross():
+    # Each distribution switch's access switches start out on the far side of the other's
+    levels = [["core"], ["d1", "d2", "d3"], ["s3a", "s2a", "s1a", "s3b", "s2b", "s1b"]]
+    edges = [("core", "d1"), ("core", "d2"), ("core", "d3")] + [(f"d{n}", f"s{n}{end}") for n in (1, 2, 3)
+                                                                 for end in "ab"]
+    adjacent = neighbors_of([node for level in levels for node in level], edges)
+    assert tangle(levels, adjacent) > 0
+    assert tangle(order_layers(levels, adjacent), adjacent) == 0
+
+
+def test_a_link_along_a_layer_joins_neighbors():
+    # x and z are linked to each other as well as to the core: drawn side by side, not with y between them
+    nodes = ["core", "x", "y", "z"] + [f"{parent}{n}" for parent in "xyz" for n in (1, 2)]
+    edges = [("core", "x"), ("core", "y"), ("core", "z"), ("x", "z")] + [(parent, f"{parent}{n}")
+                                                                         for parent in "xyz" for n in (1, 2)]
+    positions = layout(nodes, edges, root="core")
+    layer = sorted("xyz", key=lambda node: positions[node][0])
+    assert abs(layer.index("x") - layer.index("z")) == 1
+    no_overlaps(positions)
+
+
+def test_nothing_new_keeps_every_position_as_it_was():
+    saved = {"a": (5.0, 6.0), "b": (100.0, 600.0)}
+    assert merge_positions(["a", "b"], [("a", "b")], saved) == saved
+
+
+def passes_over(start, end, box):
+    """Whether the line from start to end runs over the device box centered on box (sampled along its length)."""
+    for step in range(1, 200):
+        x = start[0] + (end[0] - start[0]) * step / 200
+        y = start[1] + (end[1] - start[1]) * step / 200
+        if abs(x - box[0]) < NODE_WIDTH / 2 - 2 and abs(y - box[1]) < NODE_HEIGHT / 2 - 2:
+            return True
+    return False
+
+
+@pytest.mark.parametrize("style", ["top-down", "bottom-up", "left-right", "right-left"])
+def test_links_down_from_a_switch_miss_its_access_points(style):
+    # dist1 has six access points and two access switches below it (each with an edge switch of its own)
+    aps = [f"ap{number}" for number in range(6)]
+    nodes = ["core", "dist1", "dist2", "acc1", "acc2", "edge1", "edge2", "acc3", "edge3"] + aps
+    edges = [("core", "dist1"), ("core", "dist2"), ("dist1", "acc1"), ("dist1", "acc2"), ("acc1", "edge1"),
+             ("acc2", "edge2"), ("dist2", "acc3"), ("acc3", "edge3")] + [("dist1", ap) for ap in aps]
+    positions = arrange(nodes, edges, style, root="core")
+    no_overlaps(positions)
+    for a, b in edges:
+        for other in nodes:
+            if other not in (a, b) and not (b in aps and other in aps):  # In its grid, a fan of links is fine
+                assert not passes_over(positions[a], positions[b], positions[other]), (a, b, other)
+
+
+def tree():
+    nodes = ["core", "d1", "d2", "d3"] + [f"a{i}" for i in range(12)] + [f"s{i}" for i in range(6)] + \
+        [f"x{i}" for i in range(6)]
+    edges = [("core", "d1"), ("core", "d2"), ("core", "d3")] + [(f"d{1 + i % 3}", f"a{i}") for i in range(12)] + \
+        [(f"d{1 + i % 3}", f"s{i}") for i in range(6)] + [(f"s{i}", f"x{i}") for i in range(6)]
+    return nodes, edges
+
+
+@pytest.mark.parametrize("style", [style for style in STYLE_NAMES if style != "circle"])
+def test_spacing_measures_what_arranging_left(style):
+    nodes, edges = tree()
+    for value in SPACINGS.values():
+        assert spacing_of(arrange(nodes, edges, style, root="core", spacing=value)) == pytest.approx(value)
+
+
+@pytest.mark.parametrize("style", list(STYLE_NAMES))
+def test_respacing_keeps_the_arrangement(style):
+    nodes, edges = tree()
+    laid = arrange(nodes, edges, style, root="core")
+    laid["a3"] = (laid["a3"][0] + 333, laid["a3"][1] - 77)  # Dragged somewhere of its own
+    laid = {key: point for key, point in laid.items()}
+    for value in SPACINGS.values():
+        spaced = respace(laid, value)
+        no_overlaps(spaced)
+        scale = (spaced["a3"][0] - spaced["core"][0]) / (laid["a3"][0] - laid["core"][0])
+        for key in laid:  # Every one where it was among the rest: the lot stretched or shrunk evenly
+            for axis in (0, 1):
+                assert spaced[key][axis] - spaced["core"][axis] == pytest.approx(
+                    scale * (laid[key][axis] - laid["core"][axis]))
+        if style != "circle":  # A circle's rings can't come as close as its spacing would have them
+            assert spacing_of(spaced) == pytest.approx(value, rel=0.03)
+
+
+def test_respacing_the_same_again_moves_nothing():
+    nodes, edges = tree()
+    laid = arrange(nodes, edges, root="core")
+    assert respace(laid, 1.0) == laid
+    roomy = respace(laid, SPACINGS["roomy"])
+    again = respace(roomy, SPACINGS["roomy"])
+    assert all(again[key] == pytest.approx(roomy[key], abs=0.5) for key in roomy)
+
+
+def test_shrinking_stops_before_devices_meet():
+    points = {"a": (0, 0), "b": (NODE_WIDTH + 30, 0), "c": (0, NODE_HEIGHT + 400)}  # a and b close, c far
+    spaced = respace(points, 0.1)
+    assert spaced["b"][0] - spaced["a"][0] >= NODE_WIDTH + 12 - 0.01  # Never closer than RESPACE_MIN_GAP
+    tight = respace(points, 0.1, min_gap=lambda a, b: 100)  # Closer than that already: only kept from overlapping
+    assert NODE_WIDTH - 0.01 <= tight["b"][0] - tight["a"][0] < NODE_WIDTH + 30

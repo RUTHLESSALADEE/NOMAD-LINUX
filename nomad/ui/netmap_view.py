@@ -123,6 +123,19 @@ class NodeItem(QGraphicsItem):
             painter.setPen(QPen(color, 4))
             painter.drawPath(ring)
 
+    def draw_selection(self, painter, path, rect, radius):
+        """Selected: a white ring just outside the box and a light wash over it, leaving its outline (the device's
+        type, or up or down while monitored) as it is."""
+        if not self.isSelected():
+            return
+        wash = QColor(COLORS["selection"])
+        wash.setAlpha(28)
+        painter.fillPath(path, wash)
+        ring = QPainterPath()
+        ring.addRoundedRect(rect.adjusted(-3, -3, 3, 3), radius + 2, radius + 2)
+        painter.setPen(QPen(QColor(COLORS["selection"]), 2))
+        painter.drawPath(ring)
+
     def center(self):
         return self.pos()
 
@@ -201,9 +214,7 @@ class DeviceItem(NodeItem):
         outline = QColor(COLORS["error"]) if device.source == UNREACHABLE else color
         if state is not None:  # Monitored: up/down outranks the device type, which the tag still names
             outline = QColor(STATUS_COLORS[state.status])
-        pen = QPen(outline, 3 if self.isSelected() else 2.6 if state is not None else 1.6)
-        if self.isSelected():
-            pen.setColor(QColor(COLORS["accent_hover"]))
+        pen = QPen(outline, 2.6 if state is not None else 1.6)
         if device.source != SNMP:
             pen.setStyle(Qt.DashLine)
         path = QPainterPath()
@@ -219,6 +230,7 @@ class DeviceItem(NodeItem):
         painter.restore()
         painter.setPen(pen)
         painter.drawPath(path)
+        self.draw_selection(painter, path, self.rect, 7)
 
         painter.setPen(QColor(outline if state is None else COLORS["text"]))
         painter.setFont(small_font(0.75, bold=True))
@@ -351,7 +363,7 @@ class HostPortItem(QGraphicsItem):
         painter.setPen(QPen(QColor(COLORS["border"]), 1, Qt.DotLine))
         painter.drawLine(QPointF(0, self.rect.top()), self.anchor)
         shared = len(self.hosts) > SHARED_PORT_HOSTS
-        pen = QPen(QColor(COLORS["accent_hover"] if self.isSelected() else
+        pen = QPen(QColor(COLORS["selection"] if self.isSelected() else
                           COLORS["warning"] if shared else COLORS["border"]), 2 if self.isSelected() else 1)
         if all(host.manual for host in self.hosts):
             pen.setStyle(Qt.DashLine)  # Only hosts added by hand: not seen by the crawl
@@ -425,13 +437,12 @@ class SimpleNodeItem(NodeItem):
         path = QPainterPath()
         path.addRoundedRect(self.rect, radius, radius)
         painter.fillPath(path, QColor(COLORS["panel_alt"] if node.kind == SUBNET else COLORS["panel"]))
-        color = QColor(COLORS["accent_hover"] if self.isSelected() else
-                       COLORS["link"] if node.kind == SUBNET else COLORS["muted"])
-        pen = QPen(color, 3 if self.isSelected() else 1.4)
+        pen = QPen(QColor(COLORS["link"] if node.kind == SUBNET else COLORS["muted"]), 1.4)
         if node.kind in (HOP, STAR):
             pen.setStyle(Qt.DashLine)
         painter.setPen(pen)
         painter.drawPath(path)
+        self.draw_selection(painter, path, self.rect, radius)
         bold = small_font(0.9, bold=True)
         painter.setFont(bold)
         painter.setPen(QColor(COLORS["text"]))
@@ -567,7 +578,7 @@ class GroupItem(QGraphicsItem):
         fill = QColor(color)
         fill.setAlpha(22 if building else 14)
         painter.fillPath(path, fill)
-        border = QColor(COLORS["success"] if self.drop_target else COLORS["accent_hover"] if selected else color)
+        border = QColor(COLORS["success"] if self.drop_target else COLORS["selection"] if selected else color)
         if not (self.drop_target or selected):
             border.setAlpha(150)
         pen = QPen(border, 2.5 if self.drop_target or selected else 1.4)
@@ -624,7 +635,7 @@ class GroupItem(QGraphicsItem):
             tint = QColor(COLORS["error"])
             tint.setAlpha(45)
             painter.fillPath(path, tint)
-        painter.setPen(QPen(QColor(COLORS["accent_hover"]) if selected else color, 3 if selected else 1.8))
+        painter.setPen(QPen(QColor(COLORS["selection"]) if selected else color, 3 if selected else 1.8))
         painter.drawPath(path)
         painter.setPen(color)
         painter.setFont(small_font(0.72, bold=True))
@@ -820,6 +831,14 @@ class MapView(QGraphicsView):
             self.items_by_key[key] = item
         self.groups_suspended = False
         self.rebuild_groups()
+        self.update_scene_rect()
+
+    def clear_map(self):
+        """Show nothing (no map open)."""
+        self.cancel_drawing()
+        self.scene().clear()
+        self.items_by_key, self.link_items, self.group_items, self.drag = {}, [], {}, None
+        self.network_map, self.links, self.last_found = None, [], None
         self.update_scene_rect()
 
     def set_graph(self, nodes, links, positions):

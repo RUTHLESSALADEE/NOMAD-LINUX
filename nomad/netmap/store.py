@@ -24,8 +24,17 @@ def default_name(network_map):
 
 
 def save(network_map, path=None, folder=None):
-    """Write the map; with no path, to a new file named after when the crawl started. Returns the path."""
-    path = Path(path) if path else (Path(folder) if folder else maps_dir()) / default_name(network_map)
+    """Write the map; with no path, to a new file named after when the crawl started (never over another map
+    started the same minute). Returns the path."""
+    if path:
+        path = Path(path)
+    else:
+        folder = Path(folder) if folder else maps_dir()
+        path = folder / default_name(network_map)
+        number = 2
+        while path.exists():
+            path = folder / f"{default_name(network_map)[:-len(EXTENSION)]} ({number}){EXTENSION}"
+            number += 1
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(network_map.to_json(), encoding="utf-8")
     temporary.replace(path)

@@ -86,6 +86,8 @@ class MainWindow(QMainWindow):
         self.init_ui()
         self.init_menus()
         self.restore_settings()
+        # Windows logging off or restarting (for updates, say) with NOMAD open: it may never get to close the window
+        QApplication.instance().commitDataRequest.connect(lambda manager: self.save_settings())
         log.info("%s started (administrator: %s)", APP_NAME, self.admin)
         self.refresh()
 
@@ -259,6 +261,15 @@ class MainWindow(QMainWindow):
         view_menu.addAction("Terminal &Keyword Highlighting...",
                             lambda: HighlightDialog(self, self.terminal_tab.highlights).exec_())
         view_menu.aboutToShow.connect(self.update_terminal_actions)
+        bar_menu = view_menu.addMenu("Network Map &Top Bar")
+        bar_group = QActionGroup(self)
+        for compact, label in ((True, "&Compact"), (False, "C&lassic")):
+            action = bar_menu.addAction(label, lambda compact=compact: self.netmap_tab.set_compact_top(compact))
+            action.setCheckable(True)
+            action.setData(compact)
+            bar_group.addAction(action)
+        bar_menu.aboutToShow.connect(lambda: [action.setChecked(action.data() == self.netmap_tab.compact_top)
+                                              for action in bar_group.actions()])
         view_menu.addSeparator()
         text_menu = view_menu.addMenu("&Text Size")
         self.text_scale_group = QActionGroup(self)

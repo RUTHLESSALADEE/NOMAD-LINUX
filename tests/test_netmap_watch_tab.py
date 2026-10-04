@@ -386,3 +386,124 @@ def test_the_watch_timers_can_be_set(app, tmp_path, monkeypatch):
         other.shutdown()
     finally:
         page.shutdown()
+
+
+class IdleCrawl:
+    """Stands in for the crawl thread: notes what map it was to add to, and does nothing."""
+
+    def __init__(self, started, known):
+        started.append(known)
+        self.event = self.crawled = self.failed = self.finished = self
+
+    def connect(self, *args):
+        pass
+
+    def start(self):
+        pass
+
+
+def answer_with(monkeypatch, label):
+    """Have the next question box answered by clicking the button labelled label."""
+    def click(box):
+        next(button for button in box.buttons() if button.text().replace("&", "") == label).click()
+        return 0
+    monkeypatch.setattr(QMessageBox, "exec_", click)
+
+
+def test_start_on_a_tribe_map_can_make_a_new_map_instead(app, server, tmp_path, monkeypatch):
+    network = build_network()
+    (tmp_path / "a").mkdir()
+    page = make_tab(network, tmp_path / "a", monkeypatch, tribe_for(server, tmp_path, "alice"))
+    try:
+        page.on_crawled(crawl(network))
+        monkeypatch.setattr(QInputDialog, "getText", lambda *args, **kwargs: ("HQ", True))
+        page.share_with_tribe()
+        map_id = page.tribe_map_id
+        before = page.tribe.maps.items(map_id)
+        page.seeds_input.setText("10.0.0.1")
+
+        answer_with(monkeypatch, "Cancel")
+        page.start()
+        assert page.worker is None and page.tribe_map_id == map_id  # Nothing started, still the tribe map
+
+        answer_with(monkeypatch, "New Map")
+        started = []
+        monkeypatch.setattr(netmap_tab, "CrawlThread", lambda settings, known, parent: IdleCrawl(started, known))
+        page.start()
+        assert started == [None]  # A crawl started, from scratch
+        assert page.tribe_map_id is None and page.network_map is None
+        page.worker = None
+        page.on_crawled(crawl(network))  # What it found: a map file of its own
+        assert page.map_path is not None and page.tribe_map_id is None
+        assert page.tribe.maps.items(map_id) == before  # The tribe map as it was
+    finally:
+        page.shutdown()
+
+
+def test_monitor_and_watch_are_remembered_as_soon_as_they_are_ticked(app, tmp_path, monkeypatch):
+    from PyQt5.QtCore import QSettings
+    network = build_network()
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat)
+    pages = []
+
+    def page_with_settings():
+        page = make_tab(network, tmp_path, monkeypatch)
+        page.window.settings = settings
+        page.monitor.pinger = lambda address: True
+        pages.append(page)
+        return page
+
+    try:
+        page = page_with_settings()
+        page.on_crawled(crawl(network))
+        page.monitor_check.setChecked(True)
+        page.watch_check.setChecked(True)
+        # Noted straight away: NOMAD closed by Windows restarting has them on again when it starts
+        assert settings.value("netmap/monitor", False, bool) and settings.value("netmap/watch", False, bool)
+        page.shutdown()
+        again = page_with_settings()
+        again.restore_settings(settings)
+        assert again.monitor_check.isChecked() and again.watch_check.isChecked()
+        assert again.monitor.running and again.watcher.running
+        assert settings.value("netmap/watch", False, bool)  # Turning them back on didn't forget either
+        again.watch_check.setChecked(False)
+        assert not settings.value("netmap/watch", True, bool) and settings.value("netmap/monitor", False, bool)
+        again.watch_check.setChecked(True)
+        again.shutdown()
+
+        # The map open last time isn't there this time: they stay off, but are still on for when it is
+        settings.setValue("netmap/last_map", str(tmp_path / "away.nomadmap"))
+        missing = page_with_settings()
+        missing.restore_settings(settings)
+        assert not missing.monitor_check.isChecked() and not missing.watch_check.isChecked()
+        missing.save_settings(settings)
+        assert settings.value("netmap/monitor", False, bool) and settings.value("netmap/watch", False, bool)
+    finally:
+        for page in pages:
+            page.shutdown()
+
+
+def test_a_page_freed_after_watching_a_tribe_map_leaves_nothing_to_crash_qt(app, server, tmp_path, monkeypatch):
+    # Watching a tribe map claims the watching, and stopping gives it up, each on a thread. Their finished signals,
+    # still waiting to be delivered when the page (and so the threads) was freed, used to crash Qt once delivered:
+    # they went to lambdas
+    import gc
+    network = build_network()
+    gc.disable()  # So the page and everything in it are freed together, by the collection below
+    try:
+        page = make_tab(network, tmp_path, monkeypatch, tribe_for(server, tmp_path, "alice"))
+        page.on_crawled(crawl(network))
+        monkeypatch.setattr(QInputDialog, "getText", lambda *args, **kwargs: ("HQ", True))
+        page.share_with_tribe()
+        page.watch_check.setChecked(True)
+        assert wait_for(app, lambda: page.watcher.active and page.watcher.lease_thread is None)
+        page.watcher.lease_checked = 0
+        page.watcher.tick()  # Claimed again, as every so often
+        page.watch_check.setChecked(False)  # And given up
+        assert page.watcher.lease_thread is not None and page.watcher.releasing
+        page.shutdown()
+        del page
+        gc.collect()
+        app.processEvents()  # What the threads said as they finished: dropped with the page, not delivered
+    finally:
+        gc.enable()
