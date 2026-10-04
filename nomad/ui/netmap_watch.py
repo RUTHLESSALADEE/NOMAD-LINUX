@@ -178,6 +178,7 @@ class MapWatcher(QObject):
         self.queue = triggers.TriggerQueue()
         self.to_refresh = {}  # Address -> reasons, waiting for the reading going on to finish
         self.signature_thread = self.refresh_thread = self.lease_thread = self.recheck_thread = None
+        self.releasing = []  # Threads giving up the watching of a tribe map (stopping, or another map opened)
         self.recheck_again = False  # The credentials changed while devices were being asked: ask again after
         self.trap_receiver = None
         self.listening = []  # What's being listened on, for the tab
@@ -343,9 +344,11 @@ class MapWatcher(QObject):
             if thread is not None:
                 thread.stop()
         if self.page.tribe_map_id is not None and self.page.tribe.maps is not None and not self.standing_by:
-            self.lease_thread = LeaseThread(self.page.tribe.maps, self.page.tribe_map_id, self.holder, release=True)
-            self.lease_thread.finished.connect(lambda: setattr(self, "lease_thread", None))
-            self.lease_thread.start()
+            # Owned by the watcher, as its other threads are, and waited for on shutdown
+            thread = LeaseThread(self.page.tribe.maps, self.page.tribe_map_id, self.holder, release=True, parent=self)
+            self.releasing.append(thread)
+            thread.finished.connect(self.on_release_finished)
+            thread.start()
         self.standing_by = ""
         self.to_refresh = {}
         if not quiet:
@@ -397,13 +400,24 @@ class MapWatcher(QObject):
 
     def claim(self):
         maps = self.page.tribe.maps
-        if maps is None or self.lease_thread is not None:
+        if maps is None or self.lease_thread is not None or self.releasing:  # Claimed once the last one's let go
             return
         self.lease_checked = time.time()
         self.lease_thread = LeaseThread(maps, self.page.tribe_map_id, self.holder, parent=self)
         self.lease_thread.done.connect(self.on_lease)
-        self.lease_thread.finished.connect(lambda: setattr(self, "lease_thread", None))
+        self.lease_thread.finished.connect(self.on_claim_finished)
         self.lease_thread.start()
+
+    # Threads' signals go to methods, never lambdas: a lambda's signal still waiting to be delivered when the watcher
+    # (and so its threads) is freed crashes Qt, where a method's is dropped
+
+    def on_claim_finished(self):
+        if self.lease_thread is self.sender():
+            self.lease_thread = None
+
+    def on_release_finished(self):
+        if self.sender() in self.releasing:
+            self.releasing.remove(self.sender())
 
     def on_lease(self, map_id, lease):
         if not self.running or map_id != self.page.tribe_map_id:
@@ -599,10 +613,13 @@ class MapWatcher(QObject):
         self.refresh_thread = RefreshThread(self.page.network_map, self.page.watch_options(), seeds, self.crawl,
                                             self)
         self.refresh_thread.done.connect(self.on_refreshed)
-        self.refresh_thread.failed.connect(lambda message: self.log(f"Reading the switches failed: {message}"))
+        self.refresh_thread.failed.connect(self.on_refresh_failed)
         self.refresh_thread.finished.connect(self.on_refresh_thread_finished)
         self.refresh_thread.start()
         self.update_summary()
+
+    def on_refresh_failed(self, message):
+        self.log(f"Reading the switches failed: {message}")
 
     def on_refresh_thread_finished(self):
         self.refresh_thread = None
@@ -625,7 +642,8 @@ class MapWatcher(QObject):
 
     def shutdown(self):
         self.stop(quiet=True)
-        for thread in (self.signature_thread, self.refresh_thread, self.lease_thread, self.recheck_thread):
+        for thread in [self.signature_thread, self.refresh_thread, self.lease_thread, self.recheck_thread] \
+                + self.releasing:
             if thread is not None:
                 if hasattr(thread, "stop"):
                     thread.stop()

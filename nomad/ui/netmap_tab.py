@@ -10,7 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QSettings, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import QAbstractItemView, QActionGroup, QApplication, QCheckBox, QComboBox, QDialog, \
     QFileDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QShortcut, \
@@ -21,14 +21,15 @@ from ..ipam.store import IpamError
 from ..netmap import diff, export, l3, monitor, shared, store, watch
 from ..netmap.crawl import MAX_WORKERS, WORKERS, CrawlSettings, Crawler, check_device, communities_for, \
     credentials_from_json, credentials_to_json, ordered_credentials, parse_overrides
-from ..netmap.layout import BOTTOM, CENTER, HORIZONTAL, LEFT, MIDDLE, RIGHT, STYLE_NAMES, TOP, TOP_DOWN, VERTICAL, \
-    align, arrange, arrange_boxes_in_place, arrange_in_place, distribute, merge_positions
+from ..netmap.layout import BOTTOM, CENTER, GROUP_PAD, GROUP_TITLE, HORIZONTAL, LEFT, MIDDLE, \
+    NORMAL, RESPACE_MIN_GAP, RIGHT, SPACING_NAMES, SPACINGS, STYLE_NAMES, TOP, TOP_DOWN, VERTICAL, align, arrange, \
+    arrange_boxes_in_place, arrange_in_place, distribute, merge_positions, nearest_spacing, respace, spacing_of
 from ..netmap.model import BUILDING, CORRECTED_NAMES, FIREWALL, GROUP_KINDS, KIND_NAMES, NO_SNMP, PARENT_KIND, \
     ROUTER, SNMP, SWITCH, UNCHECKED, UNREACHABLE, Group, NetworkMap, display_name, port_key, short_port
 from ..snmp import V2C
 from ..snmpv3 import is_v3
 from ..terminal.credentials import CredentialError, protect, unprotect
-from .common import SortableTableItem, StoppableThread, read_only_table, set_hint
+from .common import OneLineLabel, SortableTableItem, StoppableThread, read_only_table, set_hint
 from .host_menu import HostActions
 from .netmap_monitor import NetworkMonitor
 from .netmap_progress import CrawlProgress
@@ -141,6 +142,8 @@ class NetworkMapTab(QWidget):
         self.l3_nodes = {}
         self.l3_links = []
         self.arrange_style = TOP_DOWN
+        self.arrange_spacing = NORMAL  # How far apart Re-arrange puts things
+        self.last_arranged = None  # ((view, keys, group keys), style, spacing) of the last Arrange Selected
         self.keep_groups = True  # Re-arrange lays out each site, building and room in its own box
         self.compare_dialog = None
         self.extending = False  # The crawl running adds to the map open (Crawl from Here)
@@ -150,6 +153,8 @@ class NetworkMapTab(QWidget):
         self.crawl_progress = CrawlProgress(self)
         self.monitor = NetworkMonitor(self)
         self.tribe_map_id = None  # The tribe map open (None: a map file, or none)
+        self.unopened = ""  # The map open last time, when it couldn't be reopened: still the one to try next time
+        self.restoring_switches = False  # Turning Monitor and Watch back on as they were: nothing new to note
         self.tribe_seen = None  # Its items as last loaded or saved here: saves send only what changed from them
         self.tribe = TribeSync(self, key_loader=self.tribe_key)
         self.watcher = MapWatcher(self)
@@ -180,7 +185,6 @@ class NetworkMapTab(QWidget):
 
     def init_ui(self):
         layout = QVBoxLayout(self)
-        crawl_row = QHBoxLayout()
         self.seeds_input = QLineEdit()
         self.seeds_input.setPlaceholderText("Core switch or gateway to start from (IP addresses, separated by commas)")
         self.gateway_button = QPushButton("Adapter's Gateway")
@@ -193,19 +197,21 @@ class NetworkMapTab(QWidget):
         self.start_button = accent_button("Start")
         self.start_button.setToolTip("Read each device's CDP/LLDP neighbors over SNMP, then theirs, and so on.")
         self.stop_button = QPushButton("Stop")
+        self.crawl_row = QWidget()  # Where to start from, Start and Stop
+        crawl_row = QHBoxLayout(self.crawl_row)
+        crawl_row.setContentsMargins(0, 0, 0, 0)
         crawl_row.addWidget(QLabel("Start from:"))
         crawl_row.addWidget(self.seeds_input, 1)
         for widget in (self.gateway_button, self.communities_button, self.scope_button, self.start_button,
                        self.stop_button):
             crawl_row.addWidget(widget)
-        layout.addLayout(crawl_row)
 
-        self.status_label = QLabel()
-        self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
-        layout.addWidget(self.crawl_progress.row)
+        self.status_label = OneLineLabel(wraps=True)
 
-        tools = QHBoxLayout()
+        self.new_button = QPushButton("New Map")
+        self.new_button.setToolTip("Put the map away and start a new one: enter where to start from and press "
+                                   "Start. The map that was open is left as it is (open it again from Recent, or "
+                                   "Tribe).")
         self.open_button = QPushButton("Open...")
         self.recent_button = QToolButton()
         self.recent_button.setText("Recent")
@@ -217,15 +223,15 @@ class NetworkMapTab(QWidget):
         self.export_button = QToolButton()
         self.export_button.setText("Export")
         self.export_button.setPopupMode(QToolButton.InstantPopup)
-        export_menu = QMenu(self.export_button)
-        export_menu.addAction("Picture (PNG)...", self.export_png)
-        export_menu.addAction("Drawing (SVG)...", self.export_svg)
-        export_menu.addAction("draw.io / Visio (.drawio)...", self.export_drawio)
-        export_menu.addSeparator()
-        export_menu.addAction("Devices (CSV)...", lambda: self.export_csv("devices"))
-        export_menu.addAction("Links (CSV)...", lambda: self.export_csv("links"))
-        export_menu.addAction("Hosts (CSV)...", lambda: self.export_csv("hosts"))
-        self.export_button.setMenu(export_menu)
+        self.export_menu = QMenu(self.export_button)
+        self.export_menu.addAction("Picture (PNG)...", self.export_png)
+        self.export_menu.addAction("Drawing (SVG)...", self.export_svg)
+        self.export_menu.addAction("draw.io / Visio (.drawio)...", self.export_drawio)
+        self.export_menu.addSeparator()
+        self.export_menu.addAction("Devices (CSV)...", lambda: self.export_csv("devices"))
+        self.export_menu.addAction("Links (CSV)...", lambda: self.export_csv("links"))
+        self.export_menu.addAction("Hosts (CSV)...", lambda: self.export_csv("hosts"))
+        self.export_button.setMenu(self.export_menu)
         self.compare_button = QToolButton()
         self.compare_button.setText("Compare")
         self.compare_button.setToolTip("Compare this map with an earlier one: devices and links that appeared or "
@@ -243,9 +249,9 @@ class NetworkMapTab(QWidget):
         self.arrange_button.setText("Re-arrange")
         self.arrange_button.setPopupMode(QToolButton.MenuButtonPopup)
         self.arrange_button.setToolTip("Lay the map out again, forgetting where devices were dragged to. The arrow "
-                                       "chooses how (top to bottom, left to right, a grid or a circle, with each "
-                                       "site, building and room in its own box), and arranges or lines up just the "
-                                       "devices selected.")
+                                       "chooses how (top to bottom, bottom to top, left to right, right to left, a "
+                                       "grid or a circle, with each site, building and room in its own box) and how "
+                                       "far apart, and arranges or lines up just the devices selected.")
         self.arrange_menu = QMenu(self.arrange_button)
         self.arrange_menu.aboutToShow.connect(self.fill_arrange_menu)
         self.arrange_button.setMenu(self.arrange_menu)
@@ -257,10 +263,6 @@ class NetworkMapTab(QWidget):
         self.tribe_menu = QMenu(self.tribe_button)
         self.tribe_menu.aboutToShow.connect(self.fill_tribe_menu)
         self.tribe_button.setMenu(self.tribe_menu)
-        for widget in (self.open_button, self.recent_button, self.save_button, self.export_button,
-                       self.compare_button, self.tribe_button):
-            tools.addWidget(widget)
-        tools.addSpacing(16)
         self.monitor_check = QCheckBox("Monitor")
         self.monitor_check.setToolTip("Ping the devices on the map every so often, show which are up or down, and "
                                       "log when one goes down or comes back (on the Monitor tab). Keeps going on "
@@ -270,36 +272,48 @@ class NetworkMapTab(QWidget):
             self.interval_combo.addItem(f"every {monitor.duration_text(seconds)}", seconds)
         self.interval_combo.setCurrentIndex(monitor.INTERVALS.index(monitor.DEFAULT_INTERVAL))
         self.interval_combo.setToolTip("How often to ping each device.")
-        self.monitor_label = QLabel()
-        tools.addWidget(self.monitor_check)
-        tools.addWidget(self.interval_combo)
-        tools.addWidget(self.monitor_label)
+        self.monitor_label = OneLineLabel()
+        self.monitor_label.hide()  # Until there's something to say
         self.watch_check = QCheckBox("Watch")
         self.watch_check.setToolTip("Watch for devices and hosts plugged into the network, and add them to the map "
                                     "as they appear, tagged NEW (see the Watch tab). Keeps going on other pages "
                                     "while NOMAD is open.")
-        self.watch_label = QLabel()
-        tools.addWidget(self.watch_check)
-        tools.addWidget(self.watch_label)
-        tools.addSpacing(16)
-        tools.addWidget(self.find_input, 1)
+        self.watch_label = OneLineLabel()
+        self.watch_label.hide()
+        self.status_slack = QWidget()  # What the news leave of their room on the compact bar (fit_statuses)
+        self.status_slack.setFixedWidth(0)
         self.hosts_check = QCheckBox("Show Hosts")
         self.hosts_check.setToolTip("Show every switch's hosts, a box per port with each host's VLAN. Or double-click "
                                     "one switch to show just its hosts.")
-        tools.addWidget(self.hosts_check)
         self.undo_button = QPushButton("Undo")
         self.undo_button.setToolTip("Put devices back where they were before the last move, re-arrange or "
                                     "alignment, or the last change to the sites, buildings and rooms (Ctrl+Z).")
         self.redo_button = QPushButton("Redo")
         self.redo_button.setToolTip("Do again what Undo undid (Ctrl+Y or Ctrl+Shift+Z).")
-        tools.addWidget(self.undo_button)
-        tools.addWidget(self.redo_button)
-        tools.addWidget(self.fit_button)
-        tools.addWidget(self.arrange_button)
-        layout.addLayout(tools)
+        # The compact bar's: the map file's buttons in one menu, and the crawl row shown when wanted
+        self.map_button = QToolButton()
+        self.map_button.setText("Map")
+        self.map_button.setToolTip("New, Open, Recent, Save As, Export, Compare, and the tribe's maps.")
+        self.map_button.setPopupMode(QToolButton.InstantPopup)
+        self.map_menu = QMenu(self.map_button)
+        self.map_button.setMenu(self.map_menu)
+        self.build_map_menu()
+        self.crawl_button = QToolButton()
+        self.crawl_button.setText("Crawl")
+        self.crawl_button.setCheckable(True)
+        self.crawl_button.setToolTip("Show where to start from, to map again or crawl from another switch (it's "
+                                     "shown anyway while there's no map, or a crawl's running).")
+        self.crawl_button.toggled.connect(lambda _: self.update_crawl_row())
         self.tribe_label = QLabel()
         self.tribe_label.hide()
-        layout.addWidget(self.tribe_label)
+        self.top_bar = QWidget()  # The rows above the map: compact or classic (lay_out_top_bar)
+        self.top_bar_layout = QVBoxLayout(self.top_bar)
+        self.top_bar_layout.setContentsMargins(0, 0, 0, 0)
+        self.spare = QWidget(self)  # Holds the buttons the arrangement showing doesn't use
+        self.spare.hide()
+        self.compact_top = True
+        self.lay_out_top_bar()
+        layout.addWidget(self.top_bar)
 
         self.tabs = QTabWidget()
         self.view = MapView()
@@ -336,6 +350,7 @@ class NetworkMapTab(QWidget):
         self.start_button.clicked.connect(lambda: self.start())
         self.seeds_input.returnPressed.connect(lambda: self.start())
         self.stop_button.clicked.connect(self.stop)
+        self.new_button.clicked.connect(lambda: self.new_map())
         self.open_button.clicked.connect(self.open_map)
         self.save_button.clicked.connect(self.save_map_as)
         self.find_input.returnPressed.connect(self.on_find_return)
@@ -386,6 +401,138 @@ class NetworkMapTab(QWidget):
         self.view.link_context_requested.connect(self.show_link_menu)
         self.view.link_drawn.connect(lambda a, b: self.add_link(a, b))
 
+    def lay_out_top_bar(self):
+        """Put the rows above the map in the compact arrangement (one row of buttons, the map file's in the Map menu;
+        the crawl row only while it's wanted; a one-line status, the whole of it in its tooltip) or the classic one
+        (the crawl row, the status, the map file's buttons with Monitor and Watch, then the find box and the view's
+        tools)."""
+        layout = self.top_bar_layout
+        old = []
+        while layout.count():
+            widget = layout.takeAt(0).widget()
+            if widget is not None and widget.property("tool_row"):
+                old.append(widget)
+        rows = []
+
+        def row(*items):
+            widget = QWidget(self.top_bar)
+            widget.setProperty("tool_row", True)
+            line = QHBoxLayout(widget)
+            line.setContentsMargins(0, 0, 0, 0)
+            for item in items:
+                if item is None:
+                    line.addStretch(1)
+                elif isinstance(item, int):
+                    line.addSpacing(item)
+                else:
+                    line.addWidget(item, 1 if item is self.find_input else 0)
+            rows.append(widget)
+
+        file_buttons = [self.new_button, self.open_button, self.recent_button, self.save_button, self.export_button,
+                        self.compare_button, self.tribe_button]
+        watching = [self.monitor_check, self.interval_combo, self.monitor_label, self.watch_check, self.watch_label]
+        view_tools = [self.hosts_check, self.undo_button, self.redo_button, self.fit_button, self.arrange_button]
+        if self.compact_top:
+            unused = file_buttons
+            row(self.map_button, self.crawl_button, 12, *watching, self.status_slack, 12, self.find_input, *view_tools)
+            rows += [self.crawl_row, self.status_label, self.crawl_progress.row, self.tribe_label]
+        else:
+            unused = [self.map_button, self.crawl_button, self.status_slack]
+            rows += [self.crawl_row, self.status_label, self.crawl_progress.row]
+            row(*file_buttons, 16, *watching, None)
+            row(self.find_input, *view_tools)
+            rows.append(self.tribe_label)
+        for widget in unused:
+            widget.setParent(self.spare)
+        for widget in rows:
+            layout.addWidget(widget)
+        for widget in old:  # Everything in them has moved
+            widget.deleteLater()
+        self.status_label.set_one_line(self.compact_top)
+        self.fit_statuses()
+        self.update_crawl_row()
+
+    def show_summary(self, label, text):
+        """Monitor's or Watch's news, beside its switch (none: hidden)."""
+        label.setText(text)
+        label.setVisible(bool(text))
+        self.fit_statuses()
+
+    def fit_statuses(self):
+        """On the compact bar, Monitor's and Watch's news share a set amount of room (room for "999 up · 99 down" and
+        for "checking · 99 new", for those showing), so the find box keeps its width whatever they say: Monitor's
+        takes what it needs (leaving Watch's at least what it needs, or its own share) and Watch's the rest, so a long
+        one (who's watching a tribe map, say) has the room a short one leaves."""
+        monitor_label, watch_label = self.monitor_label, self.watch_label
+        if not self.compact_top:
+            for label in (monitor_label, watch_label):
+                label.set_one_line(False)
+            return
+        metrics = monitor_label.fontMetrics()
+        share = {monitor_label: metrics.horizontalAdvance("999 up · 99 down") + 8,
+                 watch_label: metrics.horizontalAdvance("checking · 99 new") + 8}
+        shown = [label for label in share if not label.isHidden()]
+        budget = sum(share[label] for label in shown)
+        need = {label: metrics.horizontalAdvance(label.text()) + 8 for label in shown}
+        widths = {}
+        if monitor_label in shown:
+            watch_needs = min(need[watch_label], share[watch_label]) if watch_label in shown else 0
+            widths[monitor_label] = min(need[monitor_label], max(share[monitor_label], budget - watch_needs))
+        if watch_label in shown:
+            widths[watch_label] = budget - widths.get(monitor_label, 0)
+        for label in (monitor_label, watch_label):
+            label.set_one_line(True, widths.get(label) or share[label])
+        self.status_slack.setFixedWidth(budget - sum(widths.values()))  # Only monitoring: what its news don't use
+
+    def set_compact_top(self, compact):
+        self.compact_top = compact
+        self.lay_out_top_bar()
+        self.update_buttons()
+
+    def update_crawl_row(self):
+        """The crawl row: always on the classic bar; on the compact one while there's no map (to start one) or a crawl
+        is running (to stop it), or while Crawl is down."""
+        needed = self.network_map is None or self.worker is not None
+        self.crawl_button.setEnabled(not needed)
+        self.crawl_row.setVisible(not self.compact_top or needed or self.crawl_button.isChecked())
+
+    def build_map_menu(self):
+        """The compact bar's Map menu: what the classic bar's map file buttons do, each as enabled as its button."""
+        menu = self.map_menu
+        self.map_entries = []  # (action, the classic bar's button it stands for)
+        self.mirrored = {}  # Submenu -> (the classic bar's button's menu, what fills that, or None)
+        for button, source, fill in ((self.new_button, None, None), (self.open_button, None, None),
+                                     (self.recent_button, self.recent_menu, self.fill_recent_menu),
+                                     (self.save_button, None, None), (self.export_button, self.export_menu, None),
+                                     (self.compare_button, self.compare_menu, self.fill_compare_menu), (None, None, None),
+                                     (self.tribe_button, self.tribe_menu, self.fill_tribe_menu)):
+            if button is None:
+                menu.addSeparator()
+                continue
+            if source is None:
+                action = menu.addAction(button.text(), button.click)
+            else:
+                submenu = menu.addMenu(button.text())
+                self.mirrored[submenu] = source, fill
+                submenu.aboutToShow.connect(self.mirror_menu)  # A method, as a lambda or partial isn't safe here
+                action = submenu.menuAction()
+            self.map_entries.append((action, button))
+        menu.aboutToShow.connect(self.update_map_menu)
+
+    def update_map_menu(self):
+        for action, button in self.map_entries:
+            action.setEnabled(button.isEnabled())
+
+    def mirror_menu(self, submenu=None):
+        """Fill one of the Map menu's submenus (the one about to show, if None) with what the classic bar's button's
+        menu has now."""
+        submenu = submenu or self.sender()
+        source, fill = self.mirrored[submenu]
+        if fill is not None:
+            fill()
+        submenu.clear()
+        submenu.addActions(source.actions())
+
     # ----------------------------------------------------------------- Page interface
 
     def save_settings(self, settings):
@@ -403,11 +550,11 @@ class NetworkMapTab(QWidget):
         settings.setValue("netmap/collect_hosts", self.collect_hosts)
         settings.setValue("netmap/trace", self.trace)
         settings.setValue("netmap/workers", self.workers)
-        settings.setValue("netmap/monitor", self.monitor_check.isChecked())
+        if not self.unopened:  # While the map open last time couldn't be reopened, they're kept for when it is
+            for key, value in self.switches().items():
+                settings.setValue(key, value)
         settings.setValue("netmap/monitor_interval", self.interval_combo.currentData())
-        settings.setValue("netmap/last_map", f"tribe:{self.tribe_map_id}" if self.tribe_map_id is not None
-                          else str(self.map_path) if self.map_path else "")
-        settings.setValue("netmap/watch", self.watch_check.isChecked())
+        settings.setValue("netmap/last_map", self.open_map_value())
         timers = self.watcher.timers.values()
         settings.setValue("netmap/watch_neighbors", timers["neighbor_interval"])
         settings.setValue("netmap/watch_hosts", timers["host_interval"])
@@ -416,7 +563,9 @@ class NetworkMapTab(QWidget):
         settings.setValue("netmap/watch_listen", self.watcher.listen_check.isChecked())
         settings.setValue("netmap/splitter", self.splitter.saveState())
         settings.setValue("netmap/arrange_style", self.arrange_style)
+        settings.setValue("netmap/arrange_spacing", self.arrange_spacing)
         settings.setValue("netmap/keep_groups", self.keep_groups)
+        settings.setValue("netmap/compact_top", self.compact_top)
 
     def restore_settings(self, settings):
         self.seeds_input.setText(settings.value("netmap/seeds", "", str))
@@ -438,34 +587,100 @@ class NetworkMapTab(QWidget):
         self.workers = max(1, min(MAX_WORKERS, settings.value("netmap/workers", WORKERS, int)))
         style = settings.value("netmap/arrange_style", TOP_DOWN, str)
         self.arrange_style = style if style in STYLE_NAMES else TOP_DOWN
+        spacing = settings.value("netmap/arrange_spacing", NORMAL, str)
+        self.arrange_spacing = spacing if spacing in SPACINGS else NORMAL
         self.keep_groups = settings.value("netmap/keep_groups", True, bool)
+        if settings.value("netmap/compact_top", True, bool) != self.compact_top:
+            self.set_compact_top(not self.compact_top)
         splitter = settings.value("netmap/splitter")
         if splitter is not None:
             self.splitter.restoreState(splitter)
-        last = settings.value("netmap/last_map", "", str)
-        if last.startswith("tribe:") and self.tribe.ensure() is not None:
-            try:
-                self.open_tribe_map(int(last[6:]), quiet=True)
-            except ValueError:
-                pass
-        elif last and Path(last).is_file():
-            try:
-                self.show_map(store.load(last), Path(last), fit=True)
-            except (OSError, ValueError) as error:
-                log.warning("Couldn't reopen the last network map %s: %s", last, error)
+        self.reopen(settings.value("netmap/last_map", "", str))
         interval = settings.value("netmap/monitor_interval", monitor.DEFAULT_INTERVAL, int)
         if interval in monitor.INTERVALS:
             self.interval_combo.setCurrentIndex(monitor.INTERVALS.index(interval))
-        if settings.value("netmap/monitor", False, bool) and self.network_map is not None:
-            self.monitor_check.setChecked(True)  # Carry on watching from where it was left
         self.watcher.timers.set_values({name: settings.value(f"netmap/{key}", default, int) for name, key, default in (
             ("neighbor_interval", "watch_neighbors", watch.NEIGHBOR_INTERVAL),
             ("host_interval", "watch_hosts", watch.HOST_INTERVAL),
             ("recheck_interval", "watch_recheck", watch.RECHECK_INTERVAL),
             ("trigger_delay", "watch_trigger_delay", watch.TRIGGER_DELAY))})
         self.watcher.listen_check.setChecked(settings.value("netmap/watch_listen", True, bool))
-        if settings.value("netmap/watch", False, bool) and self.network_map is not None:
-            self.watch_check.setChecked(True)
+        if self.network_map is not None:  # Carry on monitoring and watching from where they were left
+            wanted = {key: settings.value(key, False, bool) for key in self.switches()}
+            self.restoring_switches = True
+            try:
+                self.monitor_check.setChecked(wanted["netmap/monitor"])
+                self.watch_check.setChecked(wanted["netmap/watch"])
+            finally:
+                self.restoring_switches = False
+
+    def reopen(self, last):
+        """Open the map that was open when NOMAD closed (last: as open_map_value gave it). If it can't be, say why,
+        and keep trying it on later starts until another map is opened."""
+        if not last:
+            return
+        problem = ""
+        if last.startswith("tribe:"):
+            try:
+                map_id = int(last[6:])
+            except ValueError:
+                return
+            what = "The tribe map open last time"
+            if self.tribe.ensure() is None:
+                problem = ("this is the tribe server: restart NOMAD as administrator (File > Restart as "
+                           "Administrator) to use its maps"
+                           if is_tribe_server() and getattr(self.window, "admin", False) is not True
+                           else "this computer isn't connected to the tribe")
+            elif not self.open_tribe_map(map_id, quiet=True):
+                info = self.tribe.maps.map_info(map_id)
+                if info is not None and info.get("deleted"):
+                    return  # Deleted for everyone: nothing to come back to
+                problem = "it isn't on this computer yet (it arrives once the tribe server has been reached)"
+        else:
+            what = f"The map open last time ({Path(last).stem})"
+            if not Path(last).is_file():
+                problem = "the file isn't there any more"
+            else:
+                try:
+                    self.show_map(store.load(last), Path(last), fit=True)
+                except (OSError, ValueError) as error:
+                    log.warning("Couldn't reopen the last network map %s: %s", last, error)
+                    problem = f"it couldn't be read ({error})"
+        if problem:
+            self.unopened = last
+            set_hint(self.status_label, f"{what} wasn't opened: {problem}. It's opened next time NOMAD starts, "
+                     "unless another map is opened before then.", "warning")
+
+    def open_map_value(self):
+        """The map open, for the settings: "tribe:<id>" for a tribe map, a file's path, or "" for none (or the one
+        that couldn't be reopened, while no other has been)."""
+        if self.tribe_map_id is not None:
+            return f"tribe:{self.tribe_map_id}"
+        if self.map_path:
+            return str(self.map_path)
+        return self.unopened if self.network_map is None else ""
+
+    def remember_open_map(self):
+        """Note the map open in the settings straight away (not only on closing), so it's the one opened next time
+        even if NOMAD doesn't get to close properly."""
+        value = self.open_map_value()
+        settings = getattr(self.window, "settings", None)
+        if isinstance(settings, QSettings) and value != getattr(self, "remembered", None):
+            self.remembered = value
+            settings.setValue("netmap/last_map", value)
+
+    def switches(self):
+        """Whether Monitor and Watch are on, as saved in the settings."""
+        return {"netmap/monitor": self.monitor_check.isChecked(), "netmap/watch": self.watch_check.isChecked()}
+
+    def remember_switches(self):
+        """Note Monitor and Watch being turned on or off in the settings straight away, so they're on again when
+        NOMAD starts even if it doesn't get to close properly (say, Windows restarting for updates)."""
+        settings = getattr(self.window, "settings", None)
+        if isinstance(settings, QSettings) and not self.restoring_switches:
+            for key, value in self.switches().items():
+                settings.setValue(key, value)
+            settings.sync()
 
     def shutdown(self):
         self.monitor.shutdown()
@@ -559,6 +774,9 @@ class NetworkMapTab(QWidget):
     def start(self, seeds=None, extend=False):
         if self.worker is not None:
             return
+        if not extend and self.tribe_map_id is not None and self.network_map is not None \
+                and not self.confirm_remap_tribe_map():
+            return
         self.extending = extend and self.network_map is not None
         seeds = seeds or parse_seeds(self.seeds_input.text())
         if not seeds:
@@ -571,7 +789,7 @@ class NetworkMapTab(QWidget):
         self.worker = CrawlThread(self.crawl_settings(seeds), self.network_map if self.extending else None, self)
         self.worker.event.connect(self.on_crawl_event)
         self.worker.crawled.connect(self.on_crawled)
-        self.worker.failed.connect(lambda message: set_hint(self.status_label, message, "error"))
+        self.worker.failed.connect(self.on_crawl_failed)
         self.worker.finished.connect(self.on_thread_finished)
         if self.extending:
             set_hint(self.status_label, f"Crawling from {', '.join(seeds)}, adding to this map. Devices already "
@@ -588,7 +806,50 @@ class NetworkMapTab(QWidget):
         self.crawl_progress.start()
         self.window.set_busy("netmap", "Mapping the network")
         self.worker.start()
+        self.crawl_button.setChecked(False)  # The crawl row stays while it runs (for Stop), and goes when it's done
         self.update_buttons()
+
+    def confirm_remap_tribe_map(self):
+        """Start, with a tribe map open: map it again (for everyone), or start a new map and leave it be? Returns
+        whether to go on."""
+        box = QMessageBox(QMessageBox.Question, "Start Mapping",
+                          f"The tribe map {self.map_name()} is open. Start a new map and leave the tribe map as it "
+                          "is, or map the tribe map again (for everyone in the tribe)?", parent=self)
+        new = box.addButton("New Map", QMessageBox.AcceptRole)
+        again = box.addButton("Map the Tribe Map Again", QMessageBox.DestructiveRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(new)
+        box.exec_()
+        if box.clickedButton() is new:
+            self.new_map(quiet=True)
+            return True
+        return box.clickedButton() is again
+
+    def new_map(self, quiet=False):
+        """Put the map open away (saved, and left as it is) and have none open: Start then makes a new one."""
+        if self.worker is not None:
+            return
+        self.flush_save()
+        for check in (self.watch_check, self.monitor_check):  # Watching lets go of the tribe map before it's closed
+            check.setChecked(False)
+        self.tribe_map_id, self.tribe_seen = None, None
+        self.network_map, self.map_path, self.history_map, self.unopened = None, None, None, ""
+        self.watched_identity = None
+        self.undo_stack, self.redo_stack, self.layout_now = [], [], None
+        self.view.clear_map()
+        self.l3_view.clear_map()
+        self.l3_nodes, self.l3_links = {}, []
+        for table in self.table_names:
+            table.setRowCount(0)
+        self.monitor.set_map(NetworkMap())
+        self.monitor.load_history([])
+        self.show_details(None)
+        self.update_tribe_label()
+        self.update_watch_label()
+        self.update_buttons()
+        if not quiet:
+            set_hint(self.status_label, "New map: enter the switch or router to start from and press Start. The map "
+                     "that was open is as it was: open it again from Recent, or Tribe.", "info")
 
     def crawl_settings(self, seeds):
         devices = self.network_map.devices.values() if self.network_map else []
@@ -614,8 +875,7 @@ class NetworkMapTab(QWidget):
             if self.network_map is not None:
                 self.show_map(self.network_map, self.map_path)
             else:
-                self.view.scene().clear()
-                self.view.items_by_key = {}
+                self.view.clear_map()
         self.window.clear_busy("netmap")
         self.record_layout()  # Where Undo starts from on the map crawled
         self.update_buttons()
@@ -792,6 +1052,8 @@ class NetworkMapTab(QWidget):
             self.l3_view.request_fit()
         self.record_layout()  # Re-arranged: Undo puts it back
         self.update_buttons()
+        self.unopened = ""
+        self.remember_open_map()
 
     def current_view(self):
         """The drawing showing (or the physical one while a table is)."""
@@ -817,13 +1079,15 @@ class NetworkMapTab(QWidget):
         """What arranging these devices (or the logical view's nodes) needs besides the style."""
         if view is self.l3_view:
             return {"edges": [(link.a, link.b) for link in self.l3_links],
-                    "weight": lambda key: 1 if self.l3_nodes[key].kind == l3.DEVICE else 0}
+                    "weight": lambda key: 1 if self.l3_nodes[key].kind == l3.DEVICE else 0,
+                    "spacing": SPACINGS[self.arrange_spacing]}
         network_map = self.network_map
         options = {"edges": [(link.a, link.b) for link in network_map.links], "root": network_map.root or None,
                    "weight": lambda key: KIND_WEIGHTS.get(network_map.devices[key].kind, 0)}
         if self.keep_groups and network_map.groups:
             options["path_of"] = {key: [group.key for group in network_map.group_path(key)] for key in keys}
             options["order"] = lambda group_key: network_map.group(group_key).name.lower()
+        options["spacing"] = SPACINGS[self.arrange_spacing]
         return options
 
     def fill_arrange_menu(self):
@@ -836,37 +1100,90 @@ class NetworkMapTab(QWidget):
             action.setChecked(style == self.arrange_style)
             styles.addAction(action)
             action.triggered.connect(lambda _, style=style: self.rearrange(style))
+        view = self.current_view()
+        keys, groups = view.selected_keys(), self.selected_groups(view)
+        count = len(view.boxes(keys, groups))
+        if count > 1 and self.worker is None:  # Spacing what's selected, as Arrange Selected arranges just it
+            self.add_spacing_menu(menu, f"Spacing of the {count} {self.selection_name(count, groups)}",
+                                  self.measured_spacing(view, keys, groups),
+                                  lambda key: self.space_out(view, keys, groups, key))
+        else:
+            self.add_spacing_menu(menu, "Spacing", self.arrange_spacing, self.set_spacing).setEnabled(self.network_map is not None and self.worker is None)
         menu.addSeparator()
         keep = menu.addAction("Keep Groups Together")
         keep.setCheckable(True)
         keep.setChecked(self.keep_groups)
         keep.toggled.connect(self.set_keep_groups)
         menu.addSeparator()
-        view = self.current_view()
-        self.add_selection_actions(menu, view, view.selected_keys(), always=True)
+        self.add_selection_actions(menu, view, keys, always=True, spacing=False)
         if self.network_map is not None and self.network_map.groups and view is self.view:
             menu.addSeparator()
             menu.addAction("Collapse All Groups", lambda: self.view.set_all_collapsed(True))
             menu.addAction("Expand All Groups", lambda: self.view.set_all_collapsed(False))
+
+    def set_spacing(self, key):
+        """Space the view showing out this far (keeping it as it's arranged), and re-arrange this far from now on."""
+        self.arrange_spacing = key
+        if self.network_map is None or self.worker is not None:
+            return
+        view = self.current_view()
+        self.space_out(view, list(view.positions()), (), key)
+        view.fit()
+
+    def space_out(self, view, keys, groups=(), spacing=NORMAL):
+        """Stretch or shrink the gaps between these devices (and with groups, those groups' boxes, each with everything
+        in it) to spacing, keeping them as they're arranged: each stays where it is among the rest."""
+        boxes = view.boxes(keys, groups)
+        if len(boxes) < 2:
+            return
+        centers = {key: (x, y) for key, (x, y, _, _) in boxes.items()}
+        sizes = {key: (width, height) for key, (_, _, width, height) in boxes.items()}
+        view.move_boxes(respace(centers, SPACINGS[spacing], sizes, self.closest_gap(view)))
+        # Arranging these again keeps the spacing (and the style they were last arranged in)
+        self.last_arranged = ((view, frozenset(keys), frozenset(groups)),
+                              self.selection_arrangement(view, keys, groups)[0], spacing)
+
+    def closest_gap(self, view):
+        """How close spacing out may bring two devices that were apart: further for two in different sites, buildings
+        or rooms, so the boxes drawn round them don't run into each other."""
+        group_of = self.network_map.group_of if self.network_map is not None and view is self.view else {}
+
+        def gap(a, b):
+            return RESPACE_MIN_GAP + (0 if group_of.get(a) == group_of.get(b) else 2 * GROUP_PAD + GROUP_TITLE)
+
+        return gap
+
+    def measured_spacing(self, view, keys, groups=()):
+        """The spacing (key) these are spaced out at now, if they're near enough one: the one to mark in a menu."""
+        boxes = view.boxes(keys, groups)
+        return nearest_spacing(spacing_of({key: (x, y) for key, (x, y, _, _) in boxes.items()},
+                                          {key: (width, height) for key, (_, _, width, height) in boxes.items()}))
 
     def set_keep_groups(self, on):
         self.keep_groups = on
         set_hint(self.status_label, "Re-arrange lays out each site, building and room in its own box." if on else
                  "Re-arrange lays out the devices without regard to their groups.", "info")
 
-    def add_selection_actions(self, menu, view, keys, always=False, groups=None):
-        """Arrange Selected and Align (with Distribute) for the devices and groups (sites, buildings and rooms)
-        selected on a map. groups: their keys (those selected, if None). always: show them (disabled) when fewer
-        than two are selected."""
+    def add_selection_actions(self, menu, view, keys, always=False, groups=None, spacing=True):
+        """Arrange Selected, Spacing (unless not spacing) and Align (with Distribute) for the devices and groups
+        (sites, buildings and rooms) selected on a map. groups: their keys (those selected, if None). always: show them
+        (disabled) when fewer than two are selected."""
         groups = self.selected_groups(view) if groups is None else groups
         count = len(view.boxes(keys, groups))
         if count < 2 and not always:
             return
         enabled = count > 1 and self.worker is None
-        what = "Selected" if not groups else "Selected Groups" if count == len(groups) else "Selected Items"
+        what = self.selection_name(count, groups)
+        style = self.selection_arrangement(view, keys, groups)[0]
         arranged = self.add_style_menu(menu, f"Arrange the {count} {what}" if count > 1 else "Arrange Selected",
-                                       lambda style: self.arrange_selected(view, keys, groups, style))
+                                       lambda style: self.arrange_selected(view, keys, groups, style), style)
         arranged.setEnabled(enabled)
+        if spacing:
+            spaced = self.add_spacing_menu(menu, f"Spacing of the {count} {what}" if count > 1 else
+                                           "Spacing of the Selected",
+                                           self.measured_spacing(view, keys, groups) if count > 1 else None,
+                                           lambda key: self.space_out(view, keys, groups, key))
+            spaced.setEnabled(enabled)
         lining = menu.addMenu("Align")
         lining.setEnabled(enabled)
         for entry in ALIGNMENTS + [None, ("Distribute Horizontally", HORIZONTAL), ("Distribute Vertically", VERTICAL)]:
@@ -876,32 +1193,59 @@ class NetworkMapTab(QWidget):
                 lining.addAction(entry[0]).triggered.connect(
                     lambda _, how=entry[1]: self.align_selected(view, keys, how, groups))
 
-    def add_style_menu(self, menu, title, chosen):
-        """A submenu of the arrangements, calling chosen(style); the one Re-arrange uses is marked."""
+    @staticmethod
+    def selection_name(count, groups):
+        return "Selected" if not groups else "Selected Groups" if count == len(groups) else "Selected Items"
+
+    def add_style_menu(self, menu, title, chosen, current=None):
+        """A submenu of the arrangements, calling chosen(style); current (or the one Re-arrange uses) is marked."""
         submenu = menu.addMenu(title)
         for style, name in STYLE_NAMES.items():
             action = submenu.addAction(name)
             action.setCheckable(True)
-            action.setChecked(style == self.arrange_style)
+            action.setChecked(style == (current or self.arrange_style))
             action.triggered.connect(lambda _, style=style: chosen(style))
         return submenu
+
+    def add_spacing_menu(self, menu, title, current, chosen):
+        """A submenu of the spacings (how far apart things are spaced out), calling chosen(key); current (how far
+        apart they are now, if it's near enough one) is marked."""
+        submenu = menu.addMenu(title)
+        for key, name in SPACING_NAMES.items():
+            action = submenu.addAction(name)
+            action.setCheckable(True)
+            action.setChecked(key == current)
+            action.triggered.connect(lambda _, key=key: chosen(key))
+        return submenu
+
+    def selection_arrangement(self, view, keys, groups=()):
+        """(style, spacing) these were last arranged in (so changing one keeps the other), or else Re-arrange's."""
+        if self.last_arranged is not None and self.last_arranged[0] == (view, frozenset(keys), frozenset(groups)):
+            return self.last_arranged[1:]
+        return self.arrange_style, self.arrange_spacing
 
     def selected_groups(self, view):
         return view.selected_groups() if view is self.view else []
 
-    def arrange_selected(self, view, keys, groups=(), style=None):
-        """Lay out just these devices, where they are, in style (Re-arrange's, if None); with groups, those groups'
-        boxes (each with everything in it) and the devices not in them."""
-        style = style or self.arrange_style
+    def arrange_selected(self, view, keys, groups=(), style=None, spacing=None):
+        """Lay out just these devices, where they are, in style and spacing (if None, those they were last arranged
+        in, or Re-arrange's); with groups, those groups' boxes (each with everything in it) and the devices not in
+        them."""
+        last_style, last_spacing = self.selection_arrangement(view, keys, groups)
+        style, spacing = style or last_style, spacing or last_spacing
+        self.last_arranged = ((view, frozenset(keys), frozenset(groups)), style, spacing)
         if groups:
             boxes = view.boxes(keys, groups)
             weight = self.arrange_options(view, [])["weight"]
             view.move_boxes(arrange_boxes_in_place(boxes, view.box_links(boxes), style=style,
-                                                   weight=lambda key: 0 if key.startswith(GROUP_BOX) else weight(key)))
+                                                   weight=lambda key: 0 if key.startswith(GROUP_BOX) else weight(key),
+                                                   spacing=SPACINGS[spacing]))
             return
         where = view.positions()
         positions = {key: where[key] for key in keys if key in where}
-        view.move_to(arrange_in_place(positions, style=style, **self.arrange_options(view, keys)))
+        options = self.arrange_options(view, keys)
+        options["spacing"] = SPACINGS[spacing]
+        view.move_to(arrange_in_place(positions, style=style, **options))
 
     def align_selected(self, view, keys, how, groups=()):
         """Line up devices (and with groups, those groups' boxes and the devices not in them) by their edges or
@@ -1607,14 +1951,21 @@ class NetworkMapTab(QWidget):
         thread = CheckThread(self.crawl_settings([address for _, address in targets]), targets, self.check_device,
                              self)
         thread.checked.connect(self.on_checked)
-        thread.finished.connect(lambda: self.on_check_finished(thread, targets))
+        thread.finished.connect(self.on_check_finished)
         self.check_threads.append(thread)
         thread.start()
 
-    def on_check_finished(self, thread, targets):
+    # Threads' signals go to methods, never lambdas: a lambda's signal still waiting to be delivered when the page
+    # (and so its threads) is freed crashes Qt, where a method's is dropped
+
+    def on_crawl_failed(self, message):
+        set_hint(self.status_label, message, "error")
+
+    def on_check_finished(self):
+        thread = self.sender()
         if thread in self.check_threads:
             self.check_threads.remove(thread)
-        for key, _ in targets:  # Any that failed (or were stopped) without an answer
+        for key, _ in thread.targets:  # Any that failed (or were stopped) without an answer
             self.checking.discard(key)
             self.announce.discard(key)
 
@@ -1691,7 +2042,11 @@ class NetworkMapTab(QWidget):
             lambda: self.view.set_collapsed(item, not group.collapsed)
         actions[menu.addAction("Select Its Devices")] = lambda: self.select_group_devices(key)
         if self.worker is None:
-            self.add_style_menu(menu, f"Arrange This {kind}", lambda style: self.arrange_group(key, style))
+            members = network_map.members(key)
+            style = self.selection_arrangement(self.view, members)[0]
+            self.add_style_menu(menu, f"Arrange This {kind}", lambda style: self.arrange_group(key, style), style)
+            self.add_spacing_menu(menu, f"Spacing of This {kind}", self.measured_spacing(self.view, members),
+                                  lambda spacing: self.space_group(key, spacing))
             self.add_selection_actions(menu, self.view, self.view.selected_keys())  # With others selected
             menu.addSeparator()
             actions[menu.addAction("Rename...")] = lambda: self.rename_group(key)
@@ -1792,6 +2147,15 @@ class NetworkMapTab(QWidget):
             self.view.set_collapsed(item, False)
         self.arrange_selected(self.view, self.network_map.members(key), style=style)
 
+    def space_group(self, key, spacing):
+        """Space a group's devices out, keeping them as they're arranged."""
+        item = self.view.group_items.get(key)
+        if item is None:
+            return
+        if item.group.collapsed:
+            self.view.set_collapsed(item, False)
+        self.space_out(self.view, self.network_map.members(key), (), spacing)
+
     def groups_edited(self, message=None):
         """Redraw the groups after they changed, keeping the view where it was, and save."""
         network_map = self.network_map
@@ -1873,6 +2237,7 @@ class NetworkMapTab(QWidget):
             self.monitor.start(self.interval_combo.currentData())
         else:
             self.monitor.stop()
+        self.remember_switches()
         self.show_statuses()
 
     def show_statuses(self):
@@ -1880,7 +2245,7 @@ class NetworkMapTab(QWidget):
         for view in (self.view, self.l3_view):
             view.set_statuses(self.monitor.status)
         summary = self.monitor.summary()
-        self.monitor_label.setText(summary)
+        self.show_summary(self.monitor_label, summary)
         self.monitor_label.setStyleSheet(f"color: {COLORS['error' if ' down' in summary else 'success']};")
         if self.network_map is not None:
             column = export.DEVICE_COLUMNS.index("Status")
@@ -1962,11 +2327,12 @@ class NetworkMapTab(QWidget):
             self.watcher.start()
         else:
             self.watcher.stop()
+        self.remember_switches()
         self.update_watch_label()
 
     def update_watch_label(self):
         summary = self.watcher.summary()
-        self.watch_label.setText(summary)
+        self.show_summary(self.watch_label, summary)
         new = self.network_map is not None and bool(self.network_map.news)
         self.watch_label.setStyleSheet(f"color: {COLORS['success' if new else 'muted']};")
 
@@ -2138,14 +2504,15 @@ class NetworkMapTab(QWidget):
             self.save_positions()
 
     def open_tribe_map(self, map_id, quiet=False):
+        """Open a tribe map. Returns whether it was."""
         maps = self.tribe.ensure()
         if maps is None or self.worker is not None:
-            return
+            return False
         info = maps.map_info(map_id)
         if info is None or info.get("deleted"):
             if not quiet:
                 QMessageBox.warning(self, "Open Tribe Map", "That map isn't shared with the tribe any more.")
-            return
+            return False
         self.flush_save()
         network_map, settings, seen = maps.snapshot(map_id)
         secrets = maps.secrets(map_id)
@@ -2161,6 +2528,7 @@ class NetworkMapTab(QWidget):
         if not quiet:
             set_hint(self.status_label, f"Opened the tribe map {info['name']}. Changes made here reach everyone "
                      "with the tribe key (and are sent later if the server can't be reached now).", "info")
+        return True
 
     def share_with_tribe(self):
         maps = self.tribe.ensure()
@@ -2231,6 +2599,7 @@ class NetworkMapTab(QWidget):
         self.leave_tribe_map("Deleted the tribe map. This computer keeps a copy as a file.")
 
     def update_tribe_label(self):
+        self.remember_open_map()  # Called whenever a tribe map is opened, shared or left
         text = self.tribe.status_text(self.tribe_map_id)
         self.tribe_label.setText(text)
         self.tribe_label.setVisible(bool(text))
@@ -2331,6 +2700,7 @@ class NetworkMapTab(QWidget):
                      "success")
             return
         self.map_path = saved
+        self.remember_open_map()
         set_hint(self.status_label, f"Saved {self.map_path.name}.", "success")
 
     def export_path(self, title, extension, file_filter):
@@ -2392,6 +2762,7 @@ class NetworkMapTab(QWidget):
             widget.setEnabled(has_map and not running)  # Not while the map is being drawn from a crawl
         for widget in (self.open_button, self.recent_button):
             widget.setEnabled(not running)
+        self.new_button.setEnabled(has_map and not running)
         for widget in (self.fit_button, self.hosts_check):
             widget.setEnabled(has_map or running)
         self.update_undo_buttons()
@@ -2399,6 +2770,7 @@ class NetworkMapTab(QWidget):
         self.watch_check.setEnabled(has_map or self.watch_check.isChecked())
         here = self.tabs.currentWidget()
         self.find_input.setEnabled(has_map or running or here is self.crawl_progress.tab)
+        self.update_crawl_row()
 
 
 def fill_table(table, rows, ip_columns=(), keys=None):

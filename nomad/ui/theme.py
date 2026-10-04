@@ -26,6 +26,7 @@ COLORS = {
     "link": "#58a6ff",
     "warning_background": "#3a3020",
     "success_background": "#17372a",
+    "selection": "#ffffff",  # What's selected on the network map: unlike any status or device colour there
 }
 
 STYLESHEET = """

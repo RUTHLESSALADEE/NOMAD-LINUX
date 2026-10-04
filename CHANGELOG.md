@@ -6,6 +6,29 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.15.0] - 2026-10-03
+
+### Added
+
+- Network Map: **Bottom to Top** and **Right to Left** arrangements, for Re-arrange, arranging the devices selected and arranging a site, building or room.
+- Network Map: **Spacing** (Compact, Normal, Roomy or Spacious) draws devices closer together or spreads them out, leaving each where it is among the rest (nothing is laid out again). It's on Re-arrange's arrow for the whole map (and Re-arrange uses it from then on), for the devices or groups selected (**Spacing of the 5 Selected**, on the right-click menu too, beside Arrange), and on a group's title menu. Shrinking stops before devices meet, and keeps sites, buildings and rooms from running into each other.
+- Network Map: a compact top bar, one row of buttons: **Map** holds New Map, Open, Recent, Save As, Export, Compare and the tribe's maps; **Crawl** shows where to start from (shown anyway while there's no map or a crawl runs); the status keeps to one line (hover over it for all of it). **View > Network Map Top Bar > Classic** puts back the bar as it was.
+- Network Map: **New Map** puts the map open away, as it is, so Start makes a new one; pressing Start with a tribe map open asks whether to start a new map or map the tribe map again for everyone.
+- Network Map: the map open when NOMAD closes (a file or a tribe map) is opened again when it starts; if it can't be, the page says why and tries again next time.
+
+### Changed
+
+- Network Map: Re-arrange orders each layer so links cross as little as it can find, and a link between two devices in the same layer doesn't run over the ones between; single-link devices (access points) go beside a switch that has links down to other devices, on the side away from them, instead of under it where those links ran through them. With Keep Groups Together, the device linking a group to the rest is on top of it, and the groups are laid out as the links between them go rather than tiled.
+- Network Map: what's selected is drawn with a white ring and a light wash, leaving its outline (its type, or up or down while monitored) as it is.
+- Network Map: Monitor's and Watch's news share a set amount of room, so the find box keeps its width whatever they say, and a long one (who's watching a tribe map) uses the room a short one leaves.
+
+### Fixed
+
+- Network Map: Monitor and Watch could be off when NOMAD started again although they were on: they're now saved the moment they're turned on or off (and all settings when Windows logs off or restarts), and kept while the map open last time can't be reopened.
+- Network Map: Watch's news squeezed the find box until it was hardly usable.
+- A crash (the whole program closing) when a page or session was closed while one of its background threads had news still waiting to be delivered: seen with watching a tribe map, and possible on the SCP page and others. Background threads now report to the page itself, which Qt tidies up safely.
+- Network Map: two maps started in the same minute were saved to the same file, the second over the first.
+
 ## [1.14.0] - 2026-10-03
 
 ### Added

@@ -645,3 +645,177 @@ def test_session_hints_for_a_device(tab, crawled):
     assert hints["folder"] == "HQ/Main - North"
     assert hints["name"] and hints["name"] in hints["aliases"]
     assert device.interfaces_l3[0][0] in hints["aliases"]
+
+
+def test_new_map_leaves_the_one_open_as_it_was(tab, crawled):
+    tab.on_crawled(crawled)
+    first = tab.map_path
+    tab.view.items_by_key["core"].setPos(4321, 0)
+    tab.save_timer.start()  # A move waiting to be saved
+    tab.new_map()
+    assert tab.network_map is None and tab.map_path is None and tab.view.items_by_key == {}
+    assert tab.devices_table.rowCount() == 0 and not tab.new_button.isEnabled()
+    assert "New map" in tab.status_label.text()
+    assert store.load(first).positions["core"] == (4321, 0)  # Saved as it was left
+    tab.on_crawled(crawled)  # Mapped again (the same minute): a file of its own
+    assert tab.map_path != first and first.exists()
+    assert store.load(first).positions["core"] == (4321, 0)
+
+
+def test_the_map_open_is_remembered_straight_away(tab, crawled, tmp_path):
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat)
+    tab.window.settings = settings
+    tab.on_crawled(crawled)
+    assert settings.value("netmap/last_map") == str(tab.map_path)  # Before NOMAD closes
+    other = netmap_tab.NetworkMapTab(Window())
+    other.restore_settings(settings)
+    assert other.map_path == tab.map_path and set(other.network_map.devices) == set(crawled.devices)
+    tab.new_map()
+    assert settings.value("netmap/last_map") == ""
+
+
+def test_a_map_that_could_not_be_reopened_is_still_the_one_to_reopen(tab, crawled, tmp_path):
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat)
+    missing = tmp_path / "gone.nomadmap"
+    settings.setValue("netmap/last_map", str(missing))
+    tab.restore_settings(settings)
+    assert tab.network_map is None and "wasn't opened" in tab.status_label.text()
+    tab.save_settings(settings)
+    assert settings.value("netmap/last_map") == str(missing)  # Not forgotten for not being there this once
+    tab.on_crawled(crawled)
+    tab.save_settings(settings)
+    assert settings.value("netmap/last_map") == str(tab.map_path)  # Until another map is opened
+
+
+def test_spacing_is_remembered(tab, crawled, tmp_path):
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat)
+    tab.on_crawled(crawled)
+    tab.set_spacing("roomy")
+    tab.save_settings(settings)
+    other = netmap_tab.NetworkMapTab(Window())
+    try:
+        other.restore_settings(settings)
+        assert other.arrange_spacing == "roomy"
+        settings.setValue("netmap/arrange_spacing", "sideways")
+        other.restore_settings(settings)
+        assert other.arrange_spacing == "normal"
+    finally:
+        other.shutdown()
+
+
+def top(widget):
+    """How far down the page a widget is."""
+    return widget.mapTo(widget.window(), widget.rect().topLeft()).y()
+
+
+@pytest.mark.parametrize("compact", [True, False])
+def test_monitor_and_watch_news_dont_squeeze_the_find_box(tab, crawled, compact):
+    tab.set_compact_top(compact)
+    tab.on_crawled(crawled)
+    tab.resize(1600, 800)
+    tab.window.show()  # The page shows inside it
+    try:
+        tab.show_summary(tab.monitor_label, "5 up")
+        tab.show_summary(tab.watch_label, "nothing new")
+        QApplication.processEvents()
+        width = tab.find_input.width()
+        for monitoring, watching in (("120 up · 14 down · 3 checking", "watched by ALICE-PC (the Map Watcher service)"),
+                                     ("5 up", "watched by ALICE-PC (the Map Watcher service)"),
+                                     ("120 up · 14 down · 3 checking", "nothing new")):
+            tab.show_summary(tab.monitor_label, monitoring)
+            tab.show_summary(tab.watch_label, watching)
+            QApplication.processEvents()
+            assert tab.find_input.width() == width  # The same room whatever they say
+        assert tab.watch_label.toolTip() == tab.watch_label.text() or not compact  # The whole of it, cut short
+    finally:
+        tab.window.hide()
+
+
+def test_compact_top_bar(tab, crawled):
+    tab.window.show()  # The page shows inside it
+    try:
+        assert tab.compact_top  # The default
+        QApplication.processEvents()
+        assert tab.crawl_row.isVisible() and not tab.crawl_button.isEnabled()  # No map: where to start is showing
+        tab.on_crawled(crawled)
+        QApplication.processEvents()
+        assert not tab.crawl_row.isVisible() and tab.crawl_button.isEnabled()
+        assert tab.map_button.isVisible() and not tab.new_button.isVisible() and not tab.tribe_button.isVisible()
+        middles = [top(widget) + widget.height() / 2 for widget in (tab.map_button, tab.monitor_check,
+                                                                     tab.find_input, tab.arrange_button)]
+        assert max(middles) - min(middles) < 4  # One row
+        tab.crawl_button.setChecked(True)  # To map again, or from another switch
+        assert tab.crawl_row.isVisible()
+        tab.crawl_button.setChecked(False)
+        assert not tab.crawl_row.isVisible()
+        message = "A long message. " * 60
+        netmap_tab.set_hint(tab.status_label, message, "info")
+        QApplication.processEvents()
+        assert tab.status_label.text() == message and tab.status_label.toolTip() == message
+        assert tab.status_label.height() < 2 * tab.status_label.fontMetrics().height()  # One line
+        compact_height = top(tab.tabs)
+
+        tab.set_compact_top(False)  # The classic bar, as it was
+        QApplication.processEvents()
+        assert tab.crawl_row.isVisible() and tab.new_button.isVisible() and not tab.map_button.isVisible()
+        assert top(tab.crawl_row) < top(tab.new_button) < top(tab.find_input)
+        assert tab.status_label.height() > 2 * tab.status_label.fontMetrics().height()  # Wrapped
+        assert top(tab.tabs) > compact_height + 60
+        tab.set_compact_top(True)
+        QApplication.processEvents()
+        assert tab.map_button.isVisible() and not tab.new_button.isVisible() and top(tab.tabs) == compact_height
+    finally:
+        tab.window.hide()
+
+
+def test_map_menu_does_what_the_map_buttons_do(tab, crawled, monkeypatch):
+    tab.on_crawled(crawled)
+    tab.update_map_menu()
+    entries = {action.text(): action for action in tab.map_menu.actions() if not action.isSeparator()}
+    assert list(entries) == ["New Map", "Open...", "Recent", "Save As...", "Export", "Compare", "Tribe"]
+    assert all(action.isEnabled() for action in entries.values())
+    recent = entries["Recent"].menu()
+    recent.aboutToShow.emit()
+    assert recent.actions() and [action.text() for action in recent.actions()] == \
+        [action.text() for action in tab.recent_menu.actions()]
+    export = entries["Export"].menu()
+    export.aboutToShow.emit()
+    assert "Picture (PNG)..." in [action.text() for action in export.actions()]
+    called = []
+    monkeypatch.setattr(tab, "new_map", lambda quiet=False: called.append("new"))
+    entries["New Map"].trigger()
+    assert called == ["new"]
+    monkeypatch.undo()
+    tab.new_map()
+    tab.update_map_menu()
+    assert not entries["Save As..."].isEnabled() and not entries["Export"].isEnabled()
+    assert entries["Open..."].isEnabled()
+
+
+def test_top_bar_choice_is_remembered(tab, tmp_path):
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat)
+    tab.set_compact_top(False)
+    tab.save_settings(settings)
+    other = netmap_tab.NetworkMapTab(Window())
+    try:
+        assert other.compact_top
+        other.restore_settings(settings)
+        assert not other.compact_top and other.new_button.parent() is not other.spare
+    finally:
+        other.shutdown()
+
+
+def test_watch_news_use_the_room_monitor_news_leave(tab, crawled):
+    tab.on_crawled(crawled)
+    long_news = "watched by ALICE-PC (the Map Watcher service)"
+    tab.show_summary(tab.watch_label, long_news)
+    alone = tab.watch_label.width()  # Its own share: cut short
+    assert tab.watch_label.fontMetrics().horizontalAdvance(long_news) > alone
+    tab.show_summary(tab.monitor_label, "5 up")
+    assert tab.monitor_label.width() < tab.monitor_label.fontMetrics().horizontalAdvance("999 up · 99 down")
+    assert tab.watch_label.width() > alone  # And what Monitor's short news leave
+    assert tab.status_slack.width() == 0
+    tab.show_summary(tab.watch_label, "")  # Only monitoring: what its news don't use is kept, not given away
+    assert tab.status_slack.width() > 0
+    tab.set_compact_top(False)
+    assert tab.status_slack.parent() is tab.spare and tab.monitor_label.maximumWidth() > 10000

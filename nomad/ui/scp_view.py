@@ -218,14 +218,14 @@ class FileSessionView(PromptAnswers, QWidget):
         if connection is None:
             return
         self.worker = TaskWorker(fs, self)
-        self.worker.busy_changed.connect(lambda busy: self.busy_label.setText("Working..." if busy else ""))
+        self.worker.busy_changed.connect(self.show_busy)
         self.worker.start()
         self.remote.worker = self.worker
         self.transfer_worker = TransferWorker(connection, self.transfers, self.lock, self)
         self.transfer_worker.conflict_policy = self.queue.policy.currentData()
         self.transfer_worker.paused = self.queue.pause_button.isChecked()
         self.transfer_worker.changed.connect(self.queue.update)
-        self.transfer_worker.added.connect(lambda folder, files: self.queue.add(files, after=folder))
+        self.transfer_worker.added.connect(self.on_transfers_added)
         self.transfer_worker.finished_one.connect(self.on_transfer_finished)
         self.transfer_worker.conflict.connect(self.ask_conflict, Qt.QueuedConnection)
         self.transfer_worker.connection_lost.connect(self.on_connection_lost)
@@ -653,6 +653,15 @@ class FileSessionView(PromptAnswers, QWidget):
             request.result = dialog.result_value
         finally:
             request.done.set()
+
+    # Worker signals go to methods, never lambdas: a lambda's signal still waiting to be delivered when its sender is freed
+    # crashes Qt, where a method's is dropped with the view
+
+    def show_busy(self, busy):
+        self.busy_label.setText("Working..." if busy else "")
+
+    def on_transfers_added(self, folder, files):
+        self.queue.add(files, after=folder)
 
     def on_transfer_finished(self, transfer):
         if transfer.state != DONE:
