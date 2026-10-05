@@ -751,6 +751,9 @@ class IpamTab(QWidget):
                 return False
             self.connect_team()
             self.fill_networks()
+            integration = hub(self.window)
+            if integration is not None:
+                integration.stores_opened()  # A map opened before them shows its network now
         return True
 
     def fit_subnet_panel(self):

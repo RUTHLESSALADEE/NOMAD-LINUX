@@ -12,12 +12,14 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from PyQt5.QtCore import QSettings, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QKeySequence
+from PyQt5.QtGui import QColor, QKeySequence
 from PyQt5.QtWidgets import QAbstractItemView, QActionGroup, QApplication, QCheckBox, QComboBox, QDialog, \
     QFileDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QShortcut, \
     QSplitter, QTabWidget, QTextBrowser, QToolButton, QVBoxLayout, QWidget
 
 from ..ipam.client import ADMIN, current_key, is_tribe_server, read_key_file, save_key
+from ..ipam.map_compare import DEVICE as DEVICE_ADDRESS, compare_map
+from ..ipam.reconcile import MAC_DIFFERS, NOT_RECORDED
 from ..ipam.store import IpamError
 from ..netmap import diff, export, l3, monitor, shared, store, watch
 from ..netmap import vlans as vlan_info
@@ -34,6 +36,7 @@ from ..snmpv3 import is_v3
 from ..terminal.credentials import CredentialError, protect, unprotect
 from .common import OneLineLabel, SortableTableItem, StoppableThread, read_only_table, set_hint
 from .host_menu import HostActions
+from .map_ipam_dialog import RecordDialog
 from .integration import IPAM, PLACEMENT, VLAN, MapNetworkDialog, hub, split_key
 from .integration import link as page_link
 from .netmap_monitor import NetworkMonitor
@@ -264,6 +267,11 @@ class NetworkMapTab(QWidget):
                                             "check that network against it, and opening the map opens the network "
                                             "on the IP Addresses, VLANs and Subnet Placement pages.")
         self.ipam_network_button.clicked.connect(self.choose_ipam_network)
+        self.ipam_record_button = QPushButton("Record in IPAM...")
+        self.ipam_record_button.setToolTip("Record the addresses of the map's devices and hosts that its IPAM "
+                                           "network doesn't have (or has with another MAC address): you see them "
+                                           "first and tick what to record.")
+        self.ipam_record_button.clicked.connect(self.record_map_in_ipam)  # Not record_in_ipam: clicked passes False
         self.find_input = QLineEdit()
         self.find_input.setClearButtonEnabled(True)
         self.fit_button = QPushButton("Fit")
@@ -317,7 +325,8 @@ class NetworkMapTab(QWidget):
         # The compact bar's: the map file's buttons in one menu, and the crawl row shown when wanted
         self.map_button = QToolButton()
         self.map_button.setText("Map")
-        self.map_button.setToolTip("New, Open, Recent, Save As, Export, Compare, and the tribe's maps.")
+        self.map_button.setToolTip("Crawl (start from, credentials, scope), New, Open, Recent, Save As, Export, "
+                                   "Compare, the map's IPAM network, and the tribe's maps.")
         self.map_button.setPopupMode(QToolButton.InstantPopup)
         self.map_menu = QMenu(self.map_button)
         self.map_button.setMenu(self.map_menu)
@@ -367,7 +376,7 @@ class NetworkMapTab(QWidget):
         self.l3_view = MapView()
         self.devices_table = read_only_table(export.DEVICE_COLUMNS)
         self.links_table = read_only_table(export.LINK_COLUMNS)
-        self.hosts_table = read_only_table(export.HOST_COLUMNS)
+        self.hosts_table = read_only_table(export.HOST_COLUMNS + ["IPAM"])  # IPAM: what the map's network has
         self.vlan_panel = VlanPanel()
         self.tabs.addTab(self.view, "Physical (L2)")
         self.tabs.addTab(self.l3_view, "Logical (L3)")
@@ -497,7 +506,7 @@ class NetworkMapTab(QWidget):
             rows.append(widget)
 
         file_buttons = [self.new_button, self.open_button, self.recent_button, self.save_button, self.export_button,
-                        self.compare_button, self.ipam_network_button, self.tribe_button]
+                        self.compare_button, self.ipam_network_button, self.ipam_record_button, self.tribe_button]
         watching = [self.monitor_check, self.interval_combo, self.monitor_label, self.watch_check, self.watch_label]
         view_tools = [self.hosts_check, self.undo_button, self.redo_button, self.fit_button, self.arrange_button]
         if self.compact_top:
@@ -569,11 +578,18 @@ class NetworkMapTab(QWidget):
         menu = self.map_menu
         self.map_entries = []  # (action, the classic bar's button it stands for)
         self.mirrored = {}  # Submenu -> (the classic bar's button's menu, what fills that, or None)
+        # The crawl row (start from, the adapter's gateway, credentials, scope, Start and Stop), as Crawl shows it
+        self.crawl_action = menu.addAction("Crawl: Start From, Gateway, Start, Stop")
+        self.crawl_action.setCheckable(True)
+        self.crawl_action.toggled.connect(self.show_crawl_row)
+        menu.addSeparator()
         for button, source, fill in ((self.new_button, None, None), (self.open_button, None, None),
                                      (self.recent_button, self.recent_menu, self.fill_recent_menu),
                                      (self.save_button, None, None), (self.export_button, self.export_menu, None),
                                      (self.compare_button, self.compare_menu, self.fill_compare_menu),
-                                     (self.ipam_network_button, None, None), (None, None, None),
+                                     (self.ipam_network_button, None, None), (self.ipam_record_button, None, None),
+                                     (None, None, None), (self.communities_button, None, None),
+                                     (self.scope_button, None, None), (None, None, None),
                                      (self.tribe_button, self.tribe_menu, self.fill_tribe_menu)):
             if button is None:
                 menu.addSeparator()
@@ -588,9 +604,21 @@ class NetworkMapTab(QWidget):
             self.map_entries.append((action, button))
         menu.aboutToShow.connect(self.update_map_menu)
 
+    def show_crawl_row(self, shown):
+        """The Map menu's Crawl: as the Crawl button does."""
+        self.crawl_button.setChecked(shown)
+        if shown:
+            self.seeds_input.setFocus()
+
     def update_map_menu(self):
+        self.crawl_action.blockSignals(True)
+        self.crawl_action.setChecked(self.crawl_row.isVisibleTo(self) if self.compact_top else True)
+        self.crawl_action.setEnabled(self.crawl_button.isEnabled())
+        self.crawl_action.blockSignals(False)
         for action, button in self.map_entries:
             action.setEnabled(button.isEnabled())
+            if action.menu() is None:
+                action.setText(button.text())  # Such as IPAM Network: <the map's>...
 
     def mirror_menu(self, submenu=None):
         """Fill one of the Map menu's submenus (the one about to show, if None) with what the classic bar's button's
@@ -1359,8 +1387,9 @@ class NetworkMapTab(QWidget):
                    keys=self.device_keys)
         fill_table(self.links_table, export.link_rows(network_map),
                    keys=[LinkRow(link) for link in export.sorted_links(network_map)])
-        fill_table(self.hosts_table, export.host_rows(network_map), ip_columns={1},
+        fill_table(self.hosts_table, [row + [""] for row in export.host_rows(network_map)], ip_columns={1},
                    keys=list(range(len(network_map.hosts))))
+        self.fill_ipam_column()
         for table_filter in self.table_filters.values():
             table_filter.apply()  # Filters carry over to the new rows
 
@@ -1525,6 +1554,7 @@ class NetworkMapTab(QWidget):
         if self.network_map is None or key == self.network_map.ipam_network:
             return
         self.network_map.ipam_network = key
+        log.info("The map %s is now of IPAM network %s", self.map_name(), key or "(none)")
         try:
             self.map_path = self.write_map(self.network_map, self.map_path)
         except OSError as error:
@@ -1564,6 +1594,9 @@ class NetworkMapTab(QWidget):
         network's map, or going back to the map's network)."""
         integration = hub(self.window)
         network_map = self.network_map
+        name = integration.network_name(network_map.ipam_network) if integration is not None and network_map \
+            is not None and network_map.ipam_network else ""
+        self.ipam_network_button.setText(f"IPAM Network: {name}..." if name else "IPAM Network...")
         if integration is None or network_map is None or self.worker is not None:
             self.network_bar.hide()
             return
@@ -1621,6 +1654,154 @@ class NetworkMapTab(QWidget):
         if integration is not None and self.network_map is not None and self.network_map.ipam_network:
             integration.choose_network(self.network_map.ipam_network, self)
         self.update_network_bar()
+
+    # ----------------------------------------------------------------- IPAM on the map
+
+    def ipam_target(self):
+        """(source, IPAM store, network id) of the IPAM network the map is compared with, or None."""
+        integration, key = hub(self.window), self.ipam_key()
+        if integration is None or not key:
+            return None
+        source, network_id = split_key(key)
+        store = integration.stores(source)[0]
+        if store is None:
+            return None
+        try:
+            store.network(network_id)
+        except IpamError:
+            return None
+        return source, store, network_id
+
+    def map_ipam_findings(self):
+        """{address: map_compare.MapAddress} judged against the map's IPAM network, or {}."""
+        target = self.ipam_target()
+        if target is None or self.network_map is None:
+            return {}
+        _, store, network_id = target
+        return {item.ip: item for item in compare_map(self.network_map, store, network_id)}
+
+    def fill_ipam_column(self):
+        """The Hosts table's IPAM column: whether the map's IPAM network has each host's address."""
+        table, network_map = self.hosts_table, self.network_map
+        column = table.columnCount() - 1
+        if network_map is None:
+            return
+        found = self.map_ipam_findings()
+        table.setSortingEnabled(False)
+        for row in range(table.rowCount()):
+            first = table.item(row, 0)
+            index = first.data_object if first is not None else None
+            if index is None or index >= len(network_map.hosts):
+                continue
+            item = found.get(network_map.hosts[index].ip)
+            finding = item.finding if item is not None else None
+            text = finding.text if finding is not None else ""
+            cell = SortableTableItem(text)
+            cell.setToolTip(text)
+            if finding is not None and finding.state in (NOT_RECORDED, MAC_DIFFERS):
+                cell.setForeground(QColor(COLORS["warning"]))
+            table.setItem(row, column, cell)
+        table.setSortingEnabled(True)
+
+    def annotate_l3(self):
+        """The logical view's subnets: their IPAM name and role, outlined by what Subnet Placement finds."""
+        integration = hub(self.window)
+        facts = integration.facts(self.ipam_key()) if integration is not None and self.network_map is not None \
+            else None
+        for key, node in getattr(self, "l3_nodes", {}).items():
+            if node.kind != l3.SUBNET:
+                continue
+            row = facts.row(node.label) if facts is not None else None
+            node.detail, node.tone = "", ""
+            if row is not None and row.subnet is not None:
+                node.detail = " · ".join(part for part in (row.subnet.name, row.role.name) if part)
+                node.tone = {"problem": "error", "warning": "warning"}.get(row.severity, "")
+            elif row is not None and row.pool is not None:
+                node.detail = f"in {row.pool.name or row.pool.cidr}"
+            elif facts is not None:
+                node.detail, node.tone = "not in IPAM", "muted"
+            item = self.l3_view.items_by_key.get(key)
+            if item is not None:
+                item.setToolTip("\n".join(part for part in (node.label, node.detail) if part))
+                item.update()
+
+    def on_facts_changed(self, *_):
+        """What IPAM, the VLANs and Subnet Placement know changed (or the network the map's used with)."""
+        if self.network_map is None:
+            return
+        self.annotate_l3()
+        self.fill_ipam_column()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self.network_map is not None:
+            self.fill_ipam_column()  # Addresses may have been recorded on the IP Addresses page meanwhile
+
+    def record_map_in_ipam(self):
+        """Record in IPAM... on the bar or Map menu: every address on the map."""
+        self.record_in_ipam()
+
+    def record_in_ipam(self, device=None, addresses=None):
+        """Review the map's addresses its IPAM network doesn't have (or has with another MAC), and record the ones
+        ticked. device: only that device's own addresses; addresses: only these (hosts chosen in the table)."""
+        integration = hub(self.window)
+        if integration is None or self.network_map is None:
+            return
+        self.window.ipam_tab.open_store()
+        if not self.network_map.ipam_network:  # Records go to a network: the one the map is of
+            self.choose_ipam_network()
+            if not self.network_map.ipam_network:
+                return
+        target = self.ipam_target()
+        if target is None:
+            QMessageBox.warning(self, "Record in IPAM", "The map's IPAM network isn't on this computer (connect to "
+                                "the tribe, or say which network the map is of with IPAM Network...).")
+            return
+        source, store, network_id = target
+        if not self.window.ipam_tab.can_change_addresses(source):
+            QMessageBox.warning(self, "Record in IPAM", "Addresses in that network can't be changed here now.")
+            return
+        items = list(self.map_ipam_findings().values())
+        if device is not None:
+            items = [item for item in items if item.kind == DEVICE_ADDRESS and item.device == device]
+        if addresses is not None:
+            items = [item for item in items if item.ip in addresses]
+        name = integration.network_name(self.network_map.ipam_network)
+        title = "Record in IPAM" if device is None else \
+            f"Record {self.network_map.devices[device].label}'s Addresses in IPAM"
+        team = self.window.ipam_tab.team
+        dialog = RecordDialog(self, store, network_id, name, items, title,
+                              offline=source == "team" and team is not None and not team.online)
+        if addresses is not None:
+            dialog.show_combo.setCurrentIndex(dialog.show_combo.count() - 1)  # Those chosen, whatever IPAM has
+        if dialog.exec_() and (dialog.recorded or dialog.updated):
+            self.window.ipam_tab.refresh_after_external_change()
+            self.fill_ipam_column()
+            set_hint(self.status_label, f"Recorded {count_text(dialog.recorded, 'address')} in {name}"
+                     + (f" and updated {count_text(dialog.updated, 'MAC address')}" if dialog.updated else "")
+                     + (" (sent to the IPAM server now, or when it's back)." if source == "team" else "."),
+                     "success")
+
+    def log_ipam_news(self, result):
+        """Watching found new hosts or subnets: note in the Watch log the ones the map's IPAM network lacks."""
+        integration = hub(self.window)
+        if integration is None or self.network_map is None or not (result.hosts or result.subnets):
+            return
+        found = self.map_ipam_findings()
+        new_hosts = [host for host in self.network_map.hosts if host.mac in set(result.hosts) and host.ip]
+        missing = [host for host in new_hosts if host.ip in found and found[host.ip].finding is not None
+                   and found[host.ip].finding.state == NOT_RECORDED]
+        name = integration.network_name(self.ipam_key())
+        if missing:
+            listed = ", ".join(f"{host.ip}" + (f" ({host.name})" if host.name else "") for host in missing[:8])
+            self.watcher.log(f"Not in IPAM ({name}): {listed}" + (f" and {len(missing) - 8} more" if len(missing) > 8
+                                                                   else "") + " (Record in IPAM to add them)")
+        integration.forget()  # The map just changed
+        facts = integration.facts(self.ipam_key())
+        for _, cidr in result.subnets:
+            row = facts.row(cidr) if facts is not None else None
+            if row is not None and row.found is not None and row.subnet is None and row.pool is None:
+                self.watcher.log(f"Subnet {cidr} isn't in IPAM ({name})")
 
     def show_subnet(self, cidr):
         """Go to a subnet: its node on the logical view, else the devices with addresses in it."""
@@ -1912,6 +2093,9 @@ class NetworkMapTab(QWidget):
             actions[menu.addAction("Mark as Seen")] = lambda: self.mark_seen(news)
         self.device_vlan_menu(menu, actions, device)
         self.device_ipam_menu(menu, actions, device)
+        if self.worker is None and self.network_map is not None and key in self.network_map.devices and \
+                hub(self.window) is not None:
+            actions[menu.addAction("Record Its Addresses in IPAM...")] = lambda: self.record_in_ipam(device=key)
         menu.addSeparator()
         actions[menu.addAction("Copy Name")] = lambda: QApplication.clipboard().setText(device.label)
         if device.mgmt_ip:
@@ -2060,6 +2244,12 @@ class NetworkMapTab(QWidget):
                 menu.addSeparator()
             actions[menu.addAction("Show on Map")] = lambda: self.show_on_map("host", item.row())
             self.add_address_link(menu, actions, host.ip)
+        addresses = [host.ip for host in hosts if host.ip]
+        if addresses and hub(self.window) is not None:
+            label = "Record in IPAM..." if len(addresses) == 1 else f"Record {len(addresses)} in IPAM..."
+            actions[menu.addAction(label)] = lambda: self.record_in_ipam(addresses=addresses)
+        if len(hosts) == 1:
+            host = hosts[0]
             actions[menu.addAction("Edit Host...")] = lambda: self.edit_host(host)
         actions[menu.addAction("Add Host...")] = lambda: self.add_host(hosts[0].device if hosts else None,
                                                                         hosts[0].port if hosts else "")
@@ -2835,6 +3025,7 @@ class NetworkMapTab(QWidget):
                 position = self.view.items_by_key[near].pos()
                 place[key] = (position.x() + 40 * (1 + len(place)), position.y() + 140)
         self.map_changed(place=place)
+        self.log_ipam_news(result)
         if result:
             self.window.show_status("Watch: " + "; ".join(result.lines[:3])
                                     + (f" (and {len(result.lines) - 3} more)" if len(result.lines) > 3 else ""))
@@ -3014,6 +3205,7 @@ class NetworkMapTab(QWidget):
         if maps.asked(self.tribe_map_id, "ipam_network"):
             return
         maps.note_asked(self.tribe_map_id, "ipam_network")
+        log.info("Asking which IPAM network the tribe map %s is of", self.map_name())
         self.window.ipam_tab.open_store()
         if integration.networks():
             self.choose_ipam_network()
@@ -3247,7 +3439,7 @@ class NetworkMapTab(QWidget):
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
         for widget in (self.save_button, self.export_button, self.compare_button, self.arrange_button,
-                       self.ipam_network_button):
+                       self.ipam_network_button, self.ipam_record_button):
             widget.setEnabled(has_map and not running)  # Not while the map is being drawn from a crawl
         for widget in (self.open_button, self.recent_button):
             widget.setEnabled(not running)

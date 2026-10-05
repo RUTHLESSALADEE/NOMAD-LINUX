@@ -772,8 +772,8 @@ def test_map_menu_does_what_the_map_buttons_do(tab, crawled, monkeypatch):
     tab.on_crawled(crawled)
     tab.update_map_menu()
     entries = {action.text(): action for action in tab.map_menu.actions() if not action.isSeparator()}
-    assert list(entries) == ["New Map", "Open...", "Recent", "Save As...", "Export", "Compare", "IPAM Network...",
-                             "Tribe"]
+    assert list(entries) == ["Crawl: Start From, Gateway, Start, Stop", "New Map", "Open...", "Recent", "Save As...", "Export", "Compare", "IPAM Network...",
+                             "Record in IPAM...", "Credentials...", "Scope...", "Tribe"]
     assert all(action.isEnabled() for action in entries.values())
     recent = entries["Recent"].menu()
     recent.aboutToShow.emit()
@@ -786,6 +786,20 @@ def test_map_menu_does_what_the_map_buttons_do(tab, crawled, monkeypatch):
     monkeypatch.setattr(tab, "new_map", lambda quiet=False: called.append("new"))
     entries["New Map"].trigger()
     assert called == ["new"]
+    monkeypatch.setattr(netmap_tab.CommunitiesDialog, "exec_", lambda dialog: called.append("credentials"))
+    monkeypatch.setattr(netmap_tab.ScopeDialog, "exec_", lambda dialog: called.append("scope"))
+    assert not tab.crawl_row.isVisibleTo(tab)  # Compact, with a map: the crawl row is put away...
+    entries["Credentials..."].trigger()
+    entries["Scope..."].trigger()  # ...but its settings are still in the Map menu
+    assert called == ["new", "credentials", "scope"]
+    crawl = entries["Crawl: Start From, Gateway, Start, Stop"]
+    assert not crawl.isChecked()
+    crawl.trigger()  # The crawl row, without finding the Crawl button
+    assert tab.crawl_row.isVisibleTo(tab) and tab.crawl_button.isChecked()
+    tab.update_map_menu()
+    assert crawl.isChecked()
+    crawl.trigger()
+    assert not tab.crawl_row.isVisibleTo(tab)
     monkeypatch.undo()
     tab.new_map()
     tab.update_map_menu()

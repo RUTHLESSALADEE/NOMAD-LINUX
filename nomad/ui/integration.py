@@ -105,6 +105,7 @@ class Integration(QObject):
         self.origin = None  # The page that chose the network last
         self.cache = {}
         self.map_identity = None  # The map (and its network) the pages were last pointed at
+        self.waiting_network = ""  # The open map's network, to show once IPAM's databases are open (at start)
 
     def connect_pages(self):
         """Once every page exists: hear what changes the facts."""
@@ -122,7 +123,8 @@ class Integration(QObject):
         would end NOMAD."""
         window = self.window
         for method in (window.ipam_tab.follow_network, window.vlan_tab.follow_network,
-                       window.placement_tab.follow_network, window.netmap_tab.update_network_bar):
+                       window.placement_tab.follow_network, window.netmap_tab.update_network_bar,
+                       window.netmap_tab.on_facts_changed):
             try:
                 method(key)
             except Exception:
@@ -130,7 +132,8 @@ class Integration(QObject):
 
     def tell_facts(self):
         window = self.window
-        for method in (window.ipam_tab.on_facts_changed, window.vlan_tab.on_facts_changed):
+        for method in (window.ipam_tab.on_facts_changed, window.vlan_tab.on_facts_changed,
+                       window.netmap_tab.on_facts_changed):
             try:
                 method()
             except Exception:
@@ -160,6 +163,19 @@ class Integration(QObject):
             return
         self.map_identity = identity
         if key and self.store_for(split_key(key)[0]) is not None:
+            self.waiting_network = ""
+            self.choose_network(key, page)
+        else:
+            self.waiting_network = key  # Reopened at start, before IPAM's databases are: shown when they are
+
+    def stores_opened(self):
+        """The IP Addresses page opened its databases (or connected to the tribe): show the network of the map that
+        was opened before they were."""
+        key, page = self.waiting_network, self.window.netmap_tab
+        if key and self.store_for(split_key(key)[0]) is not None and page.network_map is not None and \
+                page.network_map.ipam_network == key:
+            self.waiting_network = ""
+            log.info("Showing the network of the map opened at start: %s", key)
             self.choose_network(key, page)
 
     def on_routes_read(self, *_):
