@@ -13,7 +13,9 @@ from dataclasses import dataclass, field
 from .store import STATUSES, IpamStore, ip_key, parse_address, parse_subnet, subnet_key
 
 FIELD_LABELS = {"name": "Name", "status": "Status", "mac": "MAC", "description": "Description",
-                "gateway": "Gateway", "loopbacks": "Loopbacks", "fields": "Details"}
+                "gateway": "Gateway", "loopbacks": "Loopbacks", "subnets": "Subnets", "vtp_domain": "VTP domain",
+                "ranges": "Ranges", "fields": "Details"}
+SHOWN_STATUSES = dict(STATUSES, active="Active", planned="Planned")  # Addresses' and VLANs' (vlans.STATUSES)
 CREATED, CHANGED, DELETED = "create", "update", "delete"
 
 
@@ -22,7 +24,7 @@ class Event:
     seq: int
     when: str  # UTC, ISO 8601
     who: str
-    entity: str  # networks, subnets or addresses
+    entity: str  # networks, subnets, addresses, vlan_domains or vlans
     entity_id: str
     op: str
     before: dict = field(default_factory=dict)
@@ -43,6 +45,11 @@ class Event:
         if self.entity == "subnets":
             name = row.get("name")
             return f"{row.get('cidr', '')}" + (f" ({name})" if name else "")
+        if self.entity == "vlans":
+            name = row.get("name")
+            return f"VLAN {row.get('vlan', '')}" + (f" ({name})" if name else "")
+        if self.entity == "vlan_domains":
+            return f"VLAN domain {row.get('name', '')}"
         return f"Network {row.get('name', '')}"
 
     @property
@@ -68,7 +75,12 @@ class Event:
 
 def show(name, value):
     if name == "status":
-        return STATUSES.get(value, value or "(none)")
+        return SHOWN_STATUSES.get(value, value or "(none)")
+    if name == "subnets":
+        return ", ".join(value or []) or "(none)"
+    if name == "ranges":
+        listed = [f"{item['first']}-{item['last']} {item.get('name', '')}".strip() for item in value or []]
+        return ", ".join(listed) or "(none)"
     if name == "loopbacks":
         return "Yes" if value else "No"
     if name == "fields":
@@ -87,6 +99,11 @@ def describe_row(entity, row):
             parts.append(f"gateway {row['gateway']}")
         if row.get("loopbacks"):
             parts.append("loopbacks")
+        return ", ".join(parts)
+    if entity == "vlans":
+        parts = [SHOWN_STATUSES.get(row.get("status"), row.get("status", ""))]
+        parts += [row["name"]] if row.get("name") else []
+        parts += list(row.get("subnets") or [])
         return ", ".join(parts)
     return row.get("name", "")
 

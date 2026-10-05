@@ -1,6 +1,7 @@
 """Network Map page: crawl switches, routers and firewalls over SNMP from a starting device, and draw what's
 connected to what (CDP/LLDP), with the hosts on each switch port (MAC and ARP tables)."""
 import datetime
+import functools
 import html
 import ipaddress
 import json
@@ -19,8 +20,9 @@ from PyQt5.QtWidgets import QAbstractItemView, QActionGroup, QApplication, QChec
 from ..ipam.client import ADMIN, current_key, is_tribe_server, read_key_file, save_key
 from ..ipam.store import IpamError
 from ..netmap import diff, export, l3, monitor, shared, store, watch
-from ..netmap.crawl import MAX_WORKERS, WORKERS, CrawlSettings, Crawler, check_device, communities_for, \
-    credentials_from_json, credentials_to_json, ordered_credentials, parse_overrides
+from ..netmap import vlans as vlan_info
+from ..netmap.crawl import MAX_WORKERS, WORKERS, CrawlSettings, Crawler, apply_vlans, check_device, \
+    communities_for, credentials_from_json, credentials_to_json, ordered_credentials, parse_overrides, read_vlans_of
 from ..netmap.layout import BOTTOM, CENTER, GROUP_PAD, GROUP_TITLE, HORIZONTAL, LEFT, MIDDLE, \
     NORMAL, RESPACE_MIN_GAP, RIGHT, SPACING_NAMES, SPACINGS, STYLE_NAMES, TOP, TOP_DOWN, VERTICAL, align, arrange, \
     arrange_boxes_in_place, arrange_in_place, distribute, merge_positions, nearest_spacing, respace, spacing_of
@@ -37,6 +39,7 @@ from .netmap_dialogs import CommunitiesDialog, CompareDialog, DeletedDevicesDial
     HostDialog, LinkDialog, ScopeDialog, shown_value
 from .netmap_tribe import TribeSync
 from .netmap_view import GROUP_BOX, MapView
+from .netmap_vlans import VlanPanel, domain_text
 from .netmap_watch import MapWatcher
 from .table_filter import TableFilter
 from .theme import COLORS, accent_button
@@ -52,6 +55,8 @@ DEFAULTS = {"max_hops": 6, "max_devices": 500, "timeout": 2000}
 ALIGNMENTS = [("Align Left", LEFT), ("Align Center", CENTER), ("Align Right", RIGHT), None, ("Align Top", TOP),
               ("Align Middle", MIDDLE), ("Align Bottom", BOTTOM)]
 GROUP_LINKS_SHOWN = 20
+VLANS_IN_MENU = 60  # A device's Highlight VLAN menu lists this many
+VLANS_LISTED = 40  # A device's details name this many of its VLANs
 CHECK_WORKERS = 8  # Devices added by hand asked over SNMP at once
 
 
@@ -124,7 +129,14 @@ class CheckThread(StoppableThread):
             list(executor.map(ask, self.targets))
 
 
+class VlanReadThread(CheckThread):
+    """Reads just the VLANs (and IP interfaces) of the switches on the map, a few at once: Read VLANs Again."""
+
+
 class NetworkMapTab(QWidget):
+    map_shown = pyqtSignal()  # The map open was drawn again (another opened, mapped again, changed, read again)
+    routes_read = pyqtSignal(int, int)  # Read Routes Again finished: devices read, devices that didn't answer
+
     def __init__(self, window):
         super().__init__(window)
         self.window = window
@@ -164,6 +176,8 @@ class NetworkMapTab(QWidget):
         self.checking = set()  # Keys of the devices being asked
         self.announce = set()  # Of those, the ones to say what was found for (one added or asked again)
         self.check_device = check_device  # What asks one (tests swap in the fake network)
+        self.read_vlans = read_vlans_of  # What reads one's VLANs (tests swap in the fake network)
+        self.vlan_reading = None  # While Read VLANs Again runs: {"map", "read", "failed", "lines"}
         self.save_timer = QTimer(self)
         self.save_timer.setSingleShot(True)
         self.save_timer.setInterval(SAVE_DELAY_MS)
@@ -173,6 +187,7 @@ class NetworkMapTab(QWidget):
         self.undo_stack, self.redo_stack = [], []
         self.layout_now = None
         self.restoring = False
+        self.vlan_shown = None  # (VLAN, VTP domain) highlighted on the physical view, or None
         self.init_ui()
         window.adapter_changed.connect(lambda _: self.update_gateway_button())
         window.snapshot_changed.connect(lambda _: self.update_gateway_button())
@@ -321,11 +336,13 @@ class NetworkMapTab(QWidget):
         self.devices_table = read_only_table(export.DEVICE_COLUMNS)
         self.links_table = read_only_table(export.LINK_COLUMNS)
         self.hosts_table = read_only_table(export.HOST_COLUMNS)
+        self.vlan_panel = VlanPanel()
         self.tabs.addTab(self.view, "Physical (L2)")
         self.tabs.addTab(self.l3_view, "Logical (L3)")
         self.tabs.addTab(self.devices_table, "Devices")
         self.tabs.addTab(self.links_table, "Links")
         self.tabs.addTab(self.hosts_table, "Hosts")
+        self.tabs.addTab(self.vlan_panel, "VLANs")
         self.tabs.addTab(self.crawl_progress.tab, "Crawl")
         self.tabs.addTab(self.monitor.tab, "Monitor")
         self.tabs.addTab(self.watcher.tab, "Watch")
@@ -333,6 +350,8 @@ class NetworkMapTab(QWidget):
         self.table_filters = {table: TableFilter(table, lambda shown, total, table=table:
                                                  self.show_filtered_count(table, shown, total))
                               for table in self.table_names}
+        self.table_names[self.vlan_panel] = "VLANs"  # Its find box filters its VLANs
+        self.table_filters[self.vlan_panel] = TableFilter(self.vlan_panel.table, self.show_vlan_filter_count)
         self.details = QTextBrowser()
         self.details.setOpenLinks(False)
         self.splitter = QSplitter(Qt.Horizontal)
@@ -341,8 +360,24 @@ class NetworkMapTab(QWidget):
         self.splitter.setStretchFactor(0, 4)
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setSizes([900, 260])
+        self.vlan_bar = QWidget()  # While a VLAN is highlighted: which, and how to stop
+        vlan_row = QHBoxLayout(self.vlan_bar)
+        vlan_row.setContentsMargins(0, 0, 0, 0)
+        self.vlan_label = QLabel()
+        self.vlan_label.setWordWrap(True)
+        self.vlan_clear_button = QPushButton("Show All")
+        self.vlan_clear_button.setToolTip("Stop highlighting the VLAN.")
+        vlan_row.addWidget(self.vlan_label, 1)
+        vlan_row.addWidget(self.vlan_clear_button)
+        self.vlan_bar.hide()
+        layout.addWidget(self.vlan_bar)
         layout.addWidget(self.splitter, 1)
         self.show_details(None)
+        self.vlan_clear_button.clicked.connect(self.clear_vlan)
+        self.vlan_panel.highlight_requested.connect(self.highlight_vlan)
+        self.vlan_panel.show_requested.connect(self.show_vlan_finding)
+        self.vlan_panel.add_to_database_requested.connect(self.add_vlans_to_database)
+        self.vlan_panel.read_requested.connect(self.read_vlans_again)
 
         self.gateway_button.clicked.connect(self.use_gateway)
         self.communities_button.clicked.connect(self.edit_communities)
@@ -839,8 +874,11 @@ class NetworkMapTab(QWidget):
         self.view.clear_map()
         self.l3_view.clear_map()
         self.l3_nodes, self.l3_links = {}, []
-        for table in self.table_names:
+        for table in (self.devices_table, self.links_table, self.hosts_table):
             table.setRowCount(0)
+        self.vlan_shown = None
+        self.vlan_panel.set_map(None)
+        self.apply_vlan_focus()
         self.monitor.set_map(NetworkMap())
         self.monitor.load_history([])
         self.show_details(None)
@@ -1039,6 +1077,8 @@ class NetworkMapTab(QWidget):
             self.monitor.load_history(network_map.status_log)
         self.show_statuses()
         self.fill_tables()
+        self.vlan_panel.set_map(network_map)
+        self.apply_vlan_focus()
         self.show_details(None)
         if self.hosts_check.isChecked():
             self.view.set_all_hosts_shown(True)
@@ -1054,6 +1094,7 @@ class NetworkMapTab(QWidget):
         self.update_buttons()
         self.unopened = ""
         self.remember_open_map()
+        self.map_shown.emit()
 
     def current_view(self):
         """The drawing showing (or the physical one while a table is)."""
@@ -1293,6 +1334,163 @@ class NetworkMapTab(QWidget):
         filtered = self.table_filters[table].active if table in getattr(self, "table_filters", {}) else False
         self.tabs.setTabText(self.tabs.indexOf(table), f"{name} ({shown} of {total})" if filtered else name)
 
+    def show_vlan_filter_count(self, shown, total):
+        self.show_filtered_count(self.vlan_panel, shown, total)
+
+    # ----------------------------------------------------------------- VLANs
+
+    def highlight_vlan(self, vlan, domain=None):
+        """Show one VLAN on the physical view: what carries it stays bright, the rest fades."""
+        if self.network_map is None:
+            return
+        self.vlan_shown = (vlan, domain)
+        self.tabs.setCurrentWidget(self.view)
+        self.apply_vlan_focus()
+
+    def apply_vlan_focus(self):
+        """Highlight the VLAN chosen (again, after the map was drawn again), or show everything."""
+        network_map = self.network_map
+        if self.vlan_shown is None or network_map is None:
+            self.view.set_vlan_focus(None)
+            self.vlan_bar.hide()
+            return
+        vlan, domain = self.vlan_shown
+        focus = vlan_info.focus(network_map, vlan, domain)
+        self.view.set_vlan_focus(focus)
+        item = next((item for item in vlan_info.map_vlans(network_map)
+                     if item.vlan == vlan and (domain is None or item.domain == domain)), None)
+        name = f" {item.name}" if item is not None and item.name else ""
+        where = f" in {domain_text(domain)}" if domain is not None and vlan_info.domains(network_map)[1:] else ""
+        kinds = list(focus.links.values())
+        parts = [f"<b>Highlighting VLAN {vlan}{html.escape(name)}{html.escape(where)}</b>:",
+                 f"{count_text(len(focus.devices), 'device')}, {count_text(len(kinds), 'link')} carrying it"]
+        if item is not None and item.gateways:
+            gateways = ", ".join(f"{gateway.address}/{gateway.prefix}" for gateway in item.gateways[:3])
+            parts.append(f"· gateway {html.escape(gateways)}")
+        if vlan_info.ONE_END in kinds:
+            mismatched = kinds.count(vlan_info.ONE_END)
+            parts.append(f"· <span style='color:{COLORS['warning']}'>{count_text(mismatched, 'trunk')} with it "
+                         "allowed at one end only (dashed orange)</span>")
+        parts.append("· blue: tagged on trunks (dashed: native), green: between access ports")
+        self.vlan_label.setText(" ".join(parts))
+        self.vlan_bar.show()
+
+    def read_vlans_again(self, routes=False):
+        """Read the VLANs of every switch on the map that answered SNMP (not their neighbors or hosts): for a map made
+        before NOMAD read VLANs, or to bring them up to date without mapping again. routes: their routing tables
+        and VRFs too (Read Routes Again, for the Subnet Placement page). Returns whether it started."""
+        network_map = self.network_map
+        if network_map is None or self.worker is not None or self.vlan_reading is not None:
+            return False
+        targets = [(key, device.mgmt_ip) for key, device in network_map.devices.items()
+                   if device.source == SNMP and device.mgmt_ip and device.kind in (SWITCH, ROUTER, FIREWALL)]
+        if not targets:
+            set_hint(self.status_label, "No device on the map answered SNMP, so there's nothing to read.", "warning")
+            return False
+        self.vlan_reading = {"map": network_map, "read": 0, "failed": [], "lines": [], "routes": routes}
+        reader = functools.partial(self.read_vlans, routes=True) if routes else self.read_vlans
+        thread = VlanReadThread(self.crawl_settings([address for _, address in targets]), targets, reader, self)
+        thread.checked.connect(self.on_vlans_read)
+        thread.finished.connect(self.on_vlans_read_finished)
+        self.check_threads.append(thread)
+        self.vlan_panel.set_reading(True)
+        what = "VLANs and routes" if routes else "VLANs"
+        set_hint(self.status_label, f"Reading the {what} of {count_text(len(targets), 'device')}...", "info")
+        thread.start()
+        return True
+
+    def reading_routes(self):
+        """Whether Read Routes Again is under way (routes_read says when it's done)."""
+        return self.vlan_reading is not None and self.vlan_reading["routes"]
+
+    def read_routes_again(self):
+        """Read the VLANs, routing tables and VRFs of every device on the map that answered SNMP (the Subnet Placement
+        page's Read Routes Again). Returns whether it started."""
+        return self.read_vlans_again(routes=True)
+
+    def on_vlans_read(self, key, address, result):
+        reading = self.vlan_reading
+        if reading is None or reading["map"] is not self.network_map:
+            return  # Another map was opened meanwhile
+        device = self.network_map.devices.get(key)
+        tables, community = result
+        if device is None:
+            return
+        if tables is None:
+            reading["failed"].append(device.label)
+            return
+        if community:
+            self.answered[address] = community
+        before = (vlan_info.vlan_names(device), dict(device.port_vlans))
+        apply_vlans(device, tables)
+        reading["read"] += 1
+        reading["lines"] += watch.vlan_changes(device, *before)
+
+    def on_vlans_read_finished(self):
+        thread = self.sender()
+        if thread in self.check_threads:
+            self.check_threads.remove(thread)
+        reading, self.vlan_reading = self.vlan_reading, None
+        self.vlan_panel.set_reading(False)
+        if reading is None:
+            return
+        if reading["map"] is not self.network_map:
+            if reading["routes"]:
+                self.routes_read.emit(0, 0)  # Of a map no longer open
+            return
+        if reading["read"]:
+            self.map_changed()
+        for line in reading["lines"]:
+            self.watcher.log(line)
+        what = "VLANs and routes" if reading["routes"] else "VLANs"
+        text = f"Read the {what} of {count_text(reading['read'], 'device')}"
+        if reading["failed"]:
+            listed = ", ".join(reading["failed"][:5]) + ("..." if len(reading["failed"]) > 5 else "")
+            text += f"; {len(reading['failed'])} didn't answer SNMP ({listed})"
+        changes = [line for line in reading["lines"] if not line.startswith("Read ")]
+        text += f". {count_text(len(changes), 'change')} (in the Watch log)." if changes else "."
+        set_hint(self.status_label, text, "warning" if reading["failed"] else "success")
+        if reading["routes"]:
+            self.routes_read.emit(reading["read"], len(reading["failed"]))
+
+    def add_stop_highlight(self, menu):
+        """At the top of the physical view's right-click menus while a VLAN is highlighted: an action to stop (the
+        caller connects it to clear_vlan). Returns it, or None."""
+        if self.vlan_shown is None or self.tabs.currentWidget() is not self.view:
+            return None
+        action = menu.addAction(f"Stop Highlighting VLAN {self.vlan_shown[0]} (Show All)")
+        menu.addSeparator()
+        return action
+
+    def clear_vlan(self):
+        self.vlan_shown = None
+        self.apply_vlan_focus()
+
+    def show_vlan_finding(self, key, port):
+        """A VLAN check double-clicked: show the device on the map."""
+        self.tabs.setCurrentWidget(self.view)
+        self.view.show_device(key)
+
+    def add_vlans_to_database(self):
+        """Bring the map's VLANs into Manage > VLANs (reviewed there first)."""
+        page = getattr(self.window, "vlan_tab", None)
+        if page is not None and self.network_map is not None:
+            page.import_from_map(self.network_map, self.map_name())
+
+    def device_vlan_menu(self, menu, actions, device):
+        """Highlight VLAN > each of the device's VLANs (a switch's, or a router's subinterfaces')."""
+        names = vlan_info.vlan_names(device)
+        numbers = sorted(set(names) | {vlan for vlan, _ in vlan_info.gateways(device)})
+        if not numbers or self.network_map is None or device.key not in self.network_map.devices:
+            return
+        submenu = menu.addMenu("Highlight VLAN")
+        domain = device.vtp_domain if device.vlans else None
+        for vlan in numbers[:VLANS_IN_MENU]:
+            action = submenu.addAction(f"{vlan} {names.get(vlan, '')}".strip())
+            actions[action] = lambda vlan=vlan: self.highlight_vlan(vlan, domain)
+        if len(numbers) > VLANS_IN_MENU:
+            submenu.addAction(f"...and {len(numbers) - VLANS_IN_MENU} more (see the VLANs tab)").setEnabled(False)
+
     def show_on_map(self, kind, row):
         item = (self.devices_table if kind == "device" else self.hosts_table).item(row, 0)
         if item is None or self.network_map is None:
@@ -1322,7 +1520,8 @@ class NetworkMapTab(QWidget):
     def set_find_placeholder(self):
         here = self.tabs.currentWidget()
         if here in self.table_names:
-            text = f"Filter the {self.table_names[here].lower()}: words in any column (Ctrl+F)"
+            name = self.table_names[here]
+            text = f"Filter the {name if name[:2].isupper() else name.lower()}: words in any column (Ctrl+F)"
         elif here is self.crawl_progress.tab:
             text = "Find in the crawl log (Enter for the next) (Ctrl+F)"
         elif here is self.l3_view:
@@ -1442,8 +1641,11 @@ class NetworkMapTab(QWidget):
             self.show_node_menu(key, position)
             return
         menu = QMenu(self)
+        stop = self.add_stop_highlight(menu)
         actions = self.host_actions.add_to(menu, device.mgmt_ip, **self.session_hints(shown, device),
                                            snmp=self.snmp_access(device.mgmt_ip)) if device.mgmt_ip else {}
+        if stop is not None:
+            actions[stop] = self.clear_vlan
         menu.addSeparator()
         self.add_show_in(menu, actions, key)
         menu.addSeparator()
@@ -1468,6 +1670,7 @@ class NetworkMapTab(QWidget):
         news = self.news_of_devices(keys)
         if news and self.worker is None:
             actions[menu.addAction("Mark as Seen")] = lambda: self.mark_seen(news)
+        self.device_vlan_menu(menu, actions, device)
         menu.addSeparator()
         actions[menu.addAction("Copy Name")] = lambda: QApplication.clipboard().setText(device.label)
         if device.mgmt_ip:
@@ -1632,9 +1835,21 @@ class NetworkMapTab(QWidget):
             return
         hosts = self.network_map.hosts_by_port(key).get(port, []) if self.network_map else []
         menu = QMenu(self)
+        stop = self.add_stop_highlight(menu)
         actions = {}
         if len(hosts) == 1 and hosts[0].ip:
             actions = self.host_actions.add_to(menu, hosts[0].ip, **self.host_session_hints(hosts[0]))
+        if stop is not None:
+            actions[stop] = self.clear_vlan
+            menu.addSeparator()
+        device = self.network_map.devices.get(key) if self.network_map else None
+        info = vlan_info.port_info(device, port) if device is not None else {}
+        domain = device.vtp_domain if device is not None and device.vlans else None
+        for number in dict.fromkeys(number for number in (info.get("vlan"), info.get("voice"), info.get("native"))
+                                    if number):
+            actions[menu.addAction(f"Highlight VLAN {number}")] = \
+                lambda number=number: self.highlight_vlan(number, domain)
+        if actions:
             menu.addSeparator()
         if len(hosts) == 1:
             actions[menu.addAction("Edit Host...")] = lambda: self.edit_host(hosts[0])
@@ -1755,6 +1970,9 @@ class NetworkMapTab(QWidget):
             return
         menu = QMenu(self)
         actions = {}
+        stop = self.add_stop_highlight(menu)
+        if stop is not None:
+            actions[stop] = self.clear_vlan
         place = (scene_position.x(), scene_position.y())
         actions[menu.addAction("Add Device Here...")] = lambda: self.add_device(place=place)
         if self.network_map is not None and len(self.network_map.devices) > 1:
@@ -1775,6 +1993,9 @@ class NetworkMapTab(QWidget):
             return
         menu = QMenu(self)
         actions = {}
+        stop = self.add_stop_highlight(menu)
+        if stop is not None:
+            actions[stop] = self.clear_vlan
         actions[menu.addAction("Show in Links")] = lambda: self.show_links_in_table(links)
         menu.addSeparator()
         self.add_link_actions(menu, actions, links)
@@ -2038,6 +2259,9 @@ class NetworkMapTab(QWidget):
         kind = GROUP_KINDS[group.kind]
         menu = QMenu(self)
         actions = {}
+        stop = self.add_stop_highlight(menu)
+        if stop is not None:
+            actions[stop] = self.clear_vlan
         actions[menu.addAction("Expand" if group.collapsed else "Collapse")] = \
             lambda: self.view.set_collapsed(item, not group.collapsed)
         actions[menu.addAction("Select Its Devices")] = lambda: self.select_group_devices(key)
@@ -2808,9 +3032,12 @@ def device_html(network_map, key, state=None):
         parts.append("<h4>Links</h4><table>")
         for link in sorted(links, key=lambda link: link.port_on(key)):
             other = network_map.devices[link.other(key)]
+            port = vlan_port_text(vlan_info.port_info(device, link.port_on(key)))
             parts.append(f"<tr><td>{escape(link.port_on(key))}&nbsp;</td><td>&rarr; {escape(other.label)} "
-                         f"{escape(link.port_on(other.key))}</td></tr>")
+                         f"{escape(link.port_on(other.key))}" + (f" &middot; {escape(port)}" if port else "")
+                         + "</td></tr>")
         parts.append("</table>")
+    parts.append(device_vlans_html(device))
     ports = network_map.hosts_by_port(key)
     if ports:
         count = sum(len(hosts) for hosts in ports.values())
@@ -2839,6 +3066,52 @@ def device_html(network_map, key, state=None):
     if device.manual:
         parts.append("<p>Added by hand: right-click it to edit or delete it, or to draw a link from it. It's kept "
                      "when you map again, until the crawl finds it.</p>")
+    return "".join(parts)
+
+
+def vlan_port_text(info):
+    """A port's VLANs in a few words: "trunk, native 1, VLANs 1-10,20" or "access VLAN 10, voice 20"."""
+    if not info:
+        return ""
+    if info.get("mode") == vlan_info.TRUNK:
+        allowed = info.get("allowed", "")
+        return f"trunk, native {info.get('native', 1)}, " + (f"VLANs {allowed}" if allowed != "1-4094" else "all VLANs")
+    text = f"access VLAN {info['vlan']}" if info.get("vlan") else ""
+    if info.get("voice"):
+        text += f"{', ' if text else ''}voice VLAN {info['voice']}"
+    return text
+
+
+def device_vlans_html(device):
+    """A switch's VLANs, its VTP domain, and which ports are in which VLAN."""
+    escape = html.escape
+    names = vlan_info.vlan_names(device)
+    if not names and not device.port_vlans:
+        return ""
+    vtp = f"VTP domain {device.vtp_domain}" if device.vtp_domain else ""
+    if device.vtp_mode:
+        vtp = f"{vtp} ({device.vtp_mode})" if vtp else f"VTP {device.vtp_mode}"
+    parts = [f"<h4>VLANs ({len(names)})</h4>", f"<p>{escape(vtp)}</p>" if vtp else ""]
+    if names:
+        listed = [f"{vlan} {name}".strip() for vlan, name in sorted(names.items())]
+        more = f" ...and {len(listed) - VLANS_LISTED} more" if len(listed) > VLANS_LISTED else ""
+        parts.append(f"<p>{escape(', '.join(listed[:VLANS_LISTED]))}{more}</p>")
+    trunks = [(port, info) for port, info in device.port_vlans.items() if info.get("mode") == vlan_info.TRUNK]
+    if trunks:
+        parts.append("<table>")
+        for port, info in trunks:
+            parts.append(f"<tr><td>{escape(port)}&nbsp;</td><td>{escape(vlan_port_text(info))}</td></tr>")
+        parts.append("</table>")
+    by_vlan = {}
+    for port, info in device.port_vlans.items():
+        if info.get("mode") != vlan_info.TRUNK and info.get("vlan"):
+            by_vlan.setdefault(info["vlan"], []).append(port)
+    if by_vlan:
+        parts.append("<p><b>Access ports</b></p><table>")
+        for vlan, ports in sorted(by_vlan.items()):
+            listed = ", ".join(ports[:8]) + (f" and {len(ports) - 8} more" if len(ports) > 8 else "")
+            parts.append(f"<tr><td>VLAN {vlan}&nbsp;</td><td>{escape(listed)}</td></tr>")
+        parts.append("</table>")
     return "".join(parts)
 
 
@@ -2962,7 +3235,9 @@ def port_html(network_map, key, port):
     escape = html.escape
     device = network_map.devices.get(key)
     hosts = network_map.hosts_by_port(key).get(port, [])
+    vlans_text = vlan_port_text(vlan_info.port_info(device, port)) if device is not None else ""
     parts = [f"<h3>{escape(device.label if device else key)} {escape(port)}</h3>",
+             f"<p>{escape(vlans_text[0].upper() + vlans_text[1:])}</p>" if vlans_text else "",
              f"<p>{len(hosts)} host{'' if len(hosts) == 1 else 's'}</p><table>"]
     for host in hosts:
         details = [host.ip, host.name, host.vendor or host.platform, f"VLAN {host.vlan}" if host.vlan else "",

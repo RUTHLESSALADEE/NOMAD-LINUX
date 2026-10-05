@@ -8,13 +8,13 @@ import threading
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QFont, QGuiApplication
 from PyQt5.QtWidgets import QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, \
-    QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, \
-    QMessageBox, QPushButton, QRadioButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout
+    QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, \
+    QRadioButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout
 
 from ..terminal.files import BOTH_WAYS, DIFFERENT, DOWNLOAD, HASHES, LOCAL_NEWER, LOCAL_ONLY, NEWER, OVERWRITE, \
     REMOTE_NEWER, REMOTE_ONLY, RENAME, SAME, SKIP, TO_LOCAL, TO_REMOTE, UPLOAD, TransferCancelled, compare, \
     local_files, local_hash, permission_text, remote_files, suggested_action
-from .common import format_size, set_hint
+from .common import ColumnFitter, format_size, set_hint
 from .file_panes import format_time
 from .theme import COLORS
 
@@ -347,10 +347,7 @@ class SyncDialog(QDialog):
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.setHeaderLabels(["File", "Difference", "Local size", "Local modified", "Remote size",
                                    "Remote modified", "Action"])
-        self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
-        for column in range(1, 7):
-            self.tree.header().setSectionResizeMode(column, QHeaderView.ResizeToContents)
-        self.tree.header().setStretchLastSection(False)
+        ColumnFitter(self.tree, stretch=0)
         self.tree.setToolTip("Tick the files to copy. Right-click to choose upload or download for the selected "
                              "files.")
         layout.addWidget(self.tree, 1)

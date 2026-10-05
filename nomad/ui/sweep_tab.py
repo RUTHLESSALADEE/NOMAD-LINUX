@@ -8,9 +8,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QFileDialog, QFormLayout, QHBoxLayout, \
-    QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox, QProgressBar, QPushButton, QSpinBox, QTableWidget, \
-    QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, \
+    QLineEdit, QMenu, QMessageBox, QProgressBar, QPushButton, QSpinBox, QTableWidget, QVBoxLayout, QWidget
 
 from ..oui import vendor
 from ..sweep import LARGE_SWEEP_HOSTS, SWEEP_PASSES, add_to_user_path, find_putty, local_networks, lookup_host, \
@@ -18,7 +17,7 @@ from ..sweep import LARGE_SWEEP_HOSTS, SWEEP_PASSES, add_to_user_path, find_putt
 from ..ipam.store import parse_subnet
 from ..terminal.sessions import SSH
 from .host_menu import HostActions
-from .common import SortableTableItem, StoppableThread, set_hint, set_invalid
+from .common import ColumnFitter, SortableTableItem, StoppableThread, set_hint, set_invalid
 from .ipam_compare import IpamComparison, finding_color
 from .theme import accent_button
 
@@ -174,8 +173,8 @@ class SweepTab(QWidget):
         self.table.setSortingEnabled(True)
         self.table.sortByColumn(0, Qt.AscendingOrder)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
+        ColumnFitter(self.table)
         layout.addWidget(self.table, 1)
 
         host_buttons = QHBoxLayout()

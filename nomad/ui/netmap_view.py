@@ -12,6 +12,7 @@ from PyQt5.QtWidgets import QGraphicsItem, QGraphicsLineItem, QGraphicsScene, QG
 from ..netmap.l3 import HOP, STAR, SUBNET
 from ..netmap.layout import GROUP_PAD, GROUP_TITLE, NODE_HEIGHT, NODE_WIDTH
 from ..netmap.monitor import DOWN, UNKNOWN, UP, duration_text
+from ..netmap.vlans import ACCESS, NATIVE, ONE_END, TAGGED
 from ..netmap.model import AP, BUILDING, FIREWALL, GROUP_KINDS, KIND_NAMES, NO_SNMP, ROOM, ROUTER, SERVER, \
     SHARED_PORT_HOSTS, SITE, SNMP, SOURCE_NAMES, SWITCH, UNREACHABLE
 from .theme import COLORS
@@ -38,6 +39,10 @@ GROUP_TAGS = {BUILDING: "BLDG", ROOM: "ROOM"}
 GROUP_Z = {SITE: -3, BUILDING: -2, ROOM: -1}  # Inner groups' boxes over the ones they're in
 GROUP_BOX = "group:"  # Starts a group's key among devices' keys when arranging or lining them up together
 NODE_RECT = QRectF(-NODE_WIDTH / 2, -NODE_HEIGHT / 2, NODE_WIDTH, NODE_HEIGHT)
+# A VLAN highlighted: how each link carries it, and how faint what doesn't carry it is
+VLAN_LINK_COLORS = {TAGGED: COLORS["link"], NATIVE: COLORS["link"], ACCESS: COLORS["accent"], ONE_END: COLORS["warning"]}
+VLAN_LINK_NAMES = {TAGGED: "tagged", NATIVE: "native (untagged)", ACCESS: "access ports", ONE_END: "one end only"}
+FADED = 0.22
 
 
 def small_font(scale=0.85, bold=False):
@@ -706,6 +711,7 @@ class LinkItem(QGraphicsItem):
         self.setZValue(0)
         self.traced = all(link.protocols == ["icmp"] for link in links)
         self.manual = all(link.manual for link in links)  # Drawn by hand
+        self.vlan_kind = None  # How it carries the VLAN highlighted (see MapView.set_vlan_focus)
         self.setToolTip("\n".join(
             f"{label_of(a)} {link.port_on(a)}  —  {label_of(b)} {link.port_on(b)}  ({link_source(link)})"
             for link, (a, b) in zip(links, ends)))
@@ -753,7 +759,9 @@ class LinkItem(QGraphicsItem):
         painter.setRenderHint(QPainter.Antialiasing)
         count = len(self.links)
         pen = QPen(QColor(COLORS["muted"]), 3.2 if count > 1 else 1.5)
-        if self.traced:
+        if self.vlan_kind is not None:
+            pen = QPen(QColor(VLAN_LINK_COLORS[self.vlan_kind]), 4 if count > 1 else 3)
+        if self.traced or self.vlan_kind in (NATIVE, ONE_END):
             pen.setStyle(Qt.DashLine)
         elif self.manual:
             pen.setStyle(Qt.DotLine)
@@ -816,12 +824,14 @@ class MapView(QGraphicsView):
         self.auto_fit = False  # Fitted automatically and not zoomed or panned since: refit when resized
         self.drawing = None  # Drawing a link by hand: (DeviceItem it starts from, the rubber line)
         self.last_found = None  # (text, match) Find showed last, so Enter again goes on to the next
+        self.vlan_focus = None  # netmap.vlans.Focus of the VLAN highlighted, or None
         self.scene().selectionChanged.connect(self.on_selection_changed)
 
     def set_map(self, network_map, positions):
         self.cancel_drawing()
         self.scene().clear()
         self.items_by_key, self.link_items, self.group_items, self.drag = {}, [], {}, None
+        self.vlan_focus = None  # Its links are new: the page highlights the VLAN again
         self.network_map, self.links = network_map, network_map.links
         self.groups_suspended = True
         for key, device in network_map.devices.items():
@@ -838,6 +848,7 @@ class MapView(QGraphicsView):
         self.cancel_drawing()
         self.scene().clear()
         self.items_by_key, self.link_items, self.group_items, self.drag = {}, [], {}, None
+        self.vlan_focus = None  # Its links are new: the page highlights the VLAN again
         self.network_map, self.links, self.last_found = None, [], None
         self.update_scene_rect()
 
@@ -846,6 +857,7 @@ class MapView(QGraphicsView):
         self.cancel_drawing()
         self.scene().clear()
         self.items_by_key, self.link_items, self.group_items, self.drag = {}, [], {}, None
+        self.vlan_focus = None  # Its links are new: the page highlights the VLAN again
         self.network_map, self.links = None, links
         for key, node in nodes.items():
             item = DeviceItem(node.device, {}, self) if node.device is not None else SimpleNodeItem(node, self)
@@ -879,6 +891,8 @@ class MapView(QGraphicsView):
             item = LinkItem(a_item, b_item, links, ends, lambda key: self.items_by_key[key].label)
             self.scene().addItem(item)
             self.link_items.append(item)
+        if self.vlan_focus is not None:  # The new lines show it too
+            self.set_vlan_focus(self.vlan_focus)
 
     # ----------------------------------------------------------------- Groups
 
@@ -1148,6 +1162,26 @@ class MapView(QGraphicsView):
                               if hosts else "")
                 for port_item in item.port_items:
                     port_item.update()
+
+    def set_vlan_focus(self, focus):
+        """Highlight a VLAN (a netmap.vlans.Focus): the devices in it and the links carrying it stay bright (the links
+        coloured by how they carry it), the rest fade. None shows everything again."""
+        self.vlan_focus = focus
+        for key, item in self.items_by_key.items():
+            item.setOpacity(1.0 if focus is None or key in focus.devices else FADED)
+        for item in self.link_items:
+            kinds = [focus.links.get(id(link)) for link in item.links] if focus is not None else []
+            kinds = [kind for kind in kinds if kind]
+            item.vlan_kind = (ONE_END if ONE_END in kinds else kinds[0]) if kinds else None
+            item.setOpacity(1.0 if focus is None or kinds else FADED)
+            tip = item.toolTip().split("\nVLAN ")[0]
+            if item.vlan_kind is not None:
+                tip += f"\nVLAN {focus.vlan}: {VLAN_LINK_NAMES[item.vlan_kind]}"
+            item.setToolTip(tip)
+            item.update()
+        for item in self.group_items.values():
+            item.setOpacity(1.0 if focus is None or any(member.key in focus.devices for member in item.all_members())
+                            else FADED)
 
     def set_highlights(self, colors):
         """Ring the items in {key: colour}; clear the rest."""

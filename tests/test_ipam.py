@@ -414,7 +414,8 @@ def test_database_from_before_loopbacks_is_upgraded(tmp_path):
     upgraded = IpamStore(path, user="tester")
     network = upgraded.add_network("Lab")
     assert upgraded.add_subnet(network.id, "10.0.0.0/30", loopbacks=True).loopbacks
-    assert upgraded.get_meta("schema") == "2"
+    assert upgraded.get_meta("schema") == "4"  # The VLAN and placement tables were added too
+    assert upgraded.db.execute("SELECT COUNT(*) FROM vlans").fetchone()[0] == 0
     upgraded.close()
 
 

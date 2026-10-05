@@ -3,12 +3,12 @@ import logging
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor
-from PyQt5.QtWidgets import QAbstractItemView, QApplication, QFormLayout, QHBoxLayout, QHeaderView, QLabel, \
-    QProgressBar, QPushButton, QSpinBox, QSplitter, QTableWidget, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QAbstractItemView, QApplication, QFormLayout, QHBoxLayout, QLabel, QProgressBar, \
+    QPushButton, QSpinBox, QSplitter, QTableWidget, QVBoxLayout, QWidget
 
 from ..dhcp import CLIENT_PORT, assess, current_dhcp_server, discover_servers
 from ..system import allow_inbound_port
-from .common import SortableTableItem, StoppableThread, set_hint
+from .common import ColumnFitter, SortableTableItem, StoppableThread, set_hint
 from .theme import COLORS, accent_button
 
 log = logging.getLogger(__name__)
@@ -99,8 +99,8 @@ class DhcpTab(QWidget):
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
+        ColumnFitter(self.table)
 
         details = QWidget()
         details_layout = QVBoxLayout(details)
@@ -117,8 +117,8 @@ class DhcpTab(QWidget):
         self.details.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.details.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.details.verticalHeader().setVisible(False)
-        self.details.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.details.horizontalHeader().setStretchLastSection(True)
+        ColumnFitter(self.details)
         details_layout.addWidget(self.details, 1)
 
         splitter = QSplitter(Qt.Vertical)

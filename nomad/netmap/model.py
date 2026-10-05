@@ -54,8 +54,10 @@ def short_port(name):
 
 
 def port_key(name):
-    """For matching the same port written two ways (Gi1/0/1, GigabitEthernet1/0/1, gi1/0/1)."""
-    return short_port(name).lower().replace(" ", "")
+    """For matching the same port written two ways (Gi1/0/1, GigabitEthernet1/0/1, gi1/0/1; Et0/0, as IOS names an
+    Ethernet port itself, and Eth0/0, from Ethernet0/0 as CDP gives it)."""
+    key = short_port(name).lower().replace(" ", "")
+    return "eth" + key[2:] if re.match(r"et\d", key) else key
 
 
 def display_name(name):
@@ -92,6 +94,16 @@ class Device:
     # On a device the crawl found: what was corrected by hand (a wrong address, kind or name), kept over what later
     # crawls find. {attribute: [what the crawl found, what it was corrected to]}
     corrected: dict = field(default_factory=dict)
+    vtp_domain: str = ""
+    vtp_mode: str = ""  # server, client, transparent or off
+    vlans: list = field(default_factory=list)  # [[VLAN, name]]: the VLANs a switch has
+    # Switch port (short name) -> {"mode": "access" or "trunk", "vlan": an access port's, "voice", "native",
+    # "allowed": a trunk's VLANs as text, such as "1-10,20"} (numbers that are 0 are left out)
+    port_vlans: dict = field(default_factory=dict)
+    port_vrfs: dict = field(default_factory=dict)  # Port (short name) -> VRF, for the ports in one (else global)
+    # VRF -> [[destination, next hop, port, protocol]], like routes (which are the global table's). Only VRFs whose
+    # routes could be read are here
+    vrf_routes: dict = field(default_factory=dict)
 
     @property
     def label(self):

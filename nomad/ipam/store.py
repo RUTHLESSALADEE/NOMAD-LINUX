@@ -10,6 +10,10 @@ Sweeps are remembered too (when each address last answered, and which ranges wer
 own: they aren't changes to the records, so they stay out of the change log and history, and sync by their own
 sequence numbers (sightings_since).
 
+VLANs are kept here too (vlan_domains and vlans, see vlans.py), beside the networks rather than in them: they use
+the same change log, sync and backups, but nothing about a network, subnet or address changes when VLANs do. A VLAN
+names the subnets it carries by CIDR, in its domain's network.
+
 Rows are never removed: deleting marks them deleted (a tombstone) and every change bumps the row's version and is
 written to the change log. On the NOMAD server, the change log's sequence numbers are the revisions clients sync by
 (changes_since); a client's copy of the team's data is an IpamStore filled by apply_rows, without a change log of
@@ -31,12 +35,15 @@ from ..system import app_data_dir
 log = logging.getLogger(__name__)
 
 FILE_NAME = "ipam.db"
-SCHEMA_VERSION = 2  # 2 added subnets.loopbacks
+SCHEMA_VERSION = 4  # 2 added subnets.loopbacks, 3 the VLAN tables, 4 subnet placement (overrides and moves)
 USED, RESERVED = "used", "reserved"
 ANYWHERE, VALUE, NAME, DESCRIPTION, MAC = "anywhere", "value", "name", "description", "mac"  # Where search looks
 STATUSES = {USED: "Used", RESERVED: "Reserved"}
 MAX_NEXT_FREE_SCAN = 1 << 20  # Stop looking for a free address after this many (a /12's worth)
-TABLES = ("networks", "subnets", "addresses")
+TABLES = ("networks", "subnets", "addresses", "vlan_domains", "vlans", "placements", "subnet_moves")
+# Unique by sort_key within
+PARENTS = {"subnets": "network_id", "addresses": "network_id", "vlans": "domain_id", "placements": "network_id"}
+JSON_COLUMNS = ("fields", "subnets", "ranges")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -66,6 +73,28 @@ CREATE TABLE IF NOT EXISTS sightings (
 CREATE TABLE IF NOT EXISTS sweeps (
     network_id TEXT NOT NULL, cidr TEXT NOT NULL, started REAL NOT NULL, finished REAL NOT NULL,
     swept_by TEXT NOT NULL DEFAULT '', seq INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (network_id, cidr));
+CREATE TABLE IF NOT EXISTS vlan_domains (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, network_id TEXT NOT NULL DEFAULT '', vtp_domain TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '', ranges TEXT NOT NULL DEFAULT '[]', fields TEXT NOT NULL DEFAULT '{}',
+    version INTEGER NOT NULL, modified TEXT NOT NULL, modified_by TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS vlans (
+    id TEXT PRIMARY KEY, domain_id TEXT NOT NULL, vlan INTEGER NOT NULL, sort_key TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, subnets TEXT NOT NULL DEFAULT '[]',
+    description TEXT NOT NULL DEFAULT '', fields TEXT NOT NULL DEFAULT '{}',
+    version INTEGER NOT NULL, modified TEXT NOT NULL, modified_by TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0);
+CREATE UNIQUE INDEX IF NOT EXISTS vlans_unique ON vlans (domain_id, sort_key) WHERE deleted = 0;
+CREATE TABLE IF NOT EXISTS placements (
+    id TEXT PRIMARY KEY, network_id TEXT NOT NULL, cidr TEXT NOT NULL, sort_key TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'auto', one_segment INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL, modified TEXT NOT NULL, modified_by TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0);
+CREATE UNIQUE INDEX IF NOT EXISTS placements_unique ON placements (network_id, sort_key) WHERE deleted = 0;
+CREATE TABLE IF NOT EXISTS subnet_moves (
+    id TEXT PRIMARY KEY, network_id TEXT NOT NULL, cidr TEXT NOT NULL, sort_key TEXT NOT NULL,
+    from_domain_id TEXT NOT NULL DEFAULT '', from_vlan INTEGER NOT NULL DEFAULT 0,
+    from_device TEXT NOT NULL DEFAULT '', to_domain_id TEXT NOT NULL DEFAULT '',
+    to_vlan INTEGER NOT NULL DEFAULT 0, to_device TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+    planned_for TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '', finished TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL, modified TEXT NOT NULL, modified_by TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS sightings_seq ON sightings (seq);
 CREATE INDEX IF NOT EXISTS sweeps_seq ON sweeps (seq);
 """
@@ -73,6 +102,11 @@ CREATE INDEX IF NOT EXISTS sweeps_seq ON sweeps (seq);
 
 class IpamError(Exception):
     """A change that can't be made, with a message for the user."""
+
+
+def vlan_key(number):
+    """Sort key for a VLAN number."""
+    return f"{int(number):04d}"
 
 
 def ip_key(address):
@@ -230,19 +264,95 @@ class Address:
         return ipaddress.ip_address(self.ip)
 
 
-ENTITIES = {"networks": Network, "subnets": Subnet, "addresses": Address}
+@dataclass
+class VlanDomain:
+    """Where VLAN numbers are unique (a VTP domain, or a site's switches), optionally for one IPAM network: the
+    network whose subnets its VLANs carry."""
+    id: str
+    name: str
+    network_id: str = ""
+    vtp_domain: str = ""  # The VTP domain its switches are in, for matching what a network map found
+    description: str = ""
+    ranges: list = field(default_factory=list)  # [{"first", "last", "name"}]: blocks set aside for a purpose
+    fields: dict = field(default_factory=dict)
+    version: int = 1
+    modified: str = ""
+    modified_by: str = ""
+
+
+@dataclass
+class Vlan:
+    id: str
+    domain_id: str
+    vlan: int
+    name: str = ""
+    status: str = "active"
+    subnets: list = field(default_factory=list)  # CIDRs of the subnets it carries, in its domain's network
+    description: str = ""
+    fields: dict = field(default_factory=dict)
+    version: int = 1
+    modified: str = ""
+    modified_by: str = ""
+
+
+@dataclass
+class Placement:
+    """How the Subnet Placement page treats one subnet of a network, where someone said so: advertised or local
+    (over what the map's routing tables suggest), or its places one L2 segment the map can't see."""
+    id: str
+    network_id: str
+    cidr: str
+    scope: str = "auto"  # auto, advertised or local
+    one_segment: bool = False
+    note: str = ""
+    version: int = 1
+    modified: str = ""
+    modified_by: str = ""
+
+
+@dataclass
+class SubnetMove:
+    """A subnet moving from one VLAN (and device) to another: planned, in progress, done or cancelled."""
+    id: str
+    network_id: str
+    cidr: str
+    from_domain_id: str = ""
+    from_vlan: int = 0
+    from_device: str = ""  # Network map device key, when it matters which device
+    to_domain_id: str = ""
+    to_vlan: int = 0
+    to_device: str = ""
+    status: str = "planned"
+    planned_for: str = ""  # When it's to happen (free text, such as a date or change window)
+    note: str = ""
+    finished: str = ""  # When it was done or cancelled
+    version: int = 1
+    modified: str = ""
+    modified_by: str = ""
+
+
+ENTITIES = {"networks": Network, "subnets": Subnet, "addresses": Address, "vlan_domains": VlanDomain, "vlans": Vlan,
+            "placements": Placement, "subnet_moves": SubnetMove}
 EDITABLE = {
     "networks": {"name", "description", "fields"},
     "subnets": {"name", "gateway", "description", "fields", "loopbacks"},
     "addresses": {"status", "name", "mac", "description", "fields"},
+    "vlan_domains": {"name", "network_id", "vtp_domain", "description", "ranges", "fields"},
+    "vlans": {"name", "status", "subnets", "description", "fields"},
+    "placements": {"scope", "one_segment", "note"},
+    "subnet_moves": {"from_domain_id", "from_vlan", "from_device", "to_domain_id", "to_vlan", "to_device", "status",
+                     "planned_for", "note", "finished"},
 }
 
 
 def _from_row(cls, row):
     values = {name: row[name] for name in row.keys() if name in cls.__dataclass_fields__}
-    values["fields"] = json.loads(values.get("fields") or "{}")
-    if "loopbacks" in values:
-        values["loopbacks"] = bool(values["loopbacks"])
+    for name in JSON_COLUMNS:
+        if name in values:
+            values[name] = json.loads(values[name] or ("{}" if name == "fields" else "[]"))
+    for name in ("loopbacks", "one_segment"):
+        if name in values:
+            values[name] = bool(values[name])
     return cls(**values)
 
 
@@ -302,11 +412,18 @@ class IpamStore:
     def _insert(self, table, item):
         item.version, item.modified, item.modified_by = 1, now(), self.user
         data = {name: getattr(item, name) for name in item.__dataclass_fields__}
-        row = dict(data, fields=json.dumps(item.fields))  # Details keep the order they were given in
+        row = dict(data)  # Details keep the order they were given in
+        for name in JSON_COLUMNS:
+            if name in row:
+                row[name] = json.dumps(row[name])
         if table == "subnets":
             row["sort_key"] = subnet_key(item.network)
         elif table == "addresses":
             row["sort_key"] = ip_key(item.address)
+        elif table == "vlans":
+            row["sort_key"] = vlan_key(item.vlan)
+        elif table in ("placements", "subnet_moves"):
+            row["sort_key"] = subnet_key(parse_subnet(item.cidr))
         names = ", ".join(row)
         self.db.execute(f"INSERT INTO {table} ({names}) VALUES ({', '.join('?' * len(row))})", list(row.values()))
         self._log(table, item.id, item.version, "create", data)
@@ -323,8 +440,9 @@ class IpamStore:
             setattr(item, name, value)
         item.version, item.modified, item.modified_by = item.version + 1, now(), self.user
         row = dict(changes, version=item.version, modified=item.modified, modified_by=item.modified_by)
-        if "fields" in row:
-            row["fields"] = json.dumps(row["fields"])
+        for name in JSON_COLUMNS:
+            if name in row:
+                row[name] = json.dumps(row[name])
         assignments = ", ".join(f"{name} = ?" for name in row)
         self.db.execute(f"UPDATE {table} SET {assignments} WHERE id = ?", list(row.values()) + [item.id])
         self._log(table, item.id, item.version, "update", changes)
@@ -395,10 +513,11 @@ class IpamStore:
                 table, row = item["entity"], item["row"]
                 if table not in TABLES:
                     continue
-                if table != "networks" and not row.get("deleted"):
-                    # An older row here may still hold the same address or subnet: the server's word wins
-                    self.db.execute(f"UPDATE {table} SET deleted = 1 WHERE network_id = ? AND sort_key = ? AND "
-                                    "deleted = 0 AND id != ?", (row["network_id"], row["sort_key"], row["id"]))
+                parent = PARENTS.get(table)
+                if parent is not None and not row.get("deleted"):
+                    # An older row here may still hold the same address, subnet or VLAN: the server's word wins
+                    self.db.execute(f"UPDATE {table} SET deleted = 1 WHERE {parent} = ? AND sort_key = ? AND "
+                                    "deleted = 0 AND id != ?", (row[parent], row["sort_key"], row["id"]))
                 names = ", ".join(row)
                 self.db.execute(f"INSERT OR REPLACE INTO {table} ({names}) VALUES ({', '.join('?' * len(row))})",
                                 list(row.values()))

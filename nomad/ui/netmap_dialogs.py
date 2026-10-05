@@ -6,8 +6,8 @@ from dataclasses import replace
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, \
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QRadioButton, QSpinBox, \
-    QTableWidget, QTableWidgetItem, QVBoxLayout
+    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QRadioButton, QSpinBox, QTableWidget, \
+    QTableWidgetItem, QVBoxLayout
 
 from ..netmap import diff
 from ..netmap.crawl import MAX_WORKERS, WORKERS, parse_networks
@@ -16,6 +16,7 @@ from ..netmap.model import AP, CORRECTED_NAMES, FIREWALL, GROUP_KINDS, KIND_NAME
 from ..oui import format_mac, vendor
 from ..snmp import VERSIONS, community_is_valid
 from ..snmpv3 import AUTH_NAMES, PRIV_NAMES, V3User, is_v3
+from .common import ColumnFitter
 from .theme import COLORS
 
 CHANGE_COLORS = {diff.ADDED: "success", diff.REMOVED: "error", diff.CHANGED: "warning", diff.MOVED: "link"}
@@ -31,7 +32,8 @@ class V3UsersTable(QTableWidget):
         self.setHorizontalHeaderLabels(self.COLUMNS)
         self.verticalHeader().setVisible(False)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.horizontalHeader().setStretchLastSection(True)
+        ColumnFitter(self)
         for user in users:
             self.add_user(user)
 
@@ -132,7 +134,8 @@ class CommunitiesDialog(QDialog):
         self.table.setHorizontalHeaderLabels(["Subnet", "Community or v3:user"])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        ColumnFitter(self.table)
         for subnet, community in overrides:
             self.add_row(subnet, V3_PREFIX + community.user if is_v3(community) else community)
         layout.addWidget(self.table, 1)
@@ -315,8 +318,8 @@ class CompareDialog(QDialog):
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
+        ColumnFitter(self.table)
         self.table.itemDoubleClicked.connect(self.on_double_click)
         layout.addWidget(self.table, 1)
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
@@ -363,8 +366,8 @@ class DeletedDevicesDialog(QDialog):
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
+        ColumnFitter(self.table)
         for row, key in enumerate(self.keys):
             name, addresses = deleted[key]
             self.table.setItem(row, 0, QTableWidgetItem(name))

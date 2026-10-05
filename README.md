@@ -19,6 +19,8 @@ Screenshots use made-up demo data.
 - [Terminal and SCP](#terminal-and-scp)
 - [IP address management (IPAM)](#ip-address-management-ipam)
 - [Sharing IPAM with the tribe](#sharing-ipam-with-the-tribe)
+- [VLANs](#vlans)
+- [Subnet placement](#subnet-placement)
 - [Good to know](#good-to-know)
 - [Running from source and building](#running-from-source-and-building)
 
@@ -55,6 +57,8 @@ Screenshots use made-up demo data.
 | Page | Functions |
 | --- | --- |
 | **IP Addresses** | IP address management for several separate networks, shared with the tribe through an IPAM server and usable offline. [More below.](#ip-address-management-ipam) |
+| **VLANs** | Each VLAN domain's VLANs and the subnets they carry, brought in from what the network map finds, shared with the tribe. [More below.](#vlans) |
+| **Subnet Placement** | Where each subnet is planned to be and where the network map finds it, whether it's advertised, what's wrong, and moving subnets between VLANs and devices. [More below.](#subnet-placement) |
 
 ### Test
 
@@ -272,6 +276,31 @@ Spreadsheets are imported, and tribe networks added or deleted, only in NOMAD on
 - Subnets and networks can only be changed online.
 
 **Troubleshooting:** stop the service and run `NOMAD.exe --ipam-server` to run the server in a console. Its log is `%ProgramData%\NOMAD\server\server.log`.
+
+## VLANs
+
+The **VLANs** page (Manage > VLANs) keeps each VLAN domain's VLANs: number, name, status (active, reserved or planned), description and the subnets each carries.
+
+- **Domains:** a domain is where VLAN numbers are unique: a VTP domain, or a site's switches. **New Domain** makes a Tribe one (shared through the IPAM server, like tribe networks) or a Local one. A domain can belong to one IPAM network, whose subnets its VLANs carry, and can have ranges set aside (100-199 for users, say), which **Next Free** picks from.
+- **IPAM stays as it is:** a VLAN names its subnets by CIDR, in its domain's network. Nothing is written to the subnets, so the IP Addresses page and its export to the workbook don't change. **Domain > Link Subnets Named for VLANs** links subnets whose names (Vlan 6) or details (a Vlan 10 column) say which VLAN they're in, without touching them.
+- **From the network map:** **Domain > Bring in VLANs from a Network Map** (or **Add to VLAN Database** on the map's VLANs tab) compares what the crawl found on the switches with a domain, or a new one named after the VTP domain, and you tick what to add, rename or link. Each VLAN interface (an SVI, or a router's subinterface such as Gi0/0.100) links the IPAM subnet holding its address; the network holding most of them is suggested for a domain that has none. VLANs deleted from the domain, and names it already has, aren't ticked: the database may have the intended answer, and the switches may be what needs changing.
+- **On the page:** **Gateways (IPAM)** comes from the linked subnets, **VLAN Interfaces (Map)** from the map open, and **On the Map** says how many switches have each VLAN, warning when a switch names it differently. In a VLAN's window, the subnets holding its interfaces on the map are marked and listed first. **Highlight on Map** shows a VLAN on the map, **Show Subnet in IPAM** goes to its subnet, and **History** shows who changed it and when.
+- **Offline:** tribe VLANs can be changed offline: changes wait as pending and are sent when the server is back. **Review Refused VLAN Changes** offers the next free number (in the same range) or discarding, for a VLAN someone else changed first. Domains can only be changed online. The server needs NOMAD 1.16 or later (Update Service).
+
+On the **Network Map**, the crawl reads every switch's VLANs, VTP domain and port VLANs (access, voice, trunk native and allowed). The **VLANs** tab lists each VLAN by VTP domain with its switches, ports, gateways and hosts, and **checks** for mistakes: a trunk facing an access port, native VLANs that differ, VLANs allowed at one end of a trunk only, access ports in VLANs the switch doesn't have, and a VLAN named differently on two switches. **Highlight on Map** (or right-click a device or port > **Highlight VLAN**) fades everything that doesn't carry the VLAN; the links that do are coloured by how they carry it, with a trunk allowing it at one end only dashed orange. **Stop Highlighting VLAN** is at the top of every right-click menu while one is highlighted.
+
+VLANs stay up to date as the map does: mapping again, **Crawl from Here** and watching (which reads each switch again every hour, and when a trap, a syslog message or a new neighbor says something changed) read them again, and watching notes in its log VLANs added, gone or renamed and ports moved to another VLAN. **Read VLANs Again** on the VLANs tab reads just the VLANs, quickly: it's how a map made before NOMAD read VLANs gets them.
+
+## Subnet placement
+
+An advertised subnet (one other routers have a route to) can be in only one place at a time; a local one (that nobody routes to, such as a printer subnet reused at every site) can be in several. The **Subnet Placement** page (Manage > Subnet Placement) checks this for an IPAM network against the network map open on the Network Map page.
+
+- **Each subnet** (per VRF) shows where it's planned to be (the VLANs it's linked to on the VLANs page), where the map finds it (each device's address in it, with places that are one L2 segment counted as one: HSRP/VRRP SVIs on a trunked VLAN, a link's two ends, a router subinterface and the switch it's on, two linked devices whose link can carry it, such as OSPF neighbors on a transit subnet), and whether it's advertised: the protocols and how many routers have a route to it, each route followed to where it leads, so each place says whether that device advertises it or only has an address in it. Routers on it the map couldn't read (a next hop in it no device on the map has, or a linked device that didn't answer SNMP) are noted. A subnet only covered by a summary counts as local, with the summary noted.
+- **What's wrong:** an advertised subnet in two places; routers reaching it in different places; an advertised subnet linked to two VLANs; a subnet in another VLAN on the map than it's linked to; a local-only subnet that's leaking into the routing tables; an advertised subnet inside another one advertised elsewhere. **Show** picks problems, advertised, local, moving, or subnets on the map that aren't in the network.
+- **How to Treat It** sets a subnet advertised or local when the routing tables don't say it right (with a note), or marks its places one L2 segment the map can't see. It's kept beside the VLANs (shared with the tribe), never on the IPAM subnet.
+- **Moving a subnet:** **Plan Move** (from its VLAN, and device, to another; when; why), **Start Move** when the work begins, **Read Routes Again** once it's done on the switches, **Check Move** (it's only at the new place, and every route leads there), then **Complete Move**, which relinks it on the VLANs page. While it's in progress, the page expects it at the old place or the new one, and flags it if it's advertised from both.
+- **VRFs:** each VRF is checked on its own (the same subnet in two VRFs is two subnets). Interfaces' VRFs come from CISCO-VRF-MIB or MPLS-L3VPN-STD-MIB, and VRF routing tables from MPLS-L3VPN-STD-MIB; when a device doesn't offer those, the crawl log says so and the page notes it.
+- Watching notes subnets that appear, go or move between switches in the Watch log, and **Read Routes Again** brings the map's routing tables up to date without mapping again.
 
 ## Good to know
 

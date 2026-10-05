@@ -4,12 +4,12 @@ import time
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
-from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel, \
-    QLineEdit, QMenu, QMessageBox, QPushButton, QTableWidget, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, \
+    QMenu, QMessageBox, QPushButton, QTableWidget, QVBoxLayout, QWidget
 
 from ..neighbors import PERMANENT, UNRESOLVED_STATES, MacHistory, clear_neighbor_cache, delete_neighbor, \
     load_neighbors, shared_macs
-from .common import SortableTableItem, run_in_background, set_hint
+from .common import ColumnFitter, SortableTableItem, run_in_background, set_hint
 from .ipam_compare import IpamComparison, finding_color
 from .theme import COLORS
 
@@ -72,9 +72,8 @@ class NeighborsTab(QWidget):
         self.table.setSortingEnabled(True)
         self.table.sortByColumn(COL_ADDRESS, Qt.AscendingOrder)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeToContents)
-        header.setStretchLastSection(True)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        ColumnFitter(self.table)
         layout.addWidget(self.table, 1)
 
         bottom = QHBoxLayout()

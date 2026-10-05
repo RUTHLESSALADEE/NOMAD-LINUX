@@ -6,11 +6,11 @@ from pathlib import Path
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor
-from PyQt5.QtWidgets import QApplication, QDialog, QFileDialog, QHBoxLayout, QHeaderView, QLabel, QMessageBox, \
-    QProgressBar, QPushButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout
+from PyQt5.QtWidgets import QApplication, QDialog, QFileDialog, QHBoxLayout, QLabel, QMessageBox, QProgressBar, \
+    QPushButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout
 
 from ..report import INFO, OK, PROBLEM, STATUS_LABELS, WARNING, render_html, render_text, run_diagnostics
-from .common import StoppableThread, set_hint
+from .common import ColumnFitter, StoppableThread, set_hint
 from .theme import COLORS, accent_button, monospace_font
 
 log = logging.getLogger(__name__)
@@ -58,8 +58,8 @@ class ReportDialog(QDialog):
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Check", "Result"])
         self.tree.setWordWrap(True)
-        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.tree.header().setStretchLastSection(True)
+        ColumnFitter(self.tree)
         layout.addWidget(self.tree, 1)
 
         buttons = QHBoxLayout()

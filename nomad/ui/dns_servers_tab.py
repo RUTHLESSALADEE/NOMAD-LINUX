@@ -6,12 +6,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QKeySequence
-from PyQt5.QtWidgets import QAbstractItemView, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, \
-    QLineEdit, QPushButton, QShortcut, QSpinBox, QTableWidget, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QAbstractItemView, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, \
+    QPushButton, QShortcut, QSpinBox, QTableWidget, QVBoxLayout, QWidget
 
 from ..dnsclient import RCODE_MEANINGS, benchmark_server, forward_reverse
 from ..lookup import HOSTNAME_PATTERN
-from .common import SortableTableItem, StoppableThread, format_ms, run_in_background, set_hint, set_invalid
+from .common import ColumnFitter, SortableTableItem, StoppableThread, format_ms, run_in_background, set_hint, set_invalid
 from .theme import COLORS, accent_button
 
 log = logging.getLogger(__name__)
@@ -112,9 +112,8 @@ class DnsServersTab(QWidget):
         self.dns_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.dns_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.dns_table.verticalHeader().setVisible(False)
-        header = self.dns_table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeToContents)
-        header.setStretchLastSection(True)
+        self.dns_table.horizontalHeader().setStretchLastSection(True)
+        ColumnFitter(self.dns_table)
         layout.addWidget(self.dns_table, 1)
 
         check_group = QGroupBox("Forward / reverse check")
@@ -138,8 +137,8 @@ class DnsServersTab(QWidget):
         self.fr_table.setHorizontalHeaderLabels(FR_COLUMNS)
         self.fr_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.fr_table.verticalHeader().setVisible(False)
-        self.fr_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.fr_table.horizontalHeader().setStretchLastSection(True)
+        ColumnFitter(self.fr_table)
         self.fr_table.setMaximumHeight(150)
         layout.addWidget(self.fr_table)
 

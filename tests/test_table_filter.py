@@ -1,13 +1,15 @@
 """Excel-style column filters on a table."""
+import gc
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
 from PyQt5.QtCore import Qt  # noqa: E402
-from PyQt5.QtWidgets import QApplication  # noqa: E402
+from PyQt5.QtWidgets import QApplication, QHeaderView, QTableWidget, QTableWidgetItem  # noqa: E402
 
-from nomad.ui.common import SortableTableItem, read_only_table  # noqa: E402
+from nomad.ui import common  # noqa: E402
+from nomad.ui.common import ColumnFitter, SortableTableItem, read_only_table  # noqa: E402
 from nomad.ui.table_filter import FilterPopup, TableFilter, natural_key  # noqa: E402
 
 ROWS = [["sw1", "Switch", "10"], ["sw2", "Switch", "20"], ["rtr1", "Router", "10"], ["ap1", "Access point", ""],
@@ -121,3 +123,41 @@ def test_popup_puts_the_filter_first(table):
     texts = [action.text() for action in popup.actions() if action.text()]
     assert texts == ["Clear All Filters", "Sort A to Z", "Sort Z to A"]  # After the list of values
     assert popup.actions()[0].defaultWidget() is not None  # The search and the values come first
+
+
+def test_columns_fit_their_contents_until_dragged(table, app, monkeypatch):
+    fitter = TableFilter(table).columns
+    header = table.horizontalHeader()
+    assert all(header.sectionResizeMode(column) == QHeaderView.Interactive for column in range(3))  # Draggable
+    app.processEvents()
+    narrow = header.sectionSize(0)
+    table.item(0, 0).setText("a much longer device name than before")
+    app.processEvents()
+    assert header.sectionSize(0) > narrow  # Followed its contents
+    fitter.widest = {0: 90}
+    fitter.fit()
+    assert header.sectionSize(0) == 90
+    monkeypatch.setattr(common.QApplication, "mouseButtons", staticmethod(lambda: Qt.LeftButton))
+    header.resizeSection(1, 300)  # As the user dragging it
+    monkeypatch.undo()
+    table.item(0, 1).setText("x")
+    app.processEvents()
+    assert header.sectionSize(1) == 300  # Kept where the user put it
+    fitter.on_double_clicked(1)
+    app.processEvents()
+    assert header.sectionSize(1) < 300  # Fits its contents again
+
+
+def test_stretch_column_takes_the_room_left(app):
+    widget = QTableWidget(1, 3)
+    widget.resize(600, 200)
+    widget.show()
+    for column, text in enumerate(("a", "b", "c")):
+        widget.setItem(0, column, QTableWidgetItem(text))
+    ColumnFitter(widget, stretch=1)
+    gc.collect()  # Kept by the table though nothing else holds it
+    app.processEvents()
+    header = widget.horizontalHeader()
+    assert sum(header.sectionSize(column) for column in range(3)) == widget.viewport().width()
+    assert header.sectionSize(1) > header.sectionSize(0)
+    widget.close()

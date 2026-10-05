@@ -6,13 +6,13 @@ import time
 from PyQt5.QtCore import QTimer, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QIcon, QPixmap
 from PyQt5.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QGroupBox, \
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QSplitter, \
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
+    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QSplitter, QTableWidget, \
+    QTableWidgetItem, QVBoxLayout, QWidget
 
 from ..icmp import IcmpClient, resolve_host
 from ..latency import DEFAULT_WINDOW_SECONDS, WINDOW_OPTIONS, CsvLog, LatencyTarget, autoscale, targets_from_dicts
 from ..system import log_dir
-from .common import StoppableThread, set_hint, set_invalid
+from .common import ColumnFitter, StoppableThread, set_hint, set_invalid
 from .latency_charts import GaugePanel, LatencyGauge, LatencyGraph, series_color
 from .theme import COLORS, accent_button, monospace_font
 
@@ -174,9 +174,7 @@ class LatencyTab(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.verticalHeader().setVisible(False)
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_NAME, QHeaderView.Stretch)
+        ColumnFitter(self.table, stretch=COL_NAME)
         self.table.setToolTip("Tick On to monitor a target; it can be changed while monitoring.")
         # Always leave room for about three targets, however much space the charts take
         self.table.setMinimumHeight(self.table.horizontalHeader().sizeHint().height()

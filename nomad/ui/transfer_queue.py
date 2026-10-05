@@ -5,12 +5,12 @@ import time
 
 from PyQt5.QtCore import QTimer, Qt, pyqtSignal
 from PyQt5.QtGui import QColor
-from PyQt5.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel, QMenu, \
-    QPushButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QHBoxLayout, QLabel, QMenu, QPushButton, \
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
 
 from ..terminal.files import ASK, CANCELLED, DONE, FAILED, NEWER, OVERWRITE, PAUSED, QUEUED, RENAME, RUNNING, \
     SKIP, SKIPPED, UPLOAD
-from .common import format_size
+from .common import ColumnFitter, format_size
 from .theme import COLORS
 
 DIRECTION, NAME, TARGET, SIZE, PROGRESS, SPEED, STATUS = range(7)
@@ -89,10 +89,7 @@ class QueuePanel(QWidget):
         self.tree.setHeaderLabels(["", "File", "To", "Size", "Progress", "Speed", "Status"])
         header = self.tree.header()
         header.setStretchLastSection(True)
-        for column in (DIRECTION, SIZE, PROGRESS, SPEED):
-            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(NAME, QHeaderView.Interactive)
-        header.setSectionResizeMode(TARGET, QHeaderView.Interactive)
+        ColumnFitter(self.tree, only=(DIRECTION, SIZE, PROGRESS, SPEED))
         header.resizeSection(NAME, 220)
         header.resizeSection(TARGET, 260)
         layout.addWidget(self.tree, 1)

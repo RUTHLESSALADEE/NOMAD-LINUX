@@ -3,7 +3,8 @@
 Every few minutes each switch read over SNMP is asked for its CDP and LLDP neighbors (a couple of short columns, not
 the whole crawl). When a switch's neighbors change from what they were, or a syslog message or trap says something
 happened on it, the map is crawled again from that switch, the way Crawl from Here does: new neighbors are read and
-added, and the hosts on its ports are refreshed. Every so often every switch is read like that, to catch hosts
+added, and the hosts on its ports and its VLANs are refreshed (VLANs added, gone or renamed, ports moved to
+another VLAN, and subnets that appear, go or move between devices are noted in the watch log). Every so often every switch is read like that, to catch hosts
 plugged in where nothing announced it. What turns up is added to the map straight away and noted in its news, so it's
 drawn as new until someone looks at it.
 
@@ -16,6 +17,8 @@ from dataclasses import dataclass, field, replace
 
 from ..snmp import SnmpError, parse_oid
 from . import collect
+from .placement import places, vrf_text
+from .vlans import vlan_names
 from .crawl import CrawlSettings, Crawler, in_scope, parse_networks
 from .model import NETWORK_KINDS, SNMP, normalize_name
 
@@ -31,6 +34,7 @@ TIMERS = {"neighbor_interval": (NEIGHBOR_INTERVAL, 60, 3600), "host_interval": (
 HOST_NEW_DAYS = 30  # A host back on the map within this many days isn't news
 HOST_SEEN_KEEP_DAYS = 90  # host_seen entries older than this are dropped
 MAX_FALLBACKS = 8  # Other addresses of a switch tried when its management address doesn't answer
+PORTS_LISTED = 4  # Ports moved to another VLAN named in one line of the watch log
 CDP_DEVICE_ID = f"{collect.CDP_CACHE_ENTRY}.6"
 LLDP_SYS_NAME = f"{collect.LLDP_REM_ENTRY}.9"
 LLDP_CHASSIS_ID = f"{collect.LLDP_REM_ENTRY}.5"
@@ -299,9 +303,11 @@ class WatchResult:
     hosts: list = field(default_factory=list)  # MACs of hosts new to the map (not seen on it within HOST_NEW_DAYS)
     moved: list = field(default_factory=list)  # [(MAC, from, to)]
     lines: list = field(default_factory=list)  # For the watch log
+    vlans: list = field(default_factory=list)  # Device keys whose VLANs changed
+    subnets: list = field(default_factory=list)  # (VRF, CIDR) of subnets that appeared, went or moved
 
     def __bool__(self):
-        return bool(self.devices or self.hosts or self.moved)
+        return bool(self.devices or self.hosts or self.moved or self.vlans or self.subnets)
 
 
 def place_text(network_map, device_key, port):
@@ -340,6 +346,8 @@ def apply_refresh(network_map, crawled, now=None, by=""):
     before_devices = set(network_map.devices)
     before_addresses = {device.mgmt_ip for device in network_map.devices.values() if device.mgmt_ip}
     before_hosts = {host.mac: host for host in network_map.hosts if host.mac}
+    before_vlans = {key: (vlan_names(device), dict(device.port_vlans)) for key, device in network_map.devices.items()}
+    before_places = places(network_map)
     recent = (now - datetime.timedelta(days=HOST_NEW_DAYS)).date().isoformat()
     added, read = network_map.merge_crawl(crawled)
     network_map.fold_manual_devices(new=set(added))
@@ -372,9 +380,86 @@ def apply_refresh(network_map, crawled, now=None, by=""):
             if was != where:
                 result.moved.append((host.mac, was, where))
                 result.lines.append(f"Host moved: {name} from {was} to {where}")
+    for key in sorted(read):
+        if key in before_vlans and key in network_map.devices:
+            lines = vlan_changes(network_map.devices[key], *before_vlans[key])
+            if lines:
+                result.vlans.append(key)
+                result.lines += lines
+    for subnet, line in subnet_changes(network_map, before_places, places(network_map), read):
+        result.subnets.append(subnet)
+        result.lines.append(line)
     mark_hosts_seen(network_map, now)
     prune_news(network_map)
     return result
+
+
+def subnet_changes(network_map, before, after, read):
+    """Subnets that appeared on, went from or moved between the devices read: [((VRF, CIDR), line for the log)].
+    before, after: placement.places() of the map then and now."""
+    def label(place):
+        device = network_map.devices.get(place.device)
+        return f"{device.label if device is not None else place.device} {place.port}"
+
+    changes = []
+    for subnet in sorted(set(before) | set(after)):
+        old = {(place.device, place.port): place for place in before.get(subnet, []) if place.device in read}
+        new = {(place.device, place.port): place for place in after.get(subnet, []) if place.device in read}
+        gone = [old[spot] for spot in old if spot not in new]
+        came = [new[spot] for spot in new if spot not in old]
+        if not gone and not came:
+            continue
+        vrf, cidr = subnet
+        name = f"Subnet {cidr}" + (f" (VRF {vrf_text(vrf)})" if vrf else "")
+        elsewhere = [place for place in after.get(subnet, []) if place not in came]
+        if gone and came:
+            line = f"{name} moved from {', '.join(map(label, gone))} to {', '.join(map(label, came))}"
+        elif came:
+            line = f"{name} appeared on {', '.join(map(label, came))}"
+            if elsewhere:
+                line += f" (also on {', '.join(map(label, elsewhere[:3]))})"
+        else:
+            line = f"{name} gone from {', '.join(map(label, gone))}"
+        changes.append((subnet, line))
+    return changes
+
+
+def vlan_changes(device, names_before, ports_before):
+    """What changed in a switch's VLANs since it was last read, for the watch log: VLANs added, gone or renamed,
+    and ports moved to another VLAN. A switch read for its VLANs the first time (on a map made before NOMAD read
+    them) gets one line."""
+    names = vlan_names(device)
+    if not names_before and not ports_before:
+        return [f"Read {device.label}'s VLANs: {len(names)}"] if names else []
+    lines = []
+    for vlan in sorted(set(names) - set(names_before)):
+        lines.append(f"New VLAN on {device.label}: {vlan} {names[vlan]}".rstrip())
+    for vlan in sorted(set(names_before) - set(names)):
+        lines.append(f"VLAN gone from {device.label}: {vlan} {names_before[vlan]}".rstrip())
+    for vlan in sorted(set(names) & set(names_before)):
+        if names[vlan] != names_before[vlan]:
+            lines.append(f"VLAN {vlan} renamed on {device.label}: {names_before[vlan] or '(no name)'} → "
+                         f"{names[vlan] or '(no name)'}")
+    moved = []
+    for port, entry in device.port_vlans.items():
+        old = ports_before.get(port)
+        if old is None or old == entry:
+            continue
+        if entry.get("mode") != old.get("mode"):
+            moved.append(f"{port} {old.get('mode') or '?'} → {entry.get('mode') or '?'}")
+        elif entry.get("mode") == "trunk":
+            if entry.get("native") != old.get("native"):
+                moved.append(f"{port} native {old.get('native', 1)} → {entry.get('native', 1)}")
+            elif entry.get("allowed") != old.get("allowed"):
+                moved.append(f"{port} allowed {old.get('allowed') or '(none)'} → {entry.get('allowed') or '(none)'}")
+        elif entry.get("vlan") != old.get("vlan"):
+            moved.append(f"{port} {old.get('vlan')} → {entry.get('vlan')}")
+        elif entry.get("voice") != old.get("voice"):
+            moved.append(f"{port} voice {old.get('voice') or 'none'} → {entry.get('voice') or 'none'}")
+    if moved:
+        more = f" and {len(moved) - PORTS_LISTED} more" if len(moved) > PORTS_LISTED else ""
+        lines.append(f"Ports changed VLAN on {device.label}: {'; '.join(moved[:PORTS_LISTED])}{more}")
+    return lines
 
 
 def prune_news(network_map):
