@@ -69,6 +69,23 @@ def test_map_round_trips_through_a_file(crawled, tmp_path):
     assert store.recent(tmp_path) == [path]
 
 
+def test_saving_waits_out_a_file_held_open_for_a_moment(tmp_path, monkeypatch):
+    path = store.save(NetworkMap(), folder=tmp_path)
+    replace, refusals = type(path).replace, [2]
+
+    def held_open(self, target):  # As Windows refuses while the virus scanner has the file open
+        if refusals[0]:
+            refusals[0] -= 1
+            raise PermissionError(13, "Access is denied")
+        return replace(self, target)
+    monkeypatch.setattr(type(path), "replace", held_open)
+    monkeypatch.setattr(store.time, "sleep", lambda seconds: None)
+    assert store.save(NetworkMap(), path) == path and not refusals[0]
+    refusals[0] = store.REPLACE_TRIES  # Held open for good: says so
+    with pytest.raises(PermissionError):
+        store.save(NetworkMap(), path)
+
+
 def test_loading_something_else_says_so(tmp_path):
     path = tmp_path / "other.nomadmap"
     path.write_text('{"hello": 1}', encoding="utf-8")

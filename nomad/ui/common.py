@@ -104,11 +104,13 @@ class ColumnFitter(QObject):
 
     @property
     def header(self):
-        return self.parent()
+        # Looked up as a QHeaderView: parent() looks it up as a QObject, which can find a wrapper Python still holds
+        # of an object Qt made and deleted at the same address (a menu, say), not the header there now
+        return sip.wrapinstance(sip.unwrapinstance(self.parent()), QHeaderView)
 
     @property
     def view(self):
-        return self.parent().parentWidget()
+        return self.header.parentWidget()
 
     def schedule(self, *_):
         """Fit once the current changes are made (many rows added at once fit once)."""
