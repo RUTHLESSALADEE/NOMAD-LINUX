@@ -118,7 +118,7 @@ class PlacementTab(QWidget):
         splitter.setSizes([850, 420])
         layout.addWidget(splitter, 1)
         buttons = QHBoxLayout()
-        self.scope_button = QPushButton("How to Treat It...")
+        self.scope_button = QPushButton("Role and Scope...")
         self.scope_button.setToolTip("What it's for (a VLAN, a point-to-point link, loopbacks, a tunnel, other...), "
                                      "and advertised (must be in one place) or local (may be in several), over what "
                                      "the map suggests; or its places one L2 segment the map can't see.")
@@ -394,10 +394,10 @@ class PlacementTab(QWidget):
                 "per VRF.</p><p>Its <b>role</b> says what it's for: a VLAN's subnet, a point-to-point link or a "
                 "tunnel (whose ends count as one place), loopbacks (each address on one device only), a routed "
                 "port's, a container holding other subnets, or other (not known yet: nothing is expected of it). "
-                "The map and IPAM suggest it, unless you set it (How to Treat It).</p>"
+                "The map and IPAM suggest it, unless you set it (Role and Scope).</p>"
                 "<p><b>Advertised</b> subnets (other devices have a route to them) must be in one place; "
-                "<b>local</b> ones may be reused. The routing tables decide which, unless you set it (How to Treat "
-                "It). A subnet only covered by a summary counts as local.</p>"
+                "<b>local</b> ones may be reused. The routing tables decide which, unless you set it (Role and "
+                "Scope). A subnet only covered by a summary counts as local.</p>"
                 "<p>To move a subnet to another VLAN or device: Plan Move, Start Move when the work begins, Read "
                 "Routes Again once it's done on the switches, Check Move, then Complete Move, which relinks it on the "
                 "VLANs page.</p>")
@@ -520,7 +520,7 @@ class PlacementTab(QWidget):
         if row is None:
             return
         if ScopeDialog(self, placements, self.network_id, row).exec_():
-            self.changed(f"Saved how to treat {row.cidr}.")
+            self.changed(f"Saved the role and scope of {row.cidr}.")
 
     def plan_move(self):
         row = self.selected_row()

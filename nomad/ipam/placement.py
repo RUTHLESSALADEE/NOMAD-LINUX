@@ -1,7 +1,7 @@
 """Subnet placement: where each subnet is planned to be (the VLANs it's linked to on the VLANs page), where the
 network map finds it, and whether it's advertised, so a subnet that must be in one place isn't in two.
 
-Kept in the IPAM database beside the VLANs: per subnet of a network, how to treat it when the map's routing tables
+Kept in the IPAM database beside the VLANs: per subnet of a network, its scope when the map's routing tables
 don't say it right (Placement: advertised or local, or its places one L2 segment the map can't see), and moves
 (SubnetMove) from one VLAN, and device, to another. Finishing a move relinks the subnet from the old VLAN to the new
 one, in the same change. And what a subnet is for (its role, see roles.py) where someone set it. As with VLANs,

@@ -1,4 +1,4 @@
-"""The Subnet Placement page: its rows and findings, how to treat a subnet, and moving one."""
+"""The Subnet Placement page: its rows and findings, a subnet's role and scope, and moving one."""
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")

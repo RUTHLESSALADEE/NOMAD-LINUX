@@ -199,7 +199,7 @@ class VlanDialog(_EditDialog):
         self.subnet_list.setMinimumHeight(160)
         self.others_check = QCheckBox()
         self.others_check.setToolTip("Point-to-point links, loopbacks, tunnels, routed ports' subnets and containers "
-                                     "aren't usually in a VLAN (Subnet Placement's How to Treat It says what each "
+                                     "aren't usually in a VLAN (Subnet Placement's Role and Scope says what each "
                                      "is for).")
         self.carried = set(vlan.subnets) if vlan else set()
         self.fill_subnets()
