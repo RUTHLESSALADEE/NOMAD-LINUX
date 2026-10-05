@@ -12,10 +12,14 @@ Each network becomes a page:
     "End".
 The layout has no place for an address's MAC or description (the CSV export has them). A used address with no name
 is written as "In use", since the importer skips rows with neither a Y nor a name.
+
+csv_rows() is the IP Addresses page's other export, Export to CSV. Both are made only from IPAM's networks, subnets
+and addresses, and tests/test_export_format.py holds them to their saved layout: what the VLANs and Subnet Placement
+pages keep about a subnet stays in their own tables, never in a subnet's details (which would become columns here).
 """
 import re
 
-from .store import RESERVED
+from .store import RESERVED, STATUSES
 
 LIST_EVERY_ADDRESS_UP_TO = 256  # Larger subnets list only their recorded addresses (and the gateway)
 TELEPHONY = "Telephony Rng"
@@ -23,6 +27,8 @@ UNIT_FIELDS = ["Unit", "Location", "Revision date", "Revision"]
 NOT_BASE_INFO = set(UNIT_FIELDS) | {"Enclave", "Imported from"}
 HOST_ROUTE_MASKS = {4: "255.255.255.255", 6: "/128"}
 UNNAMED_USED = "In use"
+CSV_COLUMNS = ["Subnet", "Subnet Name", "Gateway", "Address", "Status", "Name", "MAC Address", "Description",
+               "Last Changed", "Changed By"]
 BAD_TITLE_CHARACTERS = re.compile(r"[\[\]:*?/\\]")
 
 
@@ -172,3 +178,18 @@ def export_workbook(path, networks):
         sheet.freeze_panes = "A2"
     workbook.save(path)
     return titles
+
+
+def csv_rows(store, network_id, subnets):
+    """Export to CSV: the column names, a row per subnet, then a row per address with the smallest subnet holding it."""
+    rows = [list(CSV_COLUMNS)]
+    for subnet in subnets:
+        rows.append([subnet.cidr, subnet.name, subnet.gateway, "", "", "", "", subnet.description, subnet.modified,
+                     subnet.modified_by])
+    for address in store.addresses(network_id):
+        holding = [subnet for subnet in subnets if address.address in subnet.network]
+        subnet = max(holding, key=lambda subnet: (subnet.network.prefixlen, subnet.network.first), default=None)
+        rows.append([subnet.cidr if subnet else "", subnet.name if subnet else "", "", address.ip,
+                     STATUSES.get(address.status, address.status), address.name, address.mac, address.description,
+                     address.modified, address.modified_by])
+    return rows
