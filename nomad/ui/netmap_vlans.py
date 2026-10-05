@@ -24,6 +24,7 @@ class VlanPanel(QWidget):
     show_requested = pyqtSignal(str, str)  # Device key, port ("" for the device)
     add_to_database_requested = pyqtSignal()
     read_requested = pyqtSignal()  # Read VLANs Again
+    vlans_page_requested = pyqtSignal(int, str)  # VLAN, VTP domain: show it on Manage > VLANs
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -42,6 +43,9 @@ class VlanPanel(QWidget):
         self.database_button = QPushButton("Add to VLAN Database...")
         self.database_button.setToolTip("Bring the VLANs found here into Manage > VLANs: you see what's new, missing "
                                         "or named differently there, and choose what to bring in.")
+        self.vlans_page_button = QPushButton("Show on VLANs Page")
+        self.vlans_page_button.setToolTip("Go to the VLAN on Manage > VLANs (in the domain of its VTP domain, or of "
+                                          "the map's IPAM network).")
         self.read_button = QPushButton("Read VLANs Again")
         self.read_button.setToolTip("Read the VLANs of every switch on the map again (just their VLANs, not their "
                                     "neighbors or hosts): quicker than mapping again, and gives a map made before "
@@ -49,6 +53,7 @@ class VlanPanel(QWidget):
         buttons.addWidget(self.summary_label, 1)
         buttons.addWidget(self.read_button)
         buttons.addWidget(self.highlight_button)
+        buttons.addWidget(self.vlans_page_button)
         buttons.addWidget(self.database_button)
         layout.addLayout(buttons)
         self.table = read_only_table(VLAN_COLUMNS)
@@ -69,6 +74,7 @@ class VlanPanel(QWidget):
         self.highlight_button.clicked.connect(self.highlight_selected)
         self.database_button.clicked.connect(self.add_to_database)
         self.read_button.clicked.connect(self.read_again)
+        self.vlans_page_button.clicked.connect(self.show_on_vlans_page)
         self.table.itemDoubleClicked.connect(self.highlight_selected)
         self.table.itemSelectionChanged.connect(self.update_buttons)
         self.checks.itemDoubleClicked.connect(self.show_finding)
@@ -136,6 +142,7 @@ class VlanPanel(QWidget):
 
     def update_buttons(self):
         self.highlight_button.setEnabled(self.selected_item() is not None)
+        self.vlans_page_button.setEnabled(self.selected_item() is not None)
         self.database_button.setEnabled(bool(self.items))
         self.read_button.setEnabled(self.network_map is not None and self.read_button.text() == "Read VLANs Again")
 
@@ -143,6 +150,11 @@ class VlanPanel(QWidget):
         item = self.selected_item()
         if item is not None:
             self.highlight_requested.emit(item.vlan, item.domain)
+
+    def show_on_vlans_page(self):
+        item = self.selected_item()
+        if item is not None:
+            self.vlans_page_requested.emit(item.vlan, item.domain)
 
     def read_again(self):
         self.read_requested.emit()

@@ -123,6 +123,8 @@ def places(network_map):
                 network = ipaddress.ip_network(f"{address}/{prefix}", strict=False)
             except ValueError:
                 continue
+            if network.network_address.is_unspecified and network.prefixlen == 0:
+                continue  # 0.0.0.0/0: a placeholder some devices list (pfSense, for an interface's unset address)
             vrf = port_vrf(device, port)
             vlan = svi_vlan(port) or bdi_vlan(port) or subinterface_vlan(port)
             found.setdefault((vrf, str(network)), []).append(Place(key, port, address, int(prefix), vrf, vlan))

@@ -118,8 +118,8 @@ def l3_graph(network_map):
     for key, device in network_map.devices.items():
         for address, prefix, port in device.interfaces_l3:
             ip = _address(address)
-            if ip is None or ip.is_loopback or ip.is_link_local or prefix >= ip.max_prefixlen:
-                continue  # Loopbacks and /32s don't join anything
+            if ip is None or ip.is_loopback or ip.is_link_local or ip.is_unspecified or prefix >= ip.max_prefixlen:
+                continue  # Loopbacks and /32s don't join anything; 0.0.0.0 is a placeholder (pfSense lists one)
             network = ipaddress.ip_network(f"{address}/{prefix}", strict=False)
             subnets.setdefault(network, []).append((key, port, address))
 

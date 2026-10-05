@@ -26,6 +26,7 @@ from ..netmap.crawl import MAX_WORKERS, WORKERS, CrawlSettings, Crawler, apply_v
 from ..netmap.layout import BOTTOM, CENTER, GROUP_PAD, GROUP_TITLE, HORIZONTAL, LEFT, MIDDLE, \
     NORMAL, RESPACE_MIN_GAP, RIGHT, SPACING_NAMES, SPACINGS, STYLE_NAMES, TOP, TOP_DOWN, VERTICAL, align, arrange, \
     arrange_boxes_in_place, arrange_in_place, distribute, merge_positions, nearest_spacing, respace, spacing_of
+from ..netmap.placement import places as subnet_places
 from ..netmap.model import BUILDING, CORRECTED_NAMES, FIREWALL, GROUP_KINDS, KIND_NAMES, NO_SNMP, PARENT_KIND, \
     ROUTER, SNMP, SWITCH, UNCHECKED, UNREACHABLE, Group, NetworkMap, display_name, port_key, short_port
 from ..snmp import V2C
@@ -33,6 +34,8 @@ from ..snmpv3 import is_v3
 from ..terminal.credentials import CredentialError, protect, unprotect
 from .common import OneLineLabel, SortableTableItem, StoppableThread, read_only_table, set_hint
 from .host_menu import HostActions
+from .integration import IPAM, PLACEMENT, VLAN, MapNetworkDialog, hub, split_key
+from .integration import link as page_link
 from .netmap_monitor import NetworkMonitor
 from .netmap_progress import CrawlProgress
 from .netmap_dialogs import CommunitiesDialog, CompareDialog, DeletedDevicesDialog, DeviceDialog, GroupDialog, \
@@ -136,6 +139,7 @@ class VlanReadThread(CheckThread):
 class NetworkMapTab(QWidget):
     map_shown = pyqtSignal()  # The map open was drawn again (another opened, mapped again, changed, read again)
     routes_read = pyqtSignal(int, int)  # Read Routes Again finished: devices read, devices that didn't answer
+    ipam_network_changed = pyqtSignal()  # The open map was said to be of another IPAM network
 
     def __init__(self, window):
         super().__init__(window)
@@ -255,6 +259,11 @@ class NetworkMapTab(QWidget):
         self.compare_menu = QMenu(self.compare_button)
         self.compare_menu.aboutToShow.connect(self.fill_compare_menu)
         self.compare_button.setMenu(self.compare_menu)
+        self.ipam_network_button = QPushButton("IPAM Network...")
+        self.ipam_network_button.setToolTip("Which IPAM network the map is of: the VLANs and Subnet Placement pages "
+                                            "check that network against it, and opening the map opens the network "
+                                            "on the IP Addresses, VLANs and Subnet Placement pages.")
+        self.ipam_network_button.clicked.connect(self.choose_ipam_network)
         self.find_input = QLineEdit()
         self.find_input.setClearButtonEnabled(True)
         self.fit_button = QPushButton("Fit")
@@ -329,6 +338,29 @@ class NetworkMapTab(QWidget):
         self.compact_top = True
         self.lay_out_top_bar()
         layout.addWidget(self.top_bar)
+        # Which IPAM network the map is of, when that's worth saying: none, or not the one the other pages are on
+        self.network_bar = QWidget()
+        self.network_bar.setObjectName("networkBar")
+        self.network_bar.setStyleSheet(f"#networkBar {{ background: {COLORS['warning_background']}; border: 1px "
+                                       f"solid {COLORS['warning']}; }}")
+        bar = QHBoxLayout(self.network_bar)
+        bar.setContentsMargins(8, 3, 8, 3)
+        self.network_bar_label = QLabel()
+        self.network_bar_label.setWordWrap(True)
+        self.network_open_button = QPushButton()
+        self.network_open_button.clicked.connect(self.open_network_map)
+        self.network_back_button = QPushButton()
+        self.network_back_button.setToolTip("Put the IP Addresses, VLANs and Subnet Placement pages back on the "
+                                            "map's network.")
+        self.network_back_button.clicked.connect(self.back_to_map_network)
+        self.network_set_button = QPushButton("IPAM Network...")
+        self.network_set_button.clicked.connect(self.choose_ipam_network)
+        bar.addWidget(self.network_bar_label, 1)
+        for button in (self.network_open_button, self.network_back_button, self.network_set_button):
+            bar.addWidget(button)
+        self.network_bar.hide()
+        self.map_networks = {}  # Saved map file -> (when it was changed, the IPAM network it's of)
+        layout.addWidget(self.network_bar)
 
         self.tabs = QTabWidget()
         self.view = MapView()
@@ -378,6 +410,7 @@ class NetworkMapTab(QWidget):
         self.vlan_panel.show_requested.connect(self.show_vlan_finding)
         self.vlan_panel.add_to_database_requested.connect(self.add_vlans_to_database)
         self.vlan_panel.read_requested.connect(self.read_vlans_again)
+        self.vlan_panel.vlans_page_requested.connect(self.show_vlans_page)
 
         self.gateway_button.clicked.connect(self.use_gateway)
         self.communities_button.clicked.connect(self.edit_communities)
@@ -464,7 +497,7 @@ class NetworkMapTab(QWidget):
             rows.append(widget)
 
         file_buttons = [self.new_button, self.open_button, self.recent_button, self.save_button, self.export_button,
-                        self.compare_button, self.tribe_button]
+                        self.compare_button, self.ipam_network_button, self.tribe_button]
         watching = [self.monitor_check, self.interval_combo, self.monitor_label, self.watch_check, self.watch_label]
         view_tools = [self.hosts_check, self.undo_button, self.redo_button, self.fit_button, self.arrange_button]
         if self.compact_top:
@@ -539,7 +572,8 @@ class NetworkMapTab(QWidget):
         for button, source, fill in ((self.new_button, None, None), (self.open_button, None, None),
                                      (self.recent_button, self.recent_menu, self.fill_recent_menu),
                                      (self.save_button, None, None), (self.export_button, self.export_menu, None),
-                                     (self.compare_button, self.compare_menu, self.fill_compare_menu), (None, None, None),
+                                     (self.compare_button, self.compare_menu, self.fill_compare_menu),
+                                     (self.ipam_network_button, None, None), (None, None, None),
                                      (self.tribe_button, self.tribe_menu, self.fill_tribe_menu)):
             if button is None:
                 menu.addSeparator()
@@ -1016,6 +1050,7 @@ class NetworkMapTab(QWidget):
             dropped = network_map.carry_manual_hosts(self.network_map)
             network_map.carry_groups(self.network_map, folded)  # Sites and buildings, with the devices still there
             network_map.status_log = self.network_map.status_log  # The same network's monitoring history
+            network_map.ipam_network = self.network_map.ipam_network  # And the same IPAM network
             if self.history_map is self.network_map:
                 self.history_map = network_map  # So the Monitor log isn't reloaded
         self.live_map = None
@@ -1095,6 +1130,7 @@ class NetworkMapTab(QWidget):
         self.unopened = ""
         self.remember_open_map()
         self.map_shown.emit()
+        self.update_network_bar()
 
     def current_view(self):
         """The drawing showing (or the physical one while a table is)."""
@@ -1466,6 +1502,210 @@ class NetworkMapTab(QWidget):
         self.vlan_shown = None
         self.apply_vlan_focus()
 
+    # ----------------------------------------------------------------- The IPAM network, and the other pages
+
+    def ipam_key(self):
+        """The IPAM network the open map is of, else the one being worked on ("source:id"), or ""."""
+        if self.network_map is not None and self.network_map.ipam_network:
+            return self.network_map.ipam_network
+        integration = hub(self.window)
+        return integration.network if integration is not None else ""
+
+    def choose_ipam_network(self):
+        integration = hub(self.window)
+        if integration is None or self.network_map is None:
+            return
+        self.window.ipam_tab.open_store()
+        dialog = MapNetworkDialog(self, integration, self.network_map, self.map_name())
+        if dialog.exec_():
+            self.set_ipam_network(dialog.result_item or "")
+
+    def set_ipam_network(self, key):
+        """Say which IPAM network the open map is of (saved with it, and shared with a tribe map)."""
+        if self.network_map is None or key == self.network_map.ipam_network:
+            return
+        self.network_map.ipam_network = key
+        try:
+            self.map_path = self.write_map(self.network_map, self.map_path)
+        except OSError as error:
+            QMessageBox.warning(self, "Save Network Map", f"Couldn't save the map:\n\n{error}")
+        self.ipam_network_changed.emit()
+        self.update_network_bar()
+        integration = hub(self.window)
+        name = integration.network_name(key) if integration is not None else ""
+        set_hint(self.status_label, f"The map is of the IPAM network {name}." if key else
+                 "The map isn't of any IPAM network now: the pages use it with whichever they show.", "success")
+
+    def maps_of_network(self, key):
+        """[(name, ("tribe", map id) or ("file", path))] of the maps known here that are of an IPAM network: the
+        tribe's, and the recent map files."""
+        found = []
+        maps = self.tribe.maps
+        if maps is not None:
+            for info in maps.maps():
+                meta = maps.items(info["id"]).get((shared.META, shared.IPAM)) or {}
+                if meta.get("network") == key:
+                    found.append((f"{info['name']} (tribe)", ("tribe", info["id"])))
+        for path in store.recent():
+            try:
+                changed = path.stat().st_mtime
+                cached = self.map_networks.get(str(path))
+                if cached is None or cached[0] != changed:
+                    cached = (changed, json.loads(path.read_text(encoding="utf-8")).get("ipam_network", ""))
+                    self.map_networks[str(path)] = cached
+            except (OSError, ValueError, AttributeError):
+                continue
+            if cached[1] == key:
+                found.append((path.stem, ("file", path)))
+        return found
+
+    def update_network_bar(self, *_):
+        """Say when the map isn't of any IPAM network, or isn't of the one the other pages are on (and offer that
+        network's map, or going back to the map's network)."""
+        integration = hub(self.window)
+        network_map = self.network_map
+        if integration is None or network_map is None or self.worker is not None:
+            self.network_bar.hide()
+            return
+        mine, theirs = network_map.ipam_network, integration.network
+        self.network_open_button.hide()
+        self.network_back_button.hide()
+        if not mine:
+            self.network_bar_label.setText(f"{self.map_name()} isn't tied to an IPAM network, so the VLANs and "
+                                           "Subnet Placement pages use it with whichever network they're on. Say "
+                                           "which it's of:")
+            self.network_set_button.show()
+        elif theirs and theirs != mine:
+            name, other = integration.network_name(mine), integration.network_name(theirs)
+            others = self.maps_of_network(theirs)
+            self.network_maps = others
+            if others:
+                text = f"This map is of {name}; the other pages are on {other}, which has its own map."
+                self.network_open_button.setText(f"Open {others[0][0]}" if len(others) == 1 else
+                                                 f"Open a Map of {other}")
+                self.network_open_button.show()
+            else:
+                text = (f"This map is of {name}; the other pages are on {other}, which has no map yet (map it "
+                        "with Start, then IPAM Network... to say it's of that network).")
+            self.network_back_button.setText(f"Back to {name}")
+            self.network_back_button.show()
+            self.network_set_button.hide()
+            self.network_bar_label.setText(text)
+        else:
+            self.network_bar.hide()
+            return
+        self.network_bar.show()
+
+    def open_network_map(self):
+        """Open the map of the network the other pages are on (choosing one if there are several)."""
+        choices = getattr(self, "network_maps", [])
+        if not choices:
+            return
+        chosen = choices[0][1]
+        if len(choices) > 1:
+            menu = QMenu(self)
+            for name, where in choices:
+                menu.addAction(name).setData(where)
+            action = menu.exec_(self.network_open_button.mapToGlobal(self.network_open_button.rect().bottomLeft()))
+            if action is None:
+                return
+            chosen = action.data()
+        kind, where = chosen
+        if kind == "tribe":
+            self.open_tribe_map(where)
+        else:
+            self.open_path(Path(where))
+
+    def back_to_map_network(self):
+        integration = hub(self.window)
+        if integration is not None and self.network_map is not None and self.network_map.ipam_network:
+            integration.choose_network(self.network_map.ipam_network, self)
+        self.update_network_bar()
+
+    def show_subnet(self, cidr):
+        """Go to a subnet: its node on the logical view, else the devices with addresses in it."""
+        self.window.navigator.setCurrentWidget(self)
+        if self.network_map is None or not cidr:
+            return
+        try:
+            key = l3.subnet_key(ipaddress.ip_network(cidr))
+        except ValueError:
+            return
+        if key in self.l3_view.items_by_key:
+            self.show_in(self.l3_view, [key])
+            return
+        devices = sorted({place.device for (_, found), group in subnet_places(self.network_map).items()
+                          if found == cidr for place in group})
+        if devices:
+            self.show_in(self.view, devices)
+        else:
+            set_hint(self.status_label, f"No device on the map has an address in {cidr}.", "info")
+
+    def show_device(self, key):
+        self.window.navigator.setCurrentWidget(self)
+        if self.network_map is not None and key in self.network_map.devices:
+            self.show_in(self.view, [key])
+
+    def add_subnet_links(self, menu, actions, cidr):
+        """Show the subnet in IP Addresses, its VLANs on the VLANs page, and in Subnet Placement."""
+        integration, key = hub(self.window), self.ipam_key()
+        if integration is None or not key:
+            return
+        source, network_id = split_key(key)
+        facts = integration.facts(key)
+        row = facts.row(cidr) if facts is not None else None
+        if row is not None and row.subnet is not None:
+            actions[menu.addAction("Show in IP Addresses")] = lambda: integration.open_link(
+                page_link(IPAM, src=source, net=network_id, cidr=cidr))
+        for domain, vlan in (row.planned if row is not None else []):
+            actions[menu.addAction(f"Show VLAN {vlan.vlan} on the VLANs Page")] = \
+                lambda domain=domain, vlan=vlan: integration.open_link(page_link(VLAN, src=source, domain=domain.id,
+                                                                            vlan=vlan.vlan))
+        actions[menu.addAction("Show in Subnet Placement")] = lambda: integration.open_link(
+            page_link(PLACEMENT, src=source, net=network_id, cidr=cidr, vrf=row.vrf if row is not None else ""))
+
+    def add_address_link(self, menu, actions, address):
+        """Show an address in IP Addresses (of the map's network)."""
+        integration, key = hub(self.window), self.ipam_key()
+        if integration is None or not key or not address:
+            return
+        source, network_id = split_key(key)
+        actions[menu.addAction(f"Show {address} in IP Addresses")] = lambda: integration.open_link(
+            page_link(IPAM, src=source, net=network_id, ip=address))
+
+    def add_vlan_link(self, menu, actions, number, vtp_domain=""):
+        integration, key = hub(self.window), self.ipam_key()
+        if integration is None:
+            return
+        source, network_id = split_key(key)
+        actions[menu.addAction(f"Show VLAN {number} on the VLANs Page")] = lambda: integration.open_link(
+            page_link(VLAN, src=source, net=network_id, vlan=number, vtp=vtp_domain))
+
+    def device_ipam_menu(self, menu, actions, device):
+        """IP Addresses > each of the device's addresses; Subnet Placement for the device's subnets."""
+        integration, key = hub(self.window), self.ipam_key()
+        if integration is None or not key:
+            return
+        source, network_id = split_key(key)
+        addresses = list(dict.fromkeys([(device.mgmt_ip, "management")] * bool(device.mgmt_ip) +
+                                       [(address, port) for address, _, port in device.interfaces_l3]))
+        if addresses:
+            submenu = menu.addMenu("Show in IP Addresses")
+            for address, port in addresses[:30]:
+                actions[submenu.addAction(f"{address}  ({port})")] = \
+                    lambda address=address: integration.open_link(page_link(IPAM, src=source, net=network_id,
+                                                                            ip=address))
+        if device.interfaces_l3:
+            actions[menu.addAction("Show Its Subnets in Subnet Placement")] = lambda: integration.open_link(
+                page_link(PLACEMENT, src=source, net=network_id, find=device.label))
+
+    def show_vlans_page(self, number, vtp_domain):
+        """The map's VLANs tab asked for a VLAN on the VLANs page."""
+        integration, key = hub(self.window), self.ipam_key()
+        if integration is not None:
+            source, network_id = split_key(key)
+            integration.open_link(page_link(VLAN, src=source, net=network_id, vlan=number, vtp=vtp_domain))
+
     def show_vlan_finding(self, key, port):
         """A VLAN check double-clicked: show the device on the map."""
         self.tabs.setCurrentWidget(self.view)
@@ -1671,6 +1911,7 @@ class NetworkMapTab(QWidget):
         if news and self.worker is None:
             actions[menu.addAction("Mark as Seen")] = lambda: self.mark_seen(news)
         self.device_vlan_menu(menu, actions, device)
+        self.device_ipam_menu(menu, actions, device)
         menu.addSeparator()
         actions[menu.addAction("Copy Name")] = lambda: QApplication.clipboard().setText(device.label)
         if device.mgmt_ip:
@@ -1781,6 +2022,8 @@ class NetworkMapTab(QWidget):
         if node.kind == l3.SUBNET:
             actions[menu.addAction("Sweep This Subnet")] = lambda: self.sweep_subnet(node.label)
             actions[menu.addAction("Copy Subnet")] = lambda: QApplication.clipboard().setText(node.label)
+            menu.addSeparator()
+            self.add_subnet_links(menu, actions, node.label)
         elif node.kind == l3.HOP and key != l3.SELF:
             actions = self.host_actions.add_to(menu, node.label, snmp=self.snmp_access(node.label))
             menu.addSeparator()
@@ -1816,6 +2059,7 @@ class NetworkMapTab(QWidget):
                 actions = self.host_actions.add_to(menu, host.ip, **self.host_session_hints(host))
                 menu.addSeparator()
             actions[menu.addAction("Show on Map")] = lambda: self.show_on_map("host", item.row())
+            self.add_address_link(menu, actions, host.ip)
             actions[menu.addAction("Edit Host...")] = lambda: self.edit_host(host)
         actions[menu.addAction("Add Host...")] = lambda: self.add_host(hosts[0].device if hosts else None,
                                                                         hosts[0].port if hosts else "")
@@ -1845,10 +2089,15 @@ class NetworkMapTab(QWidget):
         device = self.network_map.devices.get(key) if self.network_map else None
         info = vlan_info.port_info(device, port) if device is not None else {}
         domain = device.vtp_domain if device is not None and device.vlans else None
-        for number in dict.fromkeys(number for number in (info.get("vlan"), info.get("voice"), info.get("native"))
-                                    if number):
+        numbers = list(dict.fromkeys(number for number in (info.get("vlan"), info.get("voice"), info.get("native"))
+                                     if number))
+        for number in numbers:
             actions[menu.addAction(f"Highlight VLAN {number}")] = \
                 lambda number=number: self.highlight_vlan(number, domain)
+        for number in numbers:
+            self.add_vlan_link(menu, actions, number, domain or "")
+        if len(hosts) == 1:
+            self.add_address_link(menu, actions, hosts[0].ip)
         if actions:
             menu.addSeparator()
         if len(hosts) == 1:
@@ -2752,7 +3001,22 @@ class NetworkMapTab(QWidget):
         if not quiet:
             set_hint(self.status_label, f"Opened the tribe map {info['name']}. Changes made here reach everyone "
                      "with the tribe key (and are sent later if the server can't be reached now).", "info")
+            if not network_map.ipam_network:
+                QTimer.singleShot(0, self.ask_tribe_map_network)
         return True
+
+    def ask_tribe_map_network(self):
+        """A tribe map no one has said the IPAM network of: ask, once on this computer (everyone gets the answer)."""
+        integration, maps = hub(self.window), self.tribe.maps
+        if integration is None or maps is None or self.tribe_map_id is None or self.network_map is None or \
+                self.network_map.ipam_network:
+            return
+        if maps.asked(self.tribe_map_id, "ipam_network"):
+            return
+        maps.note_asked(self.tribe_map_id, "ipam_network")
+        self.window.ipam_tab.open_store()
+        if integration.networks():
+            self.choose_ipam_network()
 
     def share_with_tribe(self):
         maps = self.tribe.ensure()
@@ -2982,7 +3246,8 @@ class NetworkMapTab(QWidget):
         has_map = self.network_map is not None
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
-        for widget in (self.save_button, self.export_button, self.compare_button, self.arrange_button):
+        for widget in (self.save_button, self.export_button, self.compare_button, self.arrange_button,
+                       self.ipam_network_button):
             widget.setEnabled(has_map and not running)  # Not while the map is being drawn from a crawl
         for widget in (self.open_button, self.recent_button):
             widget.setEnabled(not running)

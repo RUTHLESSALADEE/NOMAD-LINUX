@@ -25,12 +25,14 @@ from ..ipam.client import OldServerError, ServerUnreachable, TeamKeyError, TeamS
     load_saved_key, read_key_file, save_key
 from ..ipam.server import ConflictError, server_dir
 from ..ipam.spreadsheet import SpreadsheetError, parse_page, read_pages
-from ..ipam.store import ANYWHERE, DESCRIPTION, MAC, NAME, RESERVED, STATUSES, USED, VALUE, IpamError, IpamStore
+from ..ipam.store import ANYWHERE, DESCRIPTION, MAC, NAME, RESERVED, STATUSES, USED, VALUE, IpamError, IpamStore, \
+    Subnet
 from ..ipam.vlan_team import TeamVlanStore
 from ..oui import normalize_mac
 from ..sweep import SWEEP_PASSES
 from ..system import log_dir
 from .common import SortableTableItem, run_in_background, set_hint
+from .integration import MAP_DEVICE, MAP_SUBNET, PLACEMENT, VLAN, hub, link
 from .ipam_dialogs import AddressDialog, ImportDialog, NetworkDialog, SubnetDialog
 from .ipam_tools import BulkAddressDialog, BulkSubnetDialog, CheckDataDialog, CompareDialog, FreeBlocksDialog, \
     apply_to_addresses, apply_to_subnets
@@ -439,7 +441,7 @@ def when_text(moment):
 
 
 class IpamTab(QWidget):
-    # A sync with the tribe's server finished (the VLANs page shows what it brought; VLANs aren't shown here)
+    # A sync with the tribe's server finished (the VLANs and Subnet Placement pages show what it brought)
     tribe_synced = pyqtSignal()
 
     def __init__(self, window):
@@ -451,6 +453,7 @@ class IpamTab(QWidget):
         self.subnets = []
         self.network_id = None
         self.current = None  # The selected Subnet, UNSUBNETTED, or None
+        self.following = False  # Showing the network another page chose
         self.syncing = False
         self.sync_again = False  # A change arrived during a sync: sync once more when it ends
         self.watcher = None
@@ -628,7 +631,11 @@ class IpamTab(QWidget):
         right_layout.setContentsMargins(0, 0, 0, 0)
         self.subnet_label = QLabel()
         self.subnet_label.setWordWrap(True)
-        self.subnet_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.subnet_label.setTextFormat(Qt.RichText)
+        # Its role, VLANs, placement and place on the map link to those pages
+        self.subnet_label.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.LinksAccessibleByMouse)
+        self.subnet_label.linkActivated.connect(self.open_link)
+        self.subnet_line = ""  # The subnet's own details, before what the other pages know about it
         right_layout.addWidget(self.subnet_label)
         address_buttons = QHBoxLayout()
         self.next_free_button = accent_button("Use Next Free...")
@@ -1279,6 +1286,9 @@ class IpamTab(QWidget):
                                        "add one with Network > New Network, or connect to the tribe's IPAM server "
                                        "with Tribe > Connect with Tribe Key File.")
         self.fill_tree()
+        integration = hub(self.window)
+        if integration is not None and self.network_id is not None and not self.following:
+            integration.choose_network(f"{self.source}:{self.network_id}", self)
 
     def update_permissions(self):
         """Enable what can be changed: tribe networks need the server, and only its admin adds or deletes them."""
@@ -1298,6 +1308,65 @@ class IpamTab(QWidget):
 
     def network(self):
         return self.store.network(self.network_id) if self.network_id else None
+
+    def follow_network(self, key):
+        """Another page (or the map) chose a network: show it here too."""
+        integration = hub(self.window)
+        if integration is not None and not integration.follows(self):
+            return
+        if self.local_store is None:
+            self.saved_network_id = key  # Opened later: with it
+            return
+        if self.as_of is not None or key == f"{self.source}:{self.network_id}":
+            return
+        self.following = True  # Filling the list mustn't choose a network of its own for the others
+        try:
+            if self.network_combo.findData(key) < 0:
+                self.fill_networks()  # Not listed yet (or new since)
+            if self.network_combo.findData(key) >= 0:
+                self.fill_networks(key)
+        finally:
+            self.following = False
+
+    def on_facts_changed(self):
+        """Something the subnet's role, VLANs or placement come from changed: say them again."""
+        if isinstance(self.current, Subnet) and self.isVisible():
+            self.show_subnet_line(self.current)
+
+    def show_subnet_line(self, subnet):
+        parts = []
+        integration = hub(self.window)
+        if integration is not None and self.as_of is None and self.network_id:
+            parts = integration.subnet_summary(f"{self.source}:{self.network_id}", subnet.cidr)
+        self.subnet_label.setText("   ·   ".join([self.subnet_line] + parts))
+
+    def open_link(self, url):
+        integration = hub(self.window)
+        if integration is not None:
+            integration.open_link(url)
+
+    def other_page_actions(self, menu, subnet=None, address=None):
+        """Show the subnet's VLANs, its placement, or it (or the address) on the map: {action: link}."""
+        integration = hub(self.window)
+        if integration is None or self.as_of is not None or not self.network_id:
+            return {}
+        key, links = f"{self.source}:{self.network_id}", {}
+        if subnet is not None:
+            facts = integration.facts(key)
+            row = facts.row(subnet.cidr) if facts is not None else None
+            menu.addSeparator()
+            for domain, vlan in (row.planned if row is not None else []):
+                links[menu.addAction(f"Show VLAN {vlan.vlan} on the VLANs Page")] = link(
+                    VLAN, src=self.source, domain=domain.id, vlan=vlan.vlan)
+            links[menu.addAction("Show in Subnet Placement")] = link(
+                PLACEMENT, src=self.source, net=self.network_id, cidr=subnet.cidr, vrf=row.vrf if row else "")
+            if row is not None and row.found is not None:
+                links[menu.addAction("Show on the Network Map")] = link(MAP_SUBNET, cidr=subnet.cidr)
+        if address is not None:
+            device = integration.map_device_for(key, address)
+            if device is not None:
+                links[menu.addAction("Show on the Network Map")] = link(MAP_DEVICE, key=device)
+        return links
 
     def new_network(self):
         if not self.open_store():
@@ -1489,7 +1558,10 @@ class IpamTab(QWidget):
             menu.addAction("Sweep Subnet", self.sweep_subnet).setEnabled(subnet.network.version == 4)
             menu.addAction("Find Free Blocks...", self.find_free_blocks).setEnabled(self.as_of is None)
             menu.addAction("History...", lambda: self.show_history("subnet", subnet)).setEnabled(self.as_of is None)
-        menu.exec_(self.tree.viewport().mapToGlobal(position))
+        links = self.other_page_actions(menu, subnet=subnet) if subnet is not None else {}
+        chosen = menu.exec_(self.tree.viewport().mapToGlobal(position))
+        if chosen in links:
+            self.open_link(links[chosen])
 
     # ----------------------------------------------------------------- Sweeping a subnet here
 
@@ -1744,7 +1816,8 @@ class IpamTab(QWidget):
                 parts.append(subnet.description)
             if network.num_addresses > LIST_EVERY_ADDRESS_UP_TO and not self.hide_free_check.isChecked():
                 parts.append("<i>(too large to list every address, so only those recorded are shown)</i>")
-            self.subnet_label.setText("   ·   ".join(parts))
+            self.subnet_line = "   ·   ".join(parts)
+            self.show_subnet_line(subnet)
         self.table.resizeColumnToContents(0)
         metrics = self.table.fontMetrics()
         for column, sample in ((1, "Gateway · Reserved"), (COL_SWEEP, "No answer · yesterday 00:00 · last seen Sep 00"), (3, "M" * 16),
@@ -1887,7 +1960,10 @@ class IpamTab(QWidget):
             self.add_session_actions(menu, host)
             menu.addSeparator()
             menu.addAction("History...", lambda: self.show_history("address", host)).setEnabled(self.as_of is None)
-        menu.exec_(self.table.viewport().mapToGlobal(position))
+        links = self.other_page_actions(menu, address=host) if len(selected) == 1 else {}
+        chosen = menu.exec_(self.table.viewport().mapToGlobal(position))
+        if chosen in links:
+            self.open_link(links[chosen])
 
     def add_session_actions(self, menu, host):
         """SSH and SCP to an address: with its saved session if there is one (found by the address or its recorded

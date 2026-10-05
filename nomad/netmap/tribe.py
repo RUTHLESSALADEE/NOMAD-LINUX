@@ -83,6 +83,14 @@ class TribeMaps:
         with self.lock, self.db:
             self.db.execute("INSERT OR REPLACE INTO meta (name, value) VALUES (?, ?)", (name, str(value)))
 
+    def asked(self, map_id, question):
+        """Whether this computer has asked a question about a map before (such as which IPAM network it's of)."""
+        with self.lock:
+            return self._meta(f"asked/{question}/{int(map_id)}") == "1"
+
+    def note_asked(self, map_id, question):
+        self._set_meta(f"asked/{question}/{int(map_id)}", "1")
+
     @property
     def revision(self):
         with self.lock:

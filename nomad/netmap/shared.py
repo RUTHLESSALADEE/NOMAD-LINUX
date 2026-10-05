@@ -20,7 +20,9 @@ DEVICE, LINK, HOST, GROUP, GROUP_OF, POSITION, L3_POSITION, DELETED, TRACE, NEWS
     "device", "link", "host", "group", "group_of", "position", "l3_position", "deleted", "trace", "news",
     "host_seen", "meta")
 SECTIONS = (DEVICE, LINK, HOST, GROUP, GROUP_OF, POSITION, L3_POSITION, DELETED, TRACE, NEWS, HOST_SEEN, META)
-MAP_META, SETTINGS = "map", "settings"  # The meta items: the map's own fields, and how to crawl it (not secret)
+# The meta items: the map's own fields, how to crawl it (not secret), and the IPAM network it's of (an item of its
+# own, so setting it doesn't touch the others)
+MAP_META, SETTINGS, IPAM = "map", "settings", "ipam"
 PAGE_ITEMS = 5000
 LEASE_SECONDS = 180  # A watcher's claim on a map lasts this long unless renewed
 
@@ -67,6 +69,8 @@ def flatten(network_map, settings=None):
     items[(META, MAP_META)] = {"seeds": list(network_map.seeds), "started": network_map.started,
                                "finished": network_map.finished, "stopped": network_map.stopped,
                                "root": network_map.root}
+    if network_map.ipam_network:
+        items[(META, IPAM)] = {"network": network_map.ipam_network}
     if settings is not None:
         items[(META, SETTINGS)] = dict(settings)
     return {key: shared_part(key[0], _plain(value)) for key, value in items.items()}
@@ -81,7 +85,8 @@ def build(items):
     meta = sections[META].get(MAP_META, {})
     network_map = NetworkMap(seeds=list(meta.get("seeds", [])), started=meta.get("started", ""),
                              finished=meta.get("finished", ""), stopped=bool(meta.get("stopped")),
-                             root=meta.get("root", ""))
+                             root=meta.get("root", ""),
+                             ipam_network=str((sections[META].get(IPAM) or {}).get("network", "")))
     network_map.devices = {key: _build(Device, data) for key, data in sorted(sections[DEVICE].items())}
     devices = network_map.devices
     network_map.links = [_build(Link, data) for _, data in sorted(sections[LINK].items())

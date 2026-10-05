@@ -27,6 +27,7 @@ from ..ipam.vlans import STATUSES, VlanStore, name_problem, range_for
 from ..netmap import store as map_store
 from ..netmap import vlans as map_vlans
 from .common import SortableTableItem, set_hint
+from .integration import PLACEMENT, hub, link
 from .ipam_tab import ago
 from .table_filter import TableFilter
 from .theme import COLORS
@@ -49,6 +50,7 @@ class VlanTab(QWidget):
         self.source_key = None
         self.domain_id = None
         self.saved_domain = ""
+        self.no_domain_network = ""  # The network the other pages are on, when it has no VLAN domain here
         self.vlans = []
         self.init_ui()
         window.ipam_tab.tribe_synced.connect(self.on_tribe_synced)
@@ -85,6 +87,11 @@ class VlanTab(QWidget):
         self.export_action = self.domain_menu.addAction("Export to CSV...", self.export_csv)
         self.domain_button.setMenu(self.domain_menu)
         top.addWidget(self.domain_button)
+        self.network_domain_button = QPushButton()
+        self.network_domain_button.setProperty("accent", True)
+        self.network_domain_button.clicked.connect(self.new_domain_for_network)
+        self.network_domain_button.hide()
+        top.addWidget(self.network_domain_button)
         top.addStretch()
         self.refused_button = QPushButton()
         self.refused_button.setVisible(False)
@@ -118,6 +125,7 @@ class VlanTab(QWidget):
         self.table_filter.columns.widest = {4: 280, COL_INTERFACES: 300, COL_MAP: 260, 8: 260}
         self.details = QTextBrowser()
         self.details.setOpenLinks(False)
+        self.details.anchorClicked.connect(self.open_link)
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self.table)
         splitter.addWidget(self.details)
@@ -218,6 +226,8 @@ class VlanTab(QWidget):
 
     def fill_domains(self, select=None):
         """Every domain: the tribe's first (marked Tribe), then this computer's (marked Local)."""
+        if not select and self.no_domain_network:
+            select = self.no_domain_network  # Still on a network with no domain: not the one remembered from before
         select = select or (f"{self.source_key}:{self.domain_id}" if self.domain_id else "") or self.saved_domain
         self.domain_combo.blockSignals(True)
         self.domain_combo.clear()
@@ -225,17 +235,125 @@ class VlanTab(QWidget):
             for domain in source.vlans.domains():
                 self.domain_combo.addItem(f"{domain.name}  ({source.label})", f"{source.key}:{domain.id}")
         index = self.domain_combo.findData(select)
-        if self.domain_combo.count():
+        if self.no_domain_network and index < 0:
+            self.domain_combo.setCurrentIndex(-1)  # The network the pages are on has none: none shown
+        elif self.domain_combo.count():
             self.domain_combo.setCurrentIndex(max(index, 0))
         self.domain_combo.blockSignals(False)
         self.on_domain_chosen()
 
     def on_domain_chosen(self):
         data = self.domain_combo.currentData()
-        self.source_key, _, self.domain_id = (data or "::").partition(":")
-        self.domain_id = self.domain_id or None
+        if data:
+            self.no_domain_network = ""  # A domain chosen: of whatever network
+            self.source_key, _, self.domain_id = data.partition(":")
+        else:
+            self.source_key = self.no_domain_network.partition(":")[0] or self.source_key
+            self.domain_id = None
+        self.network_domain_button.setVisible(bool(self.no_domain_network))
         self.fill_table()
         self.show_status()
+        domain, integration = self.domain(), hub(self.window)
+        if domain is not None and domain.network_id and integration is not None:
+            integration.choose_network(f"{self.source_key}:{domain.network_id}", self)
+
+    def follow_network(self, key):
+        """Another page (or the map) chose a network: show a domain of it here, if it has one."""
+        integration = hub(self.window)
+        if integration is not None and not integration.follows(self):
+            return
+        domain = self.domain()
+        if domain is not None and f"{self.source_key}:{domain.network_id}" == key:
+            return
+        source_key, _, network_id = key.partition(":")
+        source = self.source(source_key)
+        if source is None:
+            return
+        found = next((item for item in source.vlans.domains() if item.network_id == network_id), None)
+        if found is not None:
+            self.no_domain_network = ""
+            self.fill_domains(f"{source_key}:{found.id}")
+        else:  # Not another network's domain, which would look like this one's
+            self.no_domain_network = key
+            name = integration.network_name(key) if integration is not None else "the network"
+            self.network_domain_button.setText(f"New Domain for {name}...")
+            self.fill_domains(key)
+
+    def new_domain_for_network(self):
+        """A domain for the network the other pages are on (which has none)."""
+        source_key, _, network_id = self.no_domain_network.partition(":")
+        source = self.source(source_key)
+        if source is None or not network_id:
+            return
+        if not source.can_edit_domains:
+            set_hint(self.status_label, "Tribe VLAN domains can only be made while the IPAM server can be reached.",
+                     "warning")
+            return
+        integration = hub(self.window)
+        dialog = DomainDialog(self, source, name=integration.network_name(self.no_domain_network)
+                              if integration is not None else "", network_id=network_id)
+        if dialog.exec_():
+            self.no_domain_network = ""
+            self.after_change(source)
+            self.fill_domains(f"{source.key}:{dialog.result_item.id}")
+
+    def go_to_vlan(self, source_key, domain_id, number, vtp="", network=""):
+        """Go to a VLAN: in a domain, or else (a number from the map) in the domain of its VTP domain, or of the
+        network's (source:id)."""
+        self.window.navigator.setCurrentWidget(self)
+        if not self.window.ipam_tab.open_store():
+            return
+        if not domain_id:
+            choices = [(source, domain) for source in self.sources() if not source_key or source.key == source_key
+                       for domain in source.vlans.domains()]
+            vtp = (vtp or "").lower()
+            match = [pair for pair in choices if vtp and pair[1].vtp_domain.lower() == vtp] or \
+                [pair for pair in choices if network and pair[1].network_id == network] or \
+                [pair for pair in choices if pair[0].vlans.vlan(pair[1].id, number) is not None]
+            if not match:
+                set_hint(self.status_label, f"No VLAN domain here has VLAN {number}"
+                         + (f" or is for VTP domain {vtp}" if vtp else "") + ".", "warning")
+                return
+            source_key, domain_id = match[0][0].key, match[0][1].id
+        self.search_input.clear()
+        self.no_domain_network = ""
+        self.fill_domains(f"{source_key}:{domain_id}")
+        self.select_vlans([number])
+        if not self.selected_vlans():
+            name = self.domain().name if self.domain() else "the domain"
+            set_hint(self.status_label, f"VLAN {number} isn't in {name} yet (Add VLAN to record it).", "info")
+
+    def select_vlans(self, numbers):
+        self.table.clearSelection()
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item is not None and item.data_object.vlan in numbers:
+                self.table.selectRow(row)
+                self.table.scrollToItem(item)
+
+    def open_link(self, url):
+        integration = hub(self.window)
+        if integration is not None:
+            integration.open_link(url)
+
+    def on_facts_changed(self):
+        if self.isVisible():
+            self.on_selection()
+
+    def show_in_placement(self):
+        vlan, domain, integration = self.selected_vlan(), self.domain(), hub(self.window)
+        if vlan is None or not vlan.subnets or not domain.network_id or integration is None:
+            return
+        cidr = vlan.subnets[0]
+        if len(vlan.subnets) > 1:
+            menu = QMenu(self)
+            for subnet in vlan.subnets:
+                menu.addAction(subnet).setData(subnet)
+            chosen = menu.exec_(self.cursor().pos())
+            if chosen is None:
+                return
+            cidr = chosen.data()
+        integration.open_link(link(PLACEMENT, src=self.source_key, net=domain.network_id, cidr=cidr))
 
     def fill_new_domain_menu(self):
         self.new_domain_menu.clear()
@@ -314,6 +432,16 @@ class VlanTab(QWidget):
         return getattr(page, "network_map", None)
 
     def map_vlans_for(self, domain):
+        """{VLAN: MapVlan} the open map found for the domain (map_vlans_for_domain), or None when the map is of
+        another IPAM network than the domain's."""
+        if domain is not None and domain.network_id:
+            network_map = self.open_map()
+            if network_map is not None and network_map.ipam_network and \
+                    network_map.ipam_network != f"{self.source_key}:{domain.network_id}":
+                return None  # A map of another network
+        return self.map_vlans_for_domain(domain)
+
+    def map_vlans_for_domain(self, domain):
         """{VLAN: MapVlan} the open map found in the domain's VTP domain (or, for a domain without one, on switches
         without one), or None when there's no map (or it has none of those switches)."""
         network_map = self.open_map()
@@ -468,6 +596,13 @@ class VlanTab(QWidget):
         return text, None
 
     def show_domain(self, source, domain, on_map):
+        if domain is None and self.no_domain_network:
+            integration = hub(self.window)
+            name = integration.network_name(self.no_domain_network) if integration is not None else ""
+            self.domain_label.setText(f"<b>{html.escape(name or 'The network')}</b> (the network the other pages are "
+                                      "on) has no VLAN domain yet. New Domain for it makes one, whose VLANs carry its "
+                                      "subnets; or choose another network's domain above.")
+            return
         if domain is None:
             if source is None or not self.domain_combo.count():
                 self.domain_label.setText("No VLAN domains yet. New Domain makes one (a Tribe one is shared with "
@@ -540,12 +675,23 @@ class VlanTab(QWidget):
                     subnets = {subnet.cidr: subnet for subnet in source.ipam.subnets(domain.network_id)}
                 except IpamError:
                     pass
+            integration = hub(self.window)
+            key = f"{self.source_key}:{domain.network_id}" if domain.network_id else ""
+            facts = integration.facts(key) if integration is not None and key else None
             parts.append("<h4>Subnets</h4><table>")
             for cidr in vlan.subnets:
                 subnet = subnets.get(cidr)
                 what = "not in IPAM now" if subnet is None else ", ".join(
                     part for part in (subnet.name, f"gateway {subnet.gateway}" if subnet.gateway else "") if part)
                 parts.append(f"<tr><td>{escape(cidr)}&nbsp;</td><td>{escape(what)}</td></tr>")
+                row = facts.row(cidr) if facts is not None else None
+                if row is not None:
+                    status = {"problem": "a problem", "warning": "a warning"}.get(row.severity, "OK")
+                    color = {"problem": "error", "warning": "warning"}.get(row.severity)
+                    status = f"<span style='color:{COLORS[color]}'>{status}</span>" if color else status
+                    links = integration.subnet_links(key, cidr, row, skip=("vlan",))
+                    parts.append(f"<tr><td></td><td>{escape(row.role.name)} &middot; placement: {status} &middot; "
+                                 + " &middot; ".join(links) + "</td></tr>")
             parts.append("</table>")
         on_map = self.map_vlans_for(domain)
         item = on_map.get(vlan.vlan) if on_map is not None else None
@@ -596,7 +742,10 @@ class VlanTab(QWidget):
         for button in (self.edit_button, self.delete_button, self.history_button, self.ipam_button, self.map_button):
             action = menu.addAction(button.text(), button.click)
             action.setEnabled(button.isEnabled())
-        menu.exec_(self.table.viewport().mapToGlobal(position))
+        placement = menu.addAction("Show Subnet in Subnet Placement")
+        placement.setEnabled(self.ipam_button.isEnabled())
+        if menu.exec_(self.table.viewport().mapToGlobal(position)) is placement:
+            self.show_in_placement()
 
     def roles_of(self, source):
         """For the VLAN dialogs: what each subnet of a network is for ({CIDR: roles.RoleInfo}), from the open map and
@@ -699,6 +848,9 @@ class VlanTab(QWidget):
         if source is not None and source.key == TEAM:
             self.window.ipam_tab.sync_now()
         self.show_status()
+        integration = hub(self.window)
+        if integration is not None:
+            integration.forget()  # The subnets' VLANs changed
 
     def on_tribe_synced(self):
         """The IP Addresses page synced with the server: show what came (if this page has been opened)."""
