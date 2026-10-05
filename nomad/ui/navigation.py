@@ -1,14 +1,11 @@
-"""Sidebar navigation: pages grouped under section headings, with the selected page shown beside them.
-
-The sidebar can be hidden to give the pages more room; a slim strip then offers a menu of every page and a button
-to bring the sidebar back.
-"""
+"""Tool navigation: favorites rail, searchable drawer, and persistent page stack."""
 from PyQt5.QtCore import QEvent, QRect, QSize, Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QFontMetrics, QKeySequence, QPen
+from PyQt5.QtGui import QColor, QFont, QFontMetrics, QIcon, QKeySequence, QPen
 from PyQt5.QtWidgets import QAbstractItemView, QHBoxLayout, QListWidget, QListWidgetItem, QMenu, QShortcut, \
-    QStackedWidget, QStyle, QStyledItemDelegate, QToolButton, QVBoxLayout, QWidget
+    QStackedWidget, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QToolButton, QVBoxLayout, QWidget
 
 from .theme import COLORS
+from .tool_icons import tool_icon
 
 PAGE_ROLE = Qt.UserRole
 SECTION_ROLE = Qt.UserRole + 1  # A heading's name as written, before it is shown in capitals
@@ -49,7 +46,7 @@ class NavigationDelegate(QStyledItemDelegate):
         painter.setFont(header_font(option.font))
         painter.setPen(QColor(COLORS["accent"]))
         text_rect = band.adjusted(HEADER_PADDING, 0, -4, 0)
-        painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, index.data(Qt.DisplayRole))
+        painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft | Qt.TextWordWrap, index.data(Qt.DisplayRole))
         painter.restore()
 
     def sizeHint(self, option, index):
@@ -57,8 +54,10 @@ class NavigationDelegate(QStyledItemDelegate):
             return super().sizeHint(option, index)
         metrics = QFontMetrics(header_font(option.font))
         gap = HEADER_GAP if index.row() > 0 else 0
-        return QSize(metrics.horizontalAdvance(index.data(Qt.DisplayRole)) + HEADER_PADDING + 8,
-                     metrics.height() + 2 * HEADER_MARGIN + gap)
+        available = max(80, self.parent().viewport().width() - HEADER_PADDING - 8)
+        height = metrics.boundingRect(QRect(0, 0, available, 1000), Qt.TextWordWrap,
+                                      index.data(Qt.DisplayRole)).height()
+        return QSize(available + HEADER_PADDING + 8, height + 2 * HEADER_MARGIN + gap)
 
 
 def navigation_button(text, tooltip):
@@ -70,7 +69,26 @@ def navigation_button(text, tooltip):
     return button
 
 
-class Navigator(QWidget):
+class FavoriteIconDelegate(QStyledItemDelegate):
+    """Center rail icons independently of text layout and platform list styling."""
+
+    def paint(self, painter, option, index):
+        styled = QStyleOptionViewItem(option)
+        self.initStyleOption(styled, index)
+        icon = QIcon(styled.icon)
+        styled.icon = QIcon()
+        styled.text = ""
+        painter.save()
+        styled.widget.style().drawControl(QStyle.CE_ItemViewItem, styled, painter, styled.widget)
+        painter.restore()
+        size = self.parent().iconSize()
+        rect = QRect(0, 0, size.width(), size.height())
+        rect.moveCenter(option.rect.center())
+        mode = QIcon.Selected if option.state & QStyle.State_Selected else QIcon.Normal
+        icon.paint(painter, rect, Qt.AlignCenter, mode)
+
+
+class SidebarNavigator(QWidget):
     """A sidebar of pages under section headings. Offers the parts of QTabWidget's interface the app uses."""
     currentChanged = pyqtSignal(int)  # Index of the page in the stack
     sidebarToggled = pyqtSignal(bool)  # True when the sidebar is shown
@@ -145,6 +163,7 @@ class Navigator(QWidget):
     def add_page(self, widget, title):
         self.stack.addWidget(widget)
         item = QListWidgetItem(title)
+        item.setIcon(tool_icon(title))
         item.setData(PAGE_ROLE, widget)
         self.sidebar.addItem(item)
         if self.sidebar.currentRow() < 0:
@@ -265,3 +284,297 @@ class Navigator(QWidget):
             return
         self.stack.setCurrentWidget(widget)
         self.currentChanged.emit(self.stack.indexOf(widget))
+
+
+class Navigator(SidebarNavigator):
+    """Compact favorites rail and a searchable drawer over the current page."""
+
+    def __init__(self, parent=None):
+        from PyQt5.QtWidgets import QApplication, QCheckBox, QLabel, QLineEdit
+        super().__init__(parent)
+        self.favorites = ["Interfaces", "Terminal", "Network Map", "IP Addresses", "Ping"]
+        self.recent = []
+        self.drawer_open = False
+        self.sidebar_shown = False
+        self.sections = {}
+        self.section = ""
+        self.collapsed_sections = set()
+        self.layout().removeWidget(self.panel)
+        self.layout().removeWidget(self.stack)
+        self.content = QWidget(self)
+        content_layout = QVBoxLayout(self.content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        self.page_title = QLabel()
+        self.page_title.setContentsMargins(12, 6, 12, 6)
+        content_layout.addWidget(self.page_title)
+        content_layout.addWidget(self.stack, 1)
+        self.layout().addWidget(self.content, 1)
+        self.panel.setParent(self.content)
+        self.panel.setMinimumWidth(320)
+        self.panel.setObjectName("toolDrawer")
+        drawer_title = QLabel("Tools")
+        drawer_title.setContentsMargins(8, 4, 8, 4)
+        self.panel.layout().itemAt(0).layout().insertWidget(0, drawer_title)
+        self.pages_button.setMenu(None)
+        self.pages_button.setPopupMode(QToolButton.DelayedPopup)
+        self.pages_button.clicked.connect(self.open_drawer)
+        self.pages_button.setToolTip("Tools (Ctrl+K)")
+        self.pages_button.setText("")
+        self.pages_button.setIcon(tool_icon("tools"))
+        self.pages_button.setIconSize(QSize(24, 24))
+        self.pages_button.setFixedSize(52, 44)
+        self.pages_button.setAccessibleName("Open tools")
+        self.show_button.hide()
+        self.rail.setFixedWidth(56)
+        self.favorite_list = QListWidget()
+        self.favorite_list.setObjectName("favoriteRail")
+        self.favorite_list.setIconSize(QSize(24, 24))
+        self.favorite_list.setItemDelegate(FavoriteIconDelegate(self.favorite_list))
+        self.sidebar.setIconSize(QSize(20, 20))
+        self.favorite_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.favorite_list.setDragDropMode(QAbstractItemView.InternalMove)
+        self.favorite_list.itemClicked.connect(lambda item: self.activate_title(item.data(Qt.UserRole)))
+        self.favorite_list.model().rowsMoved.connect(self.favorites_moved)
+        self.favorite_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.favorite_list.customContextMenuRequested.connect(self.rail_menu)
+        self.rail.layout().insertWidget(1, self.favorite_list, 1)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Find a tool... (Ctrl+K)")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self.fill_drawer)
+        self.search.returnPressed.connect(self.activate_first)
+        self.panel.layout().insertWidget(1, self.search)
+        self.quick_list = QListWidget()
+        self.quick_list.setObjectName("navigationQuick")
+        self.quick_list.setIconSize(QSize(20, 20))
+        self.quick_list.itemClicked.connect(self.activate_item)
+        self.panel.layout().insertWidget(2, self.quick_list)
+        for listing in (self.sidebar, self.quick_list):
+            listing.setContextMenuPolicy(Qt.CustomContextMenu)
+            listing.customContextMenuRequested.connect(lambda pos, listing=listing: self.pin_menu(listing, pos))
+        self.sidebar.itemClicked.connect(self.activate_item)
+        self.keep_open = QCheckBox("Keep drawer open")
+        self.keep_open.toggled.connect(self.set_sidebar_visible)
+        self.panel.layout().addWidget(self.keep_open)
+        self.hide_button.clicked.disconnect()
+        self.hide_button.clicked.connect(self.dismiss_drawer)
+        self.hide_button.setToolTip("Close tool drawer")
+        self.hide_button.setText("")
+        self.hide_button.setIcon(tool_icon("close"))
+        self.hide_button.setIconSize(QSize(20, 20))
+        self.hide_button.setAccessibleName("Close tool drawer")
+        self.content.installEventFilter(self)
+        QApplication.instance().installEventFilter(self)
+        for key, callback in (("Ctrl+K", self.open_search), ("Escape", self.close_drawer)):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.setContext(Qt.WindowShortcut)
+            shortcut.activated.connect(callback)
+        self.apply_navigation()
+
+    def add_section(self, title):
+        self.section = title
+        super().add_section(title)
+        item = self.sidebar.item(self.sidebar.count() - 1)
+        item.setFlags(Qt.ItemIsEnabled)
+        if title.startswith("Diagnostics:"):
+            item.setText("DIAGNOSTICS: " + ("CONNECTIVITY" if "Connectivity" in title else "DNS & WEB"))
+        item.setToolTip(title + " — click to expand or collapse")
+
+    def add_page(self, widget, title):
+        self.sections[title] = self.section
+        super().add_page(widget, title)
+        self.rebuild_rail()
+
+    def update_width(self):
+        if hasattr(self, "content"):
+            self.sidebar.setFixedWidth(360)
+        else:
+            super().update_width()
+
+    def position_drawer(self):
+        self.sidebar.setFixedWidth(min(360, self.content.width()))
+        self.panel.setGeometry(0, 0, min(360, self.content.width()), self.content.height())
+        self.panel.raise_()
+
+    def eventFilter(self, watched, event):
+        if hasattr(self, "content"):
+            if watched is self.content and event.type() == QEvent.Resize:
+                self.position_drawer()
+            if event.type() == QEvent.MouseButtonPress and self.drawer_open and not self.sidebar_visible():
+                if isinstance(watched, QWidget) and watched.window() is self.window():
+                    point = self.panel.mapFromGlobal(event.globalPos())
+                    if not self.panel.rect().contains(point) and watched is not self.pages_button:
+                        self.close_drawer()
+        return super().eventFilter(watched, event)
+
+    def apply_navigation(self):
+        if not hasattr(self, "content"):
+            return super().apply_navigation()
+        self.rail.setVisible(not self.navigation_hidden)
+        self.panel.setVisible((self.drawer_open or self.sidebar_visible()) and not self.navigation_hidden)
+        self.page_title.setVisible(not self.navigation_hidden)
+        self.content.layout().setContentsMargins(360 if self.sidebar_visible() and not self.navigation_hidden else 0, 0, 0, 0)
+        self.position_drawer()
+
+    def set_sidebar_visible(self, visible):
+        self.sidebar_shown = bool(visible)
+        self.drawer_open = bool(visible)
+        self.keep_open.blockSignals(True)
+        self.keep_open.setChecked(bool(visible))
+        self.keep_open.blockSignals(False)
+        self.fill_drawer()
+        self.apply_navigation()
+        self.sidebarToggled.emit(bool(visible))
+
+    def open_drawer(self):
+        self.drawer_open = True
+        self.fill_drawer()
+        self.apply_navigation()
+
+    def open_search(self):
+        self.open_drawer()
+        self.search.setFocus()
+        self.search.selectAll()
+
+    def close_drawer(self):
+        if not self.sidebar_visible():
+            self.drawer_open = False
+            self.apply_navigation()
+
+    def dismiss_drawer(self):
+        self.set_sidebar_visible(False)
+
+    def activate_title(self, title):
+        for row in self.page_rows():
+            item = self.sidebar.item(row)
+            if item.text() == title:
+                self.activate_item(item)
+                return
+
+    def activate_item(self, item):
+        if item.data(PAGE_ROLE) is None:
+            section = item.data(SECTION_ROLE)
+            if section:
+                if section in self.collapsed_sections:
+                    self.collapsed_sections.remove(section)
+                else:
+                    self.collapsed_sections.add(section)
+                self.fill_drawer()
+            return
+        if item.data(PAGE_ROLE) is not None:
+            self.setCurrentWidget(item.data(PAGE_ROLE))
+            self.close_drawer()
+            self.stack.currentWidget().setFocus()
+
+    def activate_first(self):
+        for row in self.page_rows():
+            item = self.sidebar.item(row)
+            if not item.isHidden():
+                self.activate_item(item)
+                return
+
+    def fill_drawer(self):
+        query = self.search.text().strip().casefold()
+        aliases = {"iperf": "bandwidth throughput", "SCP": "file transfer ssh", "TFTP": "file transfer firmware",
+                   "Network Map": "topology snmp", "Interfaces": "adapter nic ip configuration",
+                   "ARP": "neighbors mac", "Ports": "scan tcp", "DNS Servers": "dns benchmark"}
+        self.quick_list.clear()
+        if not query:
+            for heading, titles in (("Favorites", self.favorites), ("Recent", self.recent)):
+                header = QListWidgetItem(heading.upper())
+                header.setFlags(Qt.NoItemFlags)
+                self.quick_list.addItem(header)
+                for title in titles:
+                    for row in self.page_rows():
+                        source = self.sidebar.item(row)
+                        if source.text() == title:
+                            item = QListWidgetItem(title)
+                            item.setIcon(source.icon())
+                            item.setData(PAGE_ROLE, source.data(PAGE_ROLE))
+                            self.quick_list.addItem(item)
+        self.quick_list.setVisible(not query)
+        self.quick_list.setMaximumHeight(min(300, max(80, self.content.height() // 3)))
+        heading, visible = None, False
+        for row in range(self.sidebar.count()):
+            item = self.sidebar.item(row)
+            if item.data(PAGE_ROLE) is None:
+                if heading is not None:
+                    heading.setHidden(not visible)
+                heading, visible = item, False
+            else:
+                match = query in (item.text() + " " + self.sections[item.text()] + " " + aliases.get(item.text(), "")).casefold()
+                item.setHidden(not match or (not query and self.sections[item.text()] in self.collapsed_sections))
+                visible |= match
+        if heading is not None:
+            heading.setHidden(not visible)
+        self.position_drawer()
+
+    def rebuild_rail(self):
+        self.favorite_list.clear()
+        for title in self.favorites:
+            if title not in self.sections:
+                continue
+            item = QListWidgetItem(tool_icon(title), "")
+            item.setData(Qt.UserRole, title)
+            item.setData(Qt.AccessibleTextRole, title)
+            item.setToolTip(title + " — drag to reorder; right-click to unpin")
+            item.setTextAlignment(Qt.AlignCenter)
+            item.setSizeHint(QSize(48, max(44, self.fontMetrics().height() + 16)))
+            self.favorite_list.addItem(item)
+            if title == self.title(self.currentWidget()):
+                self.favorite_list.setCurrentItem(item)
+
+    def favorites_moved(self, *args):
+        self.favorites = [self.favorite_list.item(i).data(Qt.UserRole) for i in range(self.favorite_list.count())]
+        self.fill_drawer()
+
+    def toggle_favorite(self, title):
+        if title in self.favorites:
+            self.favorites.remove(title)
+        else:
+            self.favorites.append(title)
+        self.rebuild_rail()
+        self.fill_drawer()
+
+    def pin_menu(self, listing, pos):
+        item = listing.itemAt(pos)
+        if item is None or item.data(PAGE_ROLE) is None:
+            return
+        title = self.title(item.data(PAGE_ROLE))
+        menu = QMenu(self)
+        menu.addAction("Unpin from Favorites" if title in self.favorites else "Pin to Favorites",
+                       lambda: self.toggle_favorite(title))
+        menu.exec_(listing.mapToGlobal(pos))
+
+    def rail_menu(self, pos):
+        item = self.favorite_list.itemAt(pos)
+        if item is not None:
+            title = item.data(Qt.UserRole)
+            menu = QMenu(self)
+            menu.addAction("Unpin " + title, lambda: self.toggle_favorite(title))
+            menu.exec_(self.favorite_list.mapToGlobal(pos))
+
+    def restore_settings(self, settings):
+        favorites = settings.value("navigation/favorites", self.favorites)
+        if isinstance(favorites, str):
+            favorites = [favorites]
+        self.favorites = list(dict.fromkeys(title for title in favorites if title in self.sections))
+        recent = settings.value("navigation/recent", [])
+        if isinstance(recent, str):
+            recent = [recent]
+        self.recent = [title for title in recent if title in self.sections][:5]
+        self.rebuild_rail()
+        self.set_sidebar_visible(settings.value("navigation/keep_open", False, bool))
+
+    def save_settings(self, settings):
+        settings.setValue("navigation/favorites", self.favorites)
+        settings.setValue("navigation/recent", self.recent)
+        settings.setValue("navigation/keep_open", self.sidebar_visible())
+
+    def _on_row_changed(self, row):
+        super()._on_row_changed(row)
+        if hasattr(self, "page_title"):
+            title = self.title(self.currentWidget())
+            self.page_title.setText(title)
+            self.recent = [title] + [name for name in self.recent if name != title][:4]
+            self.rebuild_rail()
