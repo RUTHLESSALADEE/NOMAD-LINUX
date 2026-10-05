@@ -21,6 +21,7 @@ from .dhcp_tab import DhcpTab
 from .dialogs import AboutDialog, LogDialog
 from .dns_servers_tab import DnsServersTab
 from .iperf_tab import IperfTab
+from .integration import Integration
 from .ipam_tab import IpamTab
 from .latency_tab import LatencyTab
 from .lookup_tab import LookupTab
@@ -164,9 +165,11 @@ class MainWindow(QMainWindow):
         self.session_store = SessionStore()  # Shared by the Terminal and SCP pages
         self.terminal_tab = TerminalTab(self, self.session_store)
         self.scp_tab = ScpTab(self, self.session_store)
+        self.integration = Integration(self)  # The Manage pages and the map, as one
         self.ipam_tab = IpamTab(self)
         self.vlan_tab = VlanTab(self)  # Uses the IP Addresses page's databases and sync
         self.placement_tab = PlacementTab(self)  # Those and the Network Map's
+        self.integration.connect_pages()
         sections = [
             ("This Computer", [(self.adapter_tab, "Interfaces"), (self.routing_tab, "Routing Table"),
                                (self.neighbors_tab, "ARP"), (self.connections_tab, "Connections"),

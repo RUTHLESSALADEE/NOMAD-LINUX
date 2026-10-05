@@ -303,6 +303,14 @@ An advertised subnet (one other routers have a route to) can be in only one plac
 - **VRFs:** each VRF is checked on its own (the same subnet in two VRFs is two subnets). Interfaces' VRFs come from CISCO-VRF-MIB or MPLS-L3VPN-STD-MIB, and VRF routing tables from MPLS-L3VPN-STD-MIB; when a device doesn't offer those, the crawl log says so and the page notes it.
 - Watching notes subnets that appear, go or move between switches in the Watch log, and **Read Routes Again** brings the map's routing tables up to date without mapping again.
 
+## The Manage pages and the map together
+
+- **One network at a time:** choosing a network on IP Addresses, VLANs (a domain of it) or Subnet Placement chooses it on the others, and opening a map of a network chooses that network.
+- **A map is of one IPAM network:** **IPAM Network...** (on the map's bar, or its Map menu) says which, suggesting the one holding most of the map's subnets. It's saved with the map (and shared with a tribe map). The VLANs and Subnet Placement pages only check a network against a map of it, so a map of another network isn't mixed in.
+- **When a network has no map, or no VLAN domain:** the Network Map page says so in a bar: a map that isn't tied to an IPAM network (with IPAM Network... to say which), or a map of another network than the pages are on, with **Open** for that network's map (a tribe map, or a recent map file, of it) and **Back to** the map's network. A tribe map no one has tied to a network asks once, when opened. The VLANs page shows nothing (not another network's domain) for a network with no VLAN domain, with **New Domain for** it.
+- **IP Addresses shows what the other pages know** about the selected subnet, on its line above the addresses: its role, the VLANs it's linked to, whether Subnet Placement finds anything wrong with it, and how many places the map has it in, each a link to that page. None of it is written to IPAM, so the exports are unchanged.
+- **Links everywhere:** a subnet's right-click menu (IP Addresses) shows its VLANs, its placement and it on the map; an address's shows the device that has it (or the switch a host with it is on). The VLANs page shows each subnet's role and placement with links, and Show Subnet in Subnet Placement. Subnet Placement links to IP Addresses, the VLANs page and the map, and right-click shows its VLANs. On the map, a subnet on the logical view, a device (its addresses in IP Addresses, its subnets in Subnet Placement), a port (its VLANs on the VLANs page, its host's address in IP Addresses), a host, and the VLANs tab (**Show on VLANs Page**) all reach the other pages.
+
 ## Good to know
 
 - **Administrator rights:** NOMAD starts without them, so viewing and testing work straight away. When a change needs them, it offers to restart as administrator (or use File > Restart as Administrator).

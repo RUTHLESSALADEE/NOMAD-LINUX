@@ -26,6 +26,7 @@ from ..ipam.vlan_team import TeamVlanStore
 from ..ipam.vlans import VlanStore
 from ..netmap.placement import places, segment_text, vrf_text
 from .common import SortableTableItem, set_hint
+from .integration import VLAN, hub, link
 from .placement_dialogs import MoveDialog, ScopeDialog
 from .table_filter import TableFilter
 from .theme import COLORS
@@ -110,6 +111,7 @@ class PlacementTab(QWidget):
         self.table_filter.columns.widest = {5: 260, 6: 320}
         self.details = QTextBrowser()
         self.details.setOpenLinks(False)
+        self.details.anchorClicked.connect(self.open_link)
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self.table)
         splitter.addWidget(self.details)
@@ -185,6 +187,7 @@ class PlacementTab(QWidget):
 
     def on_data_changed(self):
         """The tribe's data synced, or the map changed: work it out again now if the page is showing."""
+        self.forget_facts()
         self.stale = True
         if self.isVisible():
             self.refresh()
@@ -205,8 +208,60 @@ class PlacementTab(QWidget):
         return page.local_store, VlanStore(page.local_store), PlacementStore(page.local_store), True
 
     def network_map(self):
+        """The open map, when it's of the network shown (or nobody has said which network it's of)."""
         page = getattr(self.window, "netmap_tab", None)
-        return getattr(page, "network_map", None)
+        network_map = getattr(page, "network_map", None)
+        if network_map is not None and network_map.ipam_network and self.network_id and \
+                network_map.ipam_network != f"{self.source_key}:{self.network_id}":
+            return None
+        return network_map
+
+    def forget_facts(self):
+        integration = hub(self.window)
+        if integration is not None:
+            integration.forget()
+
+    def follow_network(self, key):
+        """Another page (or the map) chose a network: show it here too."""
+        integration = hub(self.window)
+        if integration is not None and not integration.follows(self):
+            return
+        if key == f"{self.source_key}:{self.network_id}":
+            return
+        index = self.network_combo.findData(key)
+        if index >= 0:
+            self.network_combo.setCurrentIndex(index)
+        else:
+            self.saved_network = key  # Listed when the page is first shown
+
+    def go_to_subnet(self, source_key, network_id, cidr, vrf=None, find=""):
+        """Go to a subnet (or, with find, the subnets matching it, such as a device's name)."""
+        self.window.navigator.setCurrentWidget(self)
+        if not self.window.ipam_tab.open_store():
+            return
+        key = f"{source_key}:{network_id}"
+        if self.network_combo.findData(key) < 0:
+            self.fill_networks()
+        index = self.network_combo.findData(key)
+        if index >= 0 and index != self.network_combo.currentIndex():
+            self.network_combo.setCurrentIndex(index)
+        elif self.stale:
+            self.refresh()
+        self.show_combo.setCurrentIndex(0)
+        self.role_combo.setCurrentIndex(0)
+        self.search_input.setText(find or "")
+        if cidr:
+            for number in range(self.table.rowCount()):
+                row = self.table.item(number, 0).data_object
+                if row.cidr == cidr and (not vrf or row.vrf == vrf):
+                    self.table.selectRow(number)
+                    self.table.scrollToItem(self.table.item(number, 0))
+                    break
+
+    def open_link(self, url):
+        integration = hub(self.window)
+        if integration is not None:
+            integration.open_link(url)
 
     def fill_networks(self):
         select = (f"{self.source_key}:{self.network_id}" if self.network_id else "") or self.saved_network
@@ -245,6 +300,9 @@ class PlacementTab(QWidget):
         self.source_key, _, network_id = data.partition(":")
         self.network_id = network_id or None
         self.refresh()
+        integration = hub(self.window)
+        if integration is not None and self.network_id:
+            integration.choose_network(f"{self.source_key}:{self.network_id}", self)
 
     def refresh(self):
         """Work everything out again: the plan, the map, and what's wrong."""
@@ -253,13 +311,21 @@ class PlacementTab(QWidget):
         network_map = self.network_map()
         selected = self.selected_row()
         self.rows = []
+        integration = hub(self.window)
         if ipam is not None and self.network_id:
+            facts = integration.facts(f"{self.source_key}:{self.network_id}") if integration is not None else None
             try:
-                self.rows = evaluate(network_map, ipam, vlans, placements, self.network_id)
+                self.rows = facts.rows if facts is not None else evaluate(network_map, ipam, vlans, placements,
+                                                                          self.network_id)
             except IpamError as error:  # The network was deleted meanwhile
                 set_hint(self.status_label, str(error), "error")
         page = getattr(self.window, "netmap_tab", None)
-        if network_map is None:
+        open_map = getattr(page, "network_map", None)
+        if network_map is None and open_map is not None:
+            other = integration.network_name(open_map.ipam_network) if integration is not None else ""
+            self.map_label.setText(f"Map: {page.map_name()} is of {other or 'another network'}, so it isn't "
+                                   "checked against this one")
+        elif network_map is None:
             self.map_label.setText("No network map open (open one on the Network Map page)")
         else:
             routers = sum(1 for device in network_map.devices.values() if device.routes or device.vrf_routes)
@@ -384,7 +450,13 @@ class PlacementTab(QWidget):
                        self.complete_button, self.cancel_button, self.map_button, self.ipam_button):
             action = menu.addAction(button.text(), button.click)
             action.setEnabled(button.isEnabled())
-        menu.exec_(self.table.viewport().mapToGlobal(position))
+        links = {}
+        for domain, vlan in self.selected_row().planned:
+            links[menu.addAction(f"Show VLAN {vlan.vlan} on the VLANs Page")] = link(
+                VLAN, src=self.source_key, domain=domain.id, vlan=vlan.vlan)
+        chosen = menu.exec_(self.table.viewport().mapToGlobal(position))
+        if chosen in links:
+            self.open_link(links[chosen])
 
     # ----------------------------------------------------------------- Details
 
@@ -411,6 +483,12 @@ class PlacementTab(QWidget):
             return devices[key].label if key in devices else key
 
         parts = [f"<h3>{escape(row.cidr)}" + (f" &middot; VRF {escape(row.vrf)}" if row.vrf else "") + "</h3>"]
+        integration = hub(self.window)
+        if integration is not None and self.network_id:
+            links = integration.subnet_links(f"{self.source_key}:{self.network_id}", row.cidr, row,
+                                             skip=("placement",))
+            if links:
+                parts.append("<p>Show in: " + " &middot; ".join(links) + "</p>")
         if row.subnet is not None:
             details = ", ".join(part for part in (row.subnet.name, f"gateway {row.subnet.gateway}"
                                                   if row.subnet.gateway else "") if part)
@@ -505,6 +583,7 @@ class PlacementTab(QWidget):
         """After a change: tribe changes reach the others through the sync; work the page out again."""
         if self.source_key == TEAM_SOURCE:
             self.window.ipam_tab.sync_now()
+        self.forget_facts()
         self.refresh()
         if message:
             set_hint(self.status_label, message, "success")
@@ -576,6 +655,7 @@ class PlacementTab(QWidget):
         waiting, self.waiting = self.waiting, None
         if waiting is None:
             return
+        self.forget_facts()
         self.refresh()
         note = f" ({failed} device{'s' if failed != 1 else ''} didn't answer SNMP)" if failed else ""
         if waiting == "read":

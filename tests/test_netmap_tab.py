@@ -772,7 +772,8 @@ def test_map_menu_does_what_the_map_buttons_do(tab, crawled, monkeypatch):
     tab.on_crawled(crawled)
     tab.update_map_menu()
     entries = {action.text(): action for action in tab.map_menu.actions() if not action.isSeparator()}
-    assert list(entries) == ["New Map", "Open...", "Recent", "Save As...", "Export", "Compare", "Tribe"]
+    assert list(entries) == ["New Map", "Open...", "Recent", "Save As...", "Export", "Compare", "IPAM Network...",
+                             "Tribe"]
     assert all(action.isEnabled() for action in entries.values())
     recent = entries["Recent"].menu()
     recent.aboutToShow.emit()

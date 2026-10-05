@@ -14,7 +14,7 @@ from nomad.ipam.vlans import VlanStore
 from nomad.netmap import collect
 from nomad.netmap.crawl import CrawlSettings, Crawler
 from nomad.netmap.model import Device, Link, NetworkMap
-from nomad.netmap.placement import analyse
+from nomad.netmap.placement import analyse, places
 
 
 # --------------------------------------------------------------------- VRFs, read over SNMP
@@ -222,6 +222,17 @@ def test_linked_devices_sharing_a_subnet_are_one_place():
     network_map.devices["sw"].port_vlans["Gi0/1"]["allowed"] = "1,57"
     [subnet] = analyse(network_map)
     assert len(subnet.segments) == 2
+
+
+def test_unset_interface_addresses_are_left_out():
+    """pfSense lists 0.0.0.0 (mask 0) beside an interface's real address: not a subnet holding everything."""
+    from nomad.netmap import l3
+    network_map = NetworkMap()
+    network_map.devices["fw"] = Device("fw", "fw", source="snmp", interfaces_l3=[["0.0.0.0", 0, "vmx0"],
+                                                                                 ["10.0.3.1", 24, "vmx0"]])
+    assert [cidr for _, cidr in places(network_map)] == ["10.0.3.0/24"]
+    nodes, _ = l3.l3_graph(network_map)
+    assert [node.label for node in nodes.values() if node.kind == l3.SUBNET] == ["10.0.3.0/24"]
 
 
 def test_routers_linked_by_a_routed_port_stay_two_places():

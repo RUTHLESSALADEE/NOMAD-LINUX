@@ -230,6 +230,9 @@ class NetworkMap:
     # {"when": ISO time, "where": "SW1 Gi1/0/5", "by": who found it}
     news: dict = field(default_factory=dict)
     host_seen: dict = field(default_factory=dict)  # MAC -> date (ISO) last on the map, so a host back isn't "new"
+    # The IPAM network the map is of, as the IP Addresses page names it: "team:<id>" (the tribe's) or "local:<id>"
+    # (this computer's), or "" when nobody has said
+    ipam_network: str = ""
 
     def add_link(self, link):
         """Add a link, merging it with the same link seen from the other end (or by the other protocol)."""
@@ -572,8 +575,8 @@ class NetworkMap:
             raise ValueError("This isn't a NOMAD network map.")
         if data.get("format", 1) > FORMAT_VERSION:
             raise ValueError("This map was saved by a newer version of NOMAD.")
-        network_map = cls(**{name: data[name] for name in ("seeds", "started", "finished", "stopped", "root")
-                             if name in data})
+        network_map = cls(**{name: data[name] for name in ("seeds", "started", "finished", "stopped", "root",
+                                                          "ipam_network") if name in data})
         network_map.devices = {item["key"]: _build(Device, item) for item in data["devices"]}
         network_map.links = [_build(Link, item) for item in data.get("links", [])]
         network_map.hosts = [_build(Host, item) for item in data.get("hosts", [])]

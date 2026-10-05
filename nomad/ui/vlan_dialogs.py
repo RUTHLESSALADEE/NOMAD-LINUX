@@ -108,13 +108,13 @@ class RangesEditor(QTableWidget):
 
 
 class DomainDialog(_EditDialog):
-    def __init__(self, parent, source, domain=None, name="", vtp_domain=""):
+    def __init__(self, parent, source, domain=None, name="", vtp_domain="", network_id=""):
         super().__init__(parent, "Edit VLAN Domain" if domain else f"New {source.label} VLAN Domain")
         self.source, self.domain = source, domain
         self.name_input = QLineEdit(domain.name if domain else name)
         self.name_input.setPlaceholderText("Where VLAN numbers are unique: a VTP domain, or a site's switches")
         self.network_combo = QComboBox()
-        fill_network_combo(self.network_combo, source.ipam, domain.network_id if domain else "")
+        fill_network_combo(self.network_combo, source.ipam, domain.network_id if domain else network_id)
         self.network_combo.setToolTip("The IPAM network whose subnets these VLANs carry. Only read: linking a "
                                       "subnet to a VLAN changes nothing in IPAM.")
         self.vtp_input = QLineEdit(domain.vtp_domain if domain else vtp_domain)
