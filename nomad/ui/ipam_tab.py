@@ -2176,22 +2176,10 @@ class IpamTab(QWidget):
         path, _ = QFileDialog.getSaveFileName(self, "Export Network", f"{network.name}.csv", "CSV files (*.csv)")
         if not path:
             return
-        subnets = self.subnets
+        from ..ipam.workbook import csv_rows
         try:
             with open(path, "w", newline="", encoding="utf-8-sig") as file:
-                writer = csv.writer(file)
-                writer.writerow(["Subnet", "Subnet Name", "Gateway", "Address", "Status", "Name", "MAC Address",
-                                 "Description", "Last Changed", "Changed By"])
-                for subnet in subnets:
-                    writer.writerow([subnet.cidr, subnet.name, subnet.gateway, "", "", "", "", subnet.description,
-                                     subnet.modified, subnet.modified_by])
-                for address in self.store.addresses(network.id):
-                    holding = [subnet for subnet in subnets if address.address in subnet.network]
-                    subnet = max(holding, key=lambda subnet: (subnet.network.prefixlen, subnet.network.first),
-                                 default=None)
-                    writer.writerow([subnet.cidr if subnet else "", subnet.name if subnet else "", "", address.ip,
-                                     STATUSES.get(address.status, address.status), address.name, address.mac,
-                                     address.description, address.modified, address.modified_by])
+                csv.writer(file).writerows(csv_rows(self.store, network.id, self.subnets))
         except OSError as error:
             set_hint(self.status_label, f"Couldn't save {path}: {error.strerror or error}", "error")
             return
