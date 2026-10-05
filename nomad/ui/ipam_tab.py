@@ -26,6 +26,7 @@ from ..ipam.client import OldServerError, ServerUnreachable, TeamKeyError, TeamS
 from ..ipam.server import ConflictError, server_dir
 from ..ipam.spreadsheet import SpreadsheetError, parse_page, read_pages
 from ..ipam.store import ANYWHERE, DESCRIPTION, MAC, NAME, RESERVED, STATUSES, USED, VALUE, IpamError, IpamStore
+from ..ipam.vlan_team import TeamVlanStore
 from ..oui import normalize_mac
 from ..sweep import SWEEP_PASSES
 from ..system import log_dir
@@ -438,6 +439,9 @@ def when_text(moment):
 
 
 class IpamTab(QWidget):
+    # A sync with the tribe's server finished (the VLANs page shows what it brought; VLANs aren't shown here)
+    tribe_synced = pyqtSignal()
+
     def __init__(self, window):
         super().__init__(window)
         self.window = window
@@ -879,8 +883,12 @@ class IpamTab(QWidget):
                                     "IPAM.", "success")
 
     def unsent_tribe_changes(self):
-        """Changes made offline that haven't reached the server (waiting, or refused and not yet resolved)."""
-        return (self.team.pending_count() + len(self.team.refused())) if self.team is not None else 0
+        """Changes made offline that haven't reached the server (waiting, or refused and not yet resolved),
+        addresses' and VLANs'."""
+        if self.team is None:
+            return 0
+        vlans = TeamVlanStore(self.team)
+        return self.team.pending_count() + len(self.team.refused()) + vlans.pending_count() + len(vlans.refused())
 
     def forget_team_copy(self):
         """Empty and close the copy of the tribe's IPAM data (leaving the tribe)."""
@@ -898,6 +906,8 @@ class IpamTab(QWidget):
         team, client, revision, outgoing = self.team, self.team.client, self.team.revision, self.team.outgoing()
         history_revision, sighting_revision = self.team.history_revision, self.team.sighting_revision
         sightings_out = self.team.outgoing_sightings()
+        vlans = TeamVlanStore(self.team)
+        vlans_out = vlans.outgoing()
         if announce:
             set_hint(self.team_label, "Tribe: syncing...", "info")
 
@@ -905,6 +915,7 @@ class IpamTab(QWidget):
             sent = []
             try:
                 sent = team.send_pending(outgoing) if outgoing else []  # Only talks to the server: thread-safe
+                sent = (sent, vlans.send_pending(vlans_out) if vlans_out else [])  # And VLANs changed offline
                 changes = client.fetch_all_changes(revision)
                 try:
                     changes += (client.fetch_log(history_revision),)  # History, kept for offline use
@@ -926,6 +937,10 @@ class IpamTab(QWidget):
             self.sync_again = False
             QTimer.singleShot(0, self.sync_now)
         sent_results, result = result
+        sent_results, vlan_results = sent_results if isinstance(sent_results, tuple) else (sent_results, [])
+        if vlan_results:
+            sent, refused = TeamVlanStore(self.team).apply_sent(vlan_results)
+            log.info("Sent %d VLAN changes made offline to the IPAM server; %d refused", sent, refused)
         if sent_results:
             sent, refused = self.team.apply_sent(sent_results)
             log.info("Sent %d offline changes to the IPAM server; %d refused", sent, refused)
@@ -962,6 +977,7 @@ class IpamTab(QWidget):
         if announce:
             set_hint(self.status_label, f"Synced: {len(items)} change{'' if len(items) == 1 else 's'} from the "
                                         "server.", "success")
+        self.tribe_synced.emit()
 
     def sync_failed(self, error):
         self.syncing = False
@@ -1063,6 +1079,18 @@ class IpamTab(QWidget):
         subnet = store.subnet_for(network_id, ip) if store is not None else None
         self.fill_tree(select=subnet if subnet is not None else UNSUBNETTED)
         self.select_address(ipaddress.ip_address(ip))
+
+    def go_to_subnet(self, source, network_id, cidr):
+        """Go to a subnet on this page (from the VLANs page)."""
+        self.window.navigator.setCurrentWidget(self)
+        self.subnet_filter.clear()
+        self.search_input.clear()
+        self.right_stack.setCurrentIndex(0)
+        self.fill_networks(f"{source}:{network_id}")
+        store = self.store_for(source)
+        subnet = next((item for item in store.subnets(network_id) if item.cidr == cidr), None) if store else None
+        if subnet is not None:
+            self.fill_tree(select=subnet)
 
     def record_sweep(self, source, network_id, ranges, hosts, complete, names=None):
         """A sweep compared with this IPAM network finished: keep what it found (shared, for tribe networks), and

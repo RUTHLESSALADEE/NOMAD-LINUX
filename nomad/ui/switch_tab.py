@@ -2,13 +2,13 @@
 import logging
 
 from PyQt5.QtCore import pyqtSignal
-from PyQt5.QtWidgets import QApplication, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QProgressBar, QPushButton, \
-    QSpinBox, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QApplication, QFormLayout, QHBoxLayout, QLabel, QProgressBar, QPushButton, QSpinBox, \
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
 
 from ..lldp import discover
 from ..pktmon import PktmonBusy, find_pktmon
 from ..system import CommandError
-from .common import StoppableThread, set_hint
+from .common import ColumnFitter, StoppableThread, set_hint
 from .theme import accent_button
 
 log = logging.getLogger(__name__)
@@ -90,7 +90,7 @@ class SwitchTab(QWidget):
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Switch", "Details"])
         self.tree.setAlternatingRowColors(True)
-        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        ColumnFitter(self.tree)
         layout.addWidget(self.tree, 1)
 
         self.start_button.clicked.connect(self.start)

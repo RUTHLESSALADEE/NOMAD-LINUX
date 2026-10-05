@@ -4,11 +4,11 @@ import re
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
-from PyQt5.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, \
-    QHeaderView, QLabel, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout
+from PyQt5.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QLabel, \
+    QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout
 
 from ..terminal.highlight import COLORS, DEFAULT_RULES, HighlightRule
-from .common import set_hint
+from .common import ColumnFitter, set_hint
 from .theme import COLORS as THEME
 
 COLUMNS = ["Word or Pattern", "Colour", "Pattern (regex)", "Match Case", "Whole Word"]
@@ -35,10 +35,7 @@ class HighlightDialog(QDialog):
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
-        for column in range(1, len(COLUMNS)):
-            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        ColumnFitter(self.table, stretch=0)
         layout.addWidget(self.table, 1)
         buttons_row = QHBoxLayout()
         add_button, remove_button = QPushButton("Add"), QPushButton("Remove")

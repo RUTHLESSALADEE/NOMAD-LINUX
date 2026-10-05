@@ -4,11 +4,11 @@ import logging
 import time
 
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, \
-    QMenu, QPushButton, QTableWidget, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QHBoxLayout, QLabel, QLineEdit, QMenu, \
+    QPushButton, QTableWidget, QVBoxLayout, QWidget
 
 from ..connections import TCP, UDP, list_connections, matches
-from .common import SortableTableItem, run_in_background, set_hint
+from .common import ColumnFitter, SortableTableItem, run_in_background, set_hint
 
 log = logging.getLogger(__name__)
 
@@ -72,9 +72,8 @@ class ConnectionsTab(QWidget):
         self.table.setSortingEnabled(True)
         self.table.sortByColumn(COL_LOCAL_PORT, Qt.AscendingOrder)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeToContents)
-        header.setStretchLastSection(True)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        ColumnFitter(self.table)
         layout.addWidget(self.table, 1)
 
         bottom = QHBoxLayout()

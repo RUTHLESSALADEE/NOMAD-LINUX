@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from ..oui import format_mac, vendor
 from ..snmp import V2C, SnmpClient, SnmpError, parse_oid
 from ..snmpv3 import credential_from_json, credential_to_json, is_v3, users_from_json
-from . import collect, l3
+from . import collect, l3, vlans
 from .model import AP, HOST, KIND_NAMES, NETWORK_KINDS, NO_SNMP, PHONE, SERVER, SNMP, UNKNOWN, UNREACHABLE, Device, \
     Host, Link, NetworkMap, Trace, display_name, normalize_name, port_key, short_port
 
@@ -374,6 +374,25 @@ class Crawler:
                 self.walk(client, collect.LLDP_REM_MAN_ADDR_IF_SUBTYPE, tables, "LLDP", timing="Neighbors"))
             tables.neighbors += collect.lldp_neighbors(lldp_rows, local_ports, tables.interfaces, addresses)
         tables.arp = collect.arp(self.walk(client, collect.ARP_PHYS_ADDRESS, tables, "ARP", timing="ARP table"))
+        self.read_routes(client, tables)
+        self.read_vlans(client, tables)
+        if not self.settings.collect_hosts:
+            return
+        tables.own_macs = collect.own_macs(self.walk(client, collect.IF_PHYS_ADDRESS, tables, "Interfaces"))
+        tables.lag_parents = collect.lag_parents(
+            self.walk(client, collect.IF_STACK_STATUS, tables, "Port-channels", timing="Interfaces"),
+            self.walk(client, collect.LAG_ATTACHED, tables, "Port-channels", timing="Interfaces"))
+        info = tables.info
+        vlan_list = sorted(tables.vlan_names) if info.object_id.startswith(collect.CISCO + ".") else []
+        if vlan_list and "nx-os" not in info.descr.lower():
+            if self.read_vlan_tables(client, tables, community, vlan_list):
+                return
+            tables.notes.append("No per-VLAN MAC tables (community@vlan or SNMPv3 vlan- contexts): read its one "
+                                "MAC table instead")
+        self.read_mac_table(client, tables)
+
+    def read_routes(self, client, tables):
+        """The global routing table, then which interfaces are in VRFs and each VRF's routing table."""
         route_rows = []
         for column in (5, 6, 7):  # ifIndex, type, protocol: the index holds destination, mask and next hop
             route_rows += self.walk(client, f"{collect.CIDR_ROUTE_ENTRY}.{column}", tables, "Routes", ROUTE_ROWS,
@@ -385,21 +404,61 @@ class Crawler:
                                       timing="Routing table")
         tables.routes = collect.routes(route_rows, old_rows)
         tables.routes_truncated = len(route_rows) >= 3 * ROUTE_ROWS or len(old_rows) >= 5 * ROUTE_ROWS
-        if not self.settings.collect_hosts:
+        self.read_vrfs(client, tables)
+
+    def read_vrfs(self, client, tables):
+        """Which interfaces are in which VRF (CISCO-VRF-MIB on Cisco, else MPLS-L3VPN-STD-MIB), and, when there are
+        any, each VRF's routes (MPLS-L3VPN-STD-MIB; a device without it has its VRFs' routes noted as unread)."""
+        if tables.info.object_id.startswith(collect.CISCO + "."):
+            names = self.walk(client, collect.CV_VRF_NAME, tables, "VRFs")
+            if names:
+                tables.interface_vrfs = collect.cisco_vrf_interfaces(
+                    names, self.walk(client, collect.CV_VRF_INTERFACE_ENTRY, tables, "VRFs"))
+        if not tables.interface_vrfs:
+            tables.interface_vrfs = collect.l3vpn_vrf_interfaces(
+                self.walk(client, collect.L3VPN_IF_CLASSIFICATION, tables, "VRFs"))
+        if not tables.interface_vrfs:
             return
-        tables.own_macs = collect.own_macs(self.walk(client, collect.IF_PHYS_ADDRESS, tables, "Interfaces"))
-        tables.lag_parents = collect.lag_parents(
-            self.walk(client, collect.IF_STACK_STATUS, tables, "Port-channels", timing="Interfaces"),
-            self.walk(client, collect.LAG_ATTACHED, tables, "Port-channels", timing="Interfaces"))
-        info = tables.info
-        vlan_list = collect.vlans(self.walk(client, collect.VTP_VLAN_STATE, tables, "VLANs", timing="MAC tables")) \
-            if info.object_id.startswith(collect.CISCO + ".") else []
-        if vlan_list and "nx-os" not in info.descr.lower():
-            if self.read_vlan_tables(client, tables, community, vlan_list):
-                return
-            tables.notes.append("No per-VLAN MAC tables (community@vlan or SNMPv3 vlan- contexts): read its one "
-                                "MAC table instead")
-        self.read_mac_table(client, tables)
+        rows = []
+        for column in collect.L3VPN_ROUTE_COLUMNS:
+            rows += self.walk(client, f"{collect.L3VPN_ROUTE_ENTRY}.{column}", tables, "VRF routes", ROUTE_ROWS,
+                              timing="Routing table")
+        tables.vrf_routes = collect.l3vpn_routes(rows)
+        unread = sorted(set(tables.interface_vrfs.values()) - set(tables.vrf_routes))
+        if unread:
+            tables.notes.append(f"Routes in VRF{'s' if len(unread) > 1 else ''} {', '.join(unread)} couldn't be read "
+                                "(the device doesn't offer MPLS-L3VPN-STD-MIB's VRF routing tables)")
+
+    def read_vlans(self, client, tables):
+        """Its VLANs and their names, its VTP domain, and each switch port's VLANs: from CISCO-VTP-MIB and
+        CISCO-VLAN-MEMBERSHIP-MIB on Cisco switches, otherwise (or when those are empty) from Q-BRIDGE-MIB."""
+        if tables.info.object_id.startswith(collect.CISCO + "."):
+            state_rows = self.walk(client, collect.VTP_VLAN_STATE, tables, "VLANs")
+            if state_rows:
+                tables.vlan_names = collect.vlan_names(
+                    state_rows, self.walk(client, collect.VTP_VLAN_NAME, tables, "VLAN names", timing="VLANs"))
+                domain_rows = []
+                for number in (2, 3):  # Name and mode
+                    domain_rows += self.walk(client, f"{collect.VTP_DOMAIN_ENTRY}.{number}", tables, "VTP domain",
+                                             timing="VLANs")
+                tables.vtp_domain, tables.vtp_mode = collect.vtp_domain(domain_rows)
+                trunk_rows = []
+                for number in (collect.TRUNK_STATUS, collect.TRUNK_NATIVE, *collect.TRUNK_ALLOWED_COLUMNS):
+                    trunk_rows += self.walk(client, f"{collect.TRUNK_PORT_ENTRY}.{number}", tables, "Trunks",
+                                            timing="VLANs")
+                tables.port_vlans = collect.cisco_port_vlans(
+                    trunk_rows, self.walk(client, collect.VM_VLAN, tables, "Access ports' VLANs", timing="VLANs"),
+                    self.walk(client, collect.VM_VOICE_VLAN, tables, "Voice VLANs", timing="VLANs"))
+        if not tables.vlan_names:
+            tables.vlan_names = collect.q_vlan_names(self.walk(client, collect.Q_VLAN_STATIC_NAME, tables,
+                                                               "VLAN names (Q-BRIDGE)", timing="VLANs"))
+            if tables.vlan_names:
+                base_ports = self.walk(client, collect.BASE_PORT_IFINDEX, tables, "Bridge ports", timing="VLANs")
+                tables.port_vlans = collect.q_port_vlans(
+                    self.walk(client, collect.Q_PVID, tables, "Ports' VLANs", timing="VLANs"),
+                    self.walk(client, collect.Q_VLAN_EGRESS, tables, "VLAN members", timing="VLANs"),
+                    self.walk(client, collect.Q_VLAN_UNTAGGED, tables, "VLAN members", timing="VLANs"), base_ports)
+        tables.vlans_in_use = collect.ports_vlans_in_use(tables.port_vlans)
 
     def read_mac_table(self, client, tables):
         """The MAC table of a switch that keeps one for every VLAN (NX-OS, most non-Cisco switches)."""
@@ -418,10 +477,7 @@ class Crawler:
         """Catalyst IOS keeps a MAC table per VLAN, read with community@vlan (or, over SNMPv3, in context vlan-N).
         Only the VLANs its ports use (a VTP domain can list hundreds the switch doesn't carry), several at once.
         Returns whether any VLAN answered (some images, and v3 users without the vlan- context, have none)."""
-        in_use = collect.vlans_in_use(
-            self.walk(client, collect.VM_VLAN, tables, "VLANs in use", timing="MAC tables"),
-            self.walk(client, collect.VM_VOICE_VLAN, tables, "VLANs in use", timing="MAC tables"),
-            self.walk(client, collect.TRUNK_NATIVE_VLAN, tables, "VLANs in use", timing="MAC tables"))
+        in_use = tables.vlans_in_use  # Read with its VLANs (read_vlans)
         chosen = [vlan for vlan in vlan_list if vlan in in_use] if in_use else vlan_list
         if len(chosen) < len(vlan_list):
             tables.notes.append(f"MAC tables for the {len(chosen)} of {len(vlan_list)} VLANs its ports use "
@@ -666,6 +722,10 @@ class Crawler:
                   for destination, next_hop, if_index, protocol in tables.routes]
         device.routes = routes[:MAX_ROUTES]
         device.routes_truncated = len(routes) > MAX_ROUTES or tables.routes_truncated
+        device.vtp_domain, device.vtp_mode = tables.vtp_domain, tables.vtp_mode
+        device.vlans = [[vlan, name] for vlan, name in sorted(tables.vlan_names.items())]
+        device.port_vlans = vlans.device_port_vlans(tables, short_port)
+        apply_vrfs(device, tables)
         for ip in device.addresses:
             self.aliases.setdefault(ip, key)
         device.kind = collect.classify(info.object_id, info.descr, frozenset(self.capabilities.get(key, ())),
@@ -843,6 +903,56 @@ class Check:
                 device.kind = collect.classify(self.info.object_id, self.info.descr, platform=device.platform)
 
 
+def read_vlans_of(settings, address, client_factory=SnmpClient, routes=False):
+    """Read just a device's VLANs and IP interfaces (the VLAN interfaces among them), and with routes its routing
+    tables (global and each VRF's), not its neighbors or tables of hosts: for a map made before NOMAD read these, or
+    to bring them up to date quickly. Returns (DeviceTables, the community or V3User it answered to), or (None,
+    None) when it answers none."""
+    crawler = Crawler(settings, client_factory=client_factory)
+    client, info, community = crawler.connect(address)
+    if client is None:
+        return None, None
+    tables = collect.DeviceTables(info=info)
+    tables.interfaces = collect.interface_names(
+        crawler.walk(client, collect.IF_NAME, tables, "Interface names", timing="Interfaces"),
+        crawler.walk(client, collect.IF_DESCR, tables, "Interfaces"))
+    tables.addresses = collect.ip_addresses(crawler.walk(client, collect.IP_ADDR_ENTRY, tables, "IP addresses"))
+    tables.lag_parents = collect.lag_parents(
+        crawler.walk(client, collect.IF_STACK_STATUS, tables, "Port-channels", timing="Interfaces"),
+        crawler.walk(client, collect.LAG_ATTACHED, tables, "Port-channels", timing="Interfaces"))
+    crawler.read_vlans(client, tables)
+    if routes:
+        crawler.read_routes(client, tables)
+        tables.routes_read = True
+    return tables, community
+
+
+def apply_vlans(device, tables):
+    """Put what read_vlans_of read on a device of the map (its routes too, when they were read)."""
+    device.vtp_domain, device.vtp_mode = tables.vtp_domain, tables.vtp_mode
+    device.vlans = [[vlan, name] for vlan, name in sorted(tables.vlan_names.items())]
+    device.port_vlans = vlans.device_port_vlans(tables, short_port)
+    if tables.addresses:
+        device.interfaces_l3 = [[ip, prefix_length(mask), tables.interfaces.get(if_index, "")]
+                                for ip, if_index, mask in tables.addresses]
+    if tables.routes_read:
+        routes = [[destination, next_hop, tables.interfaces.get(if_index, ""), protocol]
+                  for destination, next_hop, if_index, protocol in tables.routes]
+        device.routes = routes[:MAX_ROUTES]
+        device.routes_truncated = len(routes) > MAX_ROUTES or tables.routes_truncated
+        apply_vrfs(device, tables)
+
+
+def apply_vrfs(device, tables):
+    """A device's VRFs as read: which of its ports are in which, and each VRF's routes (only the VRFs whose routes
+    could be read are in vrf_routes)."""
+    device.port_vrfs = {short_port(tables.interfaces.get(if_index, str(if_index))): vrf
+                        for if_index, vrf in sorted(tables.interface_vrfs.items())}
+    device.vrf_routes = {vrf: [[destination, next_hop, short_port(tables.interfaces.get(if_index, "")), protocol]
+                               for destination, next_hop, if_index, protocol in routes[:MAX_ROUTES]]
+                         for vrf, routes in sorted(tables.vrf_routes.items())}
+
+
 def identity(tables):
     """What tells a device read over SNMP from another with its name: (its IP addresses, its own MACs)."""
     return {ip for ip, _, _ in tables.addresses}, set(tables.own_macs)
@@ -894,6 +1004,9 @@ def timing_summary(timings):
 def collect_summary(device, tables):
     """What was read from a device, for the crawl log."""
     parts = [KIND_NAMES.get(device.kind, device.kind).lower(), f"{len(tables.neighbors)} neighbors"]
+    if tables.vlan_names:
+        domain = f" (VTP domain {tables.vtp_domain}, {tables.vtp_mode})" if tables.vtp_domain else ""
+        parts.append(f"{len(tables.vlan_names)} VLANs{domain}")
     if tables.fdb:
         parts.append(f"{len(tables.fdb)} MAC table entries")
     if tables.routes:

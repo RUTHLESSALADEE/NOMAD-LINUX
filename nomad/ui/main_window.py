@@ -30,6 +30,7 @@ from .neighbors_tab import NeighborsTab
 from .netmap_tab import NetworkMapTab
 from .netreset_tab import NetworkResetTab
 from .ping_tab import PingTab
+from .placement_tab import PlacementTab
 from .ports_tab import PortsTab
 from .report_dialog import ReportDialog
 from .routing_tab import RoutingTab
@@ -46,6 +47,7 @@ from .tftp_tab import TftpTab
 from .theme import COLORS, DEFAULT_TEXT_SCALE, TEXT_SCALES, set_text_scale
 from .traceroute_tab import TracerouteTab
 from .terminal_tab import TerminalTab
+from .vlan_tab import VlanTab
 from .wake_tab import WakeTab
 from .web_check_tab import WebCheckTab
 
@@ -163,12 +165,15 @@ class MainWindow(QMainWindow):
         self.terminal_tab = TerminalTab(self, self.session_store)
         self.scp_tab = ScpTab(self, self.session_store)
         self.ipam_tab = IpamTab(self)
+        self.vlan_tab = VlanTab(self)  # Uses the IP Addresses page's databases and sync
+        self.placement_tab = PlacementTab(self)  # Those and the Network Map's
         sections = [
             ("This Computer", [(self.adapter_tab, "Interfaces"), (self.routing_tab, "Routing Table"),
                                (self.neighbors_tab, "ARP"), (self.connections_tab, "Connections"),
                                (self.netreset_tab, "Network Reset")]),
             ("Connect", [(self.terminal_tab, "Terminal"), (self.scp_tab, "SCP")]),
-            ("Manage", [(self.ipam_tab, "IP Addresses")]),
+            ("Manage", [(self.ipam_tab, "IP Addresses"), (self.vlan_tab, "VLANs"),
+                        (self.placement_tab, "Subnet Placement")]),
             ("Test", [(self.ping_tab, "Ping"), (self.latency_tab, "Latency"), (self.traceroute_tab, "Traceroute"),
                       (self.mtu_tab, "MTU"), (self.ports_tab, "Ports"), (self.iperf_tab, "iperf")]),
             ("Discover", [(self.sweep_tab, "Sweep"), (self.switch_tab, "Switch Port"),
@@ -540,7 +545,7 @@ class MainWindow(QMainWindow):
         self.ipam_tab.open_store()  # Open both copies, so changes waiting in them are counted and then emptied
         self.netmap_tab.tribe.ensure()
         warning = ""
-        for unsent, what in ((self.ipam_tab.unsent_tribe_changes(), "made offline to tribe networks"),
+        for unsent, what in ((self.ipam_tab.unsent_tribe_changes(), "made offline to tribe networks and VLANs"),
                              (self.netmap_tab.unsent_tribe_changes(), "to tribe maps")):
             if unsent:
                 warning += (f"\n\n{unsent} change{'s' if unsent != 1 else ''} {what} haven't reached the server "

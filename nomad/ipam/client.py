@@ -13,7 +13,8 @@ While the server can't be reached, changes to addresses (not subnets or networks
 the copy at once and queued as pending, several changes to one address becoming one. When the server is back they're
 sent in the order they were made (send_pending on a worker thread, then apply_sent); any the server refuses, because
 someone else changed that address first, are kept as refused for the user to resolve (use the next free address, or
-discard), and the copy goes back to the server's version.
+discard), and the copy goes back to the server's version. VLAN changes made offline wait the same way (see
+vlan_team.py), in a queue of their own.
 """
 import contextlib
 import datetime
@@ -29,7 +30,8 @@ from pathlib import Path
 from ..system import app_data_dir, log_dir
 from .server import ADMIN, KEY_FILE_FORMAT, TEAM, ConflictError, fingerprint, fingerprint_of_file, load_config, \
     server_dir
-from .store import IpamError, IpamStore, current_user, ip_key, parse_address
+from .store import TABLES, IpamError, IpamStore, current_user, ip_key, parse_address
+from .vlans import VLAN_PENDING_SCHEMA, keep_pending_on_top as keep_vlan_pending_on_top
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +56,8 @@ CREATE TABLE IF NOT EXISTS sightings_out (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, network_id TEXT NOT NULL, payload TEXT NOT NULL);
 """
 SET, FREE = "set_address", "free_address"
+VLAN_API = 7  # The server API level that keeps VLANs
+PLACEMENT_API = 8  # And subnet placement
 
 
 class ServerUnreachable(IpamError):
@@ -330,8 +334,15 @@ class TeamStore:
         self.copy.db.executescript(PENDING_SCHEMA)
         self.copy.db.executescript(HISTORY_SCHEMA)
         self.copy.db.executescript(SIGHTINGS_OUT_SCHEMA)
+        self.copy.db.executescript(VLAN_PENDING_SCHEMA)
         if self.copy.get_meta("server_id") not in ("", key.server_id):
             self.reset_copy()
+        if self.copy.get_meta("synced_tables") != ",".join(TABLES):
+            # A copy synced by a NOMAD that kept fewer tables (from before VLANs, say) went past the server's rows
+            # for the others without keeping them: fetch everything once more (rows here already are written again)
+            with self.copy.transaction():
+                self.copy.set_meta("revision", 0)
+                self.copy.set_meta("synced_tables", ",".join(TABLES))
 
     @property
     def admin(self):
@@ -348,7 +359,7 @@ class TeamStore:
         """Empty the copy (for a different server), so the next sync fetches everything."""
         with self.copy.transaction():
             for table in ("networks", "subnets", "addresses", "changes", "pending", "history", "sightings", "sweeps",
-                          "sightings_out"):
+                          "sightings_out", "vlan_domains", "vlans", "vlan_pending", "placements", "subnet_moves"):
                 self.copy.db.execute(f"DELETE FROM {table}")
             self.copy.set_meta("revision", 0)
             self.copy.set_meta("sighting_revision", 0)
@@ -387,13 +398,31 @@ class TeamStore:
         """Apply what fetch_all_changes brought (on the UI thread)."""
         self.copy.apply_rows(items)
         self._keep_pending_on_top(items)
+        keep_vlan_pending_on_top(self.copy, items)
         with self.copy.transaction():
             self.copy.set_meta("revision", revision)
             self.copy.set_meta("server_id", self.key.server_id)
             self.copy.set_meta("last_sync", time.time())
             if status and status.get("name"):
                 self.copy.set_meta("server_name", status["name"])
+            if status and status.get("api"):
+                self.copy.set_meta("server_api", status["api"])
         self.online, self.last_error, self.key_rejected = True, "", False
+
+    @property
+    def server_api(self):
+        """The server's API level, as of the last sync (0 before one)."""
+        return int(self.copy.get_meta("server_api", "0") or 0)
+
+    @property
+    def server_keeps_placement(self):
+        """Whether the server is new enough to keep subnet placement (assumed so before the first sync)."""
+        return self.server_api == 0 or self.server_api >= PLACEMENT_API
+
+    @property
+    def server_keeps_vlans(self):
+        """Whether the server is new enough to keep VLANs (unknown until the first sync: assumed so)."""
+        return self.server_api == 0 or self.server_api >= VLAN_API
 
     @property
     def server_name(self):

@@ -3,11 +3,11 @@ import logging
 
 from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtGui import QColor
-from PyQt5.QtWidgets import QApplication, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QPushButton, \
-    QSpinBox, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QApplication, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSpinBox, \
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
 
 from ..httpcheck import EXPIRY_WARNING_DAYS, check_with_redirects, normalize_url
-from .common import StoppableThread, format_ms, set_hint, set_invalid
+from .common import ColumnFitter, StoppableThread, format_ms, set_hint, set_invalid
 from .theme import COLORS, accent_button
 
 log = logging.getLogger(__name__)
@@ -65,7 +65,7 @@ class WebCheckTab(QWidget):
         self.web_tree = QTreeWidget()
         self.web_tree.setHeaderLabels(["Check", "Result"])
         self.web_tree.setAlternatingRowColors(True)
-        self.web_tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        ColumnFitter(self.web_tree)
         layout.addWidget(self.web_tree, 1)
 
         self.web_button.clicked.connect(self.start_web_check)

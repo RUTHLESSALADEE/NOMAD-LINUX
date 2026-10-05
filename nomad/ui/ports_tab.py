@@ -6,14 +6,13 @@ import webbrowser
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor
-from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QComboBox, QFormLayout, QHBoxLayout, \
-    QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox, QProgressBar, QPushButton, QSpinBox, QTableWidget, \
-    QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QComboBox, QFormLayout, QHBoxLayout, QLabel, \
+    QLineEdit, QMenu, QMessageBox, QProgressBar, QPushButton, QSpinBox, QTableWidget, QVBoxLayout, QWidget
 
 from ..icmp import resolve_host
 from ..ports import CLOSED, FILTERED, OPEN, PORT_PRESETS, SCAN_PASSES, WEB_PORTS, check_port, parse_ports, \
     scan_ports, summarize
-from .common import SortableTableItem, StoppableThread, set_hint, set_invalid
+from .common import ColumnFitter, SortableTableItem, StoppableThread, set_hint, set_invalid
 from .theme import COLORS, accent_button
 
 log = logging.getLogger(__name__)
@@ -146,9 +145,8 @@ class PortsTab(QWidget):
         self.table.setSortingEnabled(True)
         self.table.sortByColumn(COL_PORT, Qt.AscendingOrder)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeToContents)
-        header.setStretchLastSection(True)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        ColumnFitter(self.table)
         layout.addWidget(self.table, 1)
 
         self.gateway_button.clicked.connect(self.use_gateway)

@@ -7,6 +7,7 @@ from PyQt5.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PyQt5.QtWidgets import QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, \
     QPushButton, QToolTip, QVBoxLayout, QWidget, QWidgetAction
 
+from .common import ColumnFitter
 from .theme import COLORS
 
 BUTTON_WIDTH = 22  # The filter button at the left of each column header (the style puts the sort arrow right)
@@ -135,8 +136,8 @@ class TableFilter:
         stretch_last = table.horizontalHeader().stretchLastSection()
         self.header = FilterHeader(table)
         table.setHorizontalHeader(self.header)  # Deletes the old header
-        self.header.setSectionResizeMode(QHeaderView.ResizeToContents)
         self.header.setStretchLastSection(stretch_last)
+        self.columns = ColumnFitter(table)  # Its widest: set by the page, for columns that could be very wide
         self.header.setSortIndicatorShown(True)
         self.header.setSortIndicator(0, Qt.AscendingOrder)  # Qt's default is Z to A
         self.header.filter_requested.connect(self.open)

@@ -74,6 +74,10 @@ QComboBox QAbstractItemView {{ background: {panel_alt}; color: {text}; selection
 QTableWidget, QTableView, QListWidget {{ background: {input}; alternate-background-color: {panel};
     color: {text}; gridline-color: {border}; border: 1px solid {border};
     selection-background-color: {accent_dim}; selection-color: {text}; }}
+QAbstractItemView::indicator {{ width: 12px; height: 12px; background: {input}; border: 1px solid {muted}; }}
+QAbstractItemView::indicator:checked {{ background: {accent}; border: 1px solid {accent}; }}
+QAbstractItemView::indicator:indeterminate {{ background: {accent_dim}; border: 1px solid {accent}; }}
+QAbstractItemView::indicator:disabled {{ background: {panel}; border: 1px solid {border}; }}
 QHeaderView::section {{ background: {panel_alt}; color: {muted}; border: none;
     border-right: 1px solid {border}; border-bottom: 1px solid {border}; padding: 5px; font-weight: bold; }}
 

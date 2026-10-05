@@ -7,12 +7,11 @@ import threading
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, \
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QSpinBox, QTableWidget, \
-    QVBoxLayout, QWidget
+    QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QSpinBox, QTableWidget, QVBoxLayout, QWidget
 
 from ..syslog import SEVERITIES, SYSLOG_PORT, format_line, hub
 from ..system import allow_inbound_port
-from .common import SortableTableItem, set_hint
+from .common import ColumnFitter, SortableTableItem, set_hint
 from .theme import COLORS, accent_button
 
 log = logging.getLogger(__name__)
@@ -115,9 +114,7 @@ class SyslogTab(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.verticalHeader().setVisible(False)
         self.table.setWordWrap(False)
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_MESSAGE, QHeaderView.Stretch)
+        ColumnFitter(self.table, stretch=COL_MESSAGE)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         layout.addWidget(self.table, 1)
         self.count_label = QLabel()

@@ -1,11 +1,11 @@
 """DNS lookup tab: query records for a name (or reverse-lookup an address)."""
 import logging
 
-from PyQt5.QtWidgets import QAbstractItemView, QComboBox, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, \
-    QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QAbstractItemView, QComboBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, \
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
 
 from ..lookup import RECORD_TYPES, resolve, validate_lookup_input
-from .common import run_in_background, set_hint
+from .common import ColumnFitter, run_in_background, set_hint
 from .theme import accent_button
 
 log = logging.getLogger(__name__)
@@ -57,9 +57,8 @@ class LookupTab(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(len(COLUMNS) - 1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        ColumnFitter(self.table)
         layout.addWidget(self.table, 1)
 
         self.lookup_button.clicked.connect(self.start_lookup)

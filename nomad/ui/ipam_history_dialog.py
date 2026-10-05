@@ -8,6 +8,7 @@ from PyQt5.QtWidgets import QAbstractItemView, QComboBox, QDateTimeEdit, QDialog
     QHBoxLayout, QLabel, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout
 
 from ..ipam.history import CREATED, DELETED, address_history, network_history, subnet_history
+from ..ipam.vlans import domain_history, vlan_history
 from .common import set_hint
 from .theme import COLORS
 
@@ -16,7 +17,8 @@ ACTION_COLORS = {CREATED: "success", DELETED: "error"}
 
 
 class HistoryDialog(QDialog):
-    """kind: "address" (subject: the IP), "subnet" (a Subnet) or "network" (a Network)."""
+    """kind: "address" (subject: the IP), "subnet" (a Subnet) or "network" (a Network); or for VLANs, "vlan"
+    (subject: the VLAN number, network_id: its domain's id) or "vlan_domain" (a VlanDomain)."""
 
     def __init__(self, parent, store, network_id, kind, subject, note=""):
         super().__init__(parent)
@@ -24,7 +26,9 @@ class HistoryDialog(QDialog):
         self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint)
         self.resize(1000, 560)
         title = {"address": f"History of {subject}", "subnet": f"History of {getattr(subject, 'cidr', '')}",
-                 "network": f"History of {getattr(subject, 'name', '')}"}[kind]
+                 "network": f"History of {getattr(subject, 'name', '')}", "vlan": f"History of VLAN {subject}",
+                 "vlan_domain": f"History of {getattr(subject, 'name', '')}"}[kind]
+        listing = kind in ("network", "vlan_domain")  # Changes to several things: say which each was
         self.setWindowTitle(title)
         layout = QVBoxLayout(self)
         heading = QLabel(f"<b>{title}</b>, newest first. Times are this computer's local time.")
@@ -39,13 +43,12 @@ class HistoryDialog(QDialog):
         self.period_combo = QComboBox()
         for label, days in PERIODS:
             self.period_combo.addItem(label, days)
-        self.period_combo.setCurrentIndex(1 if kind == "network" else len(PERIODS) - 1)
+        self.period_combo.setCurrentIndex(1 if listing else len(PERIODS) - 1)
         top.addWidget(QLabel("Show:"))
         top.addWidget(self.period_combo)
         top.addStretch()
         layout.addLayout(top)
-        columns = ["When", "Who", "What", "Change", "Details"] if kind == "network" else \
-            ["When", "Who", "Change", "Details"]
+        columns = ["When", "Who", "What", "Change", "Details"] if listing else ["When", "Who", "Change", "Details"]
         self.table = QTableWidget(0, len(columns))
         self.table.setHorizontalHeaderLabels(columns)
         self.table.verticalHeader().setVisible(False)
@@ -70,6 +73,10 @@ class HistoryDialog(QDialog):
             events = address_history(self.store, self.network_id, self.subject)
         elif self.kind == "subnet":
             events = subnet_history(self.store, self.subject.id)
+        elif self.kind == "vlan":
+            events = vlan_history(self.store, self.network_id, self.subject)
+        elif self.kind == "vlan_domain":
+            events = domain_history(self.store, self.subject.id)
         else:
             return network_history(self.store, self.network_id, since)
         return [event for event in events if not since or event.when >= since]
@@ -79,7 +86,7 @@ class HistoryDialog(QDialog):
         self.table.setRowCount(len(events))
         for row, event in enumerate(events):
             values = [event.local_time, event.who]
-            if self.kind == "network":
+            if self.kind in ("network", "vlan_domain"):
                 values.append(event.subject)
             values += [event.action, event.details]
             for column, value in enumerate(values):

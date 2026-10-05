@@ -3,9 +3,10 @@ import logging
 import threading
 
 from PyQt5 import sip
-from PyQt5.QtCore import QObject, QRunnable, Qt, QThread, QThreadPool, pyqtSignal
+from PyQt5.QtCore import QEvent, QObject, QRunnable, Qt, QThread, QThreadPool, QTimer, pyqtSignal
 from PyQt5.QtGui import QPainter
-from PyQt5.QtWidgets import QAbstractItemView, QHeaderView, QLabel, QSizePolicy, QTableWidget, QTableWidgetItem
+from PyQt5.QtWidgets import QAbstractItemView, QApplication, QHeaderView, QLabel, QSizePolicy, QTableView, \
+    QTableWidget, QTableWidgetItem
 
 from .theme import COLORS
 
@@ -62,9 +63,119 @@ def read_only_table(columns):
     table.setSelectionBehavior(QAbstractItemView.SelectRows)
     table.setSelectionMode(QAbstractItemView.SingleSelection)
     table.verticalHeader().setVisible(False)
-    table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
     table.horizontalHeader().setStretchLastSection(True)
+    ColumnFitter(table)
     return table
+
+
+class ColumnFitter(QObject):
+    """Columns the user can drag wider or narrower that otherwise fit their contents, as ResizeToContents does (up
+    to widest, {column: pixels}): a column keeps the width the user dragged it to, until its edge is double-clicked.
+    stretch: a column that also takes up the room the others leave (as Stretch does, but draggable); or the header's
+    last section, if it stretches. only: the columns to fit (the others keep the widths they're given). Works for a
+    table or a tree; parented to its header, so it goes when that does."""
+
+    def __init__(self, view, widest=None, stretch=None, only=None):
+        header = view.horizontalHeader() if isinstance(view, QTableView) else view.header()
+        super().__init__(header)
+        # Kept by the view: Qt owning it doesn't keep its Python side (and slots) alive. It reaches the view and
+        # header through its parent, not attributes, so the two don't hold each other
+        view.column_fitter = self
+        self.widest = dict(widest or {})
+        self.stretch, self.only = stretch, only
+        self.dragged = set()  # Columns the user sized: left as they are
+        self.fitted = {}  # Column -> the width fitting its contents, which the stretch column doesn't go under
+        self.fitting = False
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(0)
+        self.timer.timeout.connect(self.fit)
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        if stretch is not None:
+            header.setStretchLastSection(False)
+            view.viewport().installEventFilter(self)  # Its resizes: the stretch column fills the room again
+        header.sectionResized.connect(self.on_resized)
+        header.sectionHandleDoubleClicked.connect(self.on_double_clicked)
+        model = view.model()
+        for signal in (model.rowsInserted, model.rowsRemoved, model.dataChanged, model.modelReset,
+                       model.layoutChanged, model.columnsInserted, model.headerDataChanged):
+            signal.connect(self.schedule)
+        self.schedule()
+
+    @property
+    def header(self):
+        return self.parent()
+
+    @property
+    def view(self):
+        return self.parent().parentWidget()
+
+    def schedule(self, *_):
+        """Fit once the current changes are made (many rows added at once fit once)."""
+        self.timer.start()
+
+    def header_stretches(self, column):
+        """Whether the header sizes the column itself: its last section, which it stretches."""
+        return self.stretch is None and self.header.stretchLastSection() and column == self.header.count() - 1
+
+    def replaced(self):
+        """Whether the view has another header now (and this one is going, with this)."""
+        view = self.view
+        if view is None:
+            return True
+        return (view.horizontalHeader() if isinstance(view, QTableView) else view.header()) is not self.header
+
+    def fit(self):
+        if self.replaced():
+            return
+        header, view = self.header, self.view
+        self.fitting = True
+        try:
+            for column in range(header.count()):
+                if column in self.dragged or header.isSectionHidden(column) or self.header_stretches(column) \
+                        or (self.only is not None and column not in self.only):
+                    continue
+                view.resizeColumnToContents(column)
+                width = min(header.sectionSize(column), self.widest.get(column, 1 << 20))
+                self.fitted[column] = width
+                header.resizeSection(column, width)
+        finally:
+            self.fitting = False
+        self.fill()
+
+    def fill(self):
+        """Widen the stretch column into the room the others leave (back to its fitted width when there's none)."""
+        column = self.stretch
+        if column is None or column in self.dragged or self.replaced():
+            return
+        header = self.header
+        if column >= header.count():
+            return
+        others = sum(header.sectionSize(other) for other in range(header.count())
+                     if other != column and not header.isSectionHidden(other))
+        width = max(self.fitted.get(column, 0), self.view.viewport().width() - others)
+        if width != header.sectionSize(column):
+            self.fitting = True
+            try:
+                header.resizeSection(column, width)
+            finally:
+                self.fitting = False
+
+    def on_resized(self, column, old, new):
+        if self.fitting or not QApplication.mouseButtons() & Qt.LeftButton or self.header_stretches(column):
+            return
+        self.dragged.add(column)  # Being dragged by the user
+        self.fill()
+
+    def on_double_clicked(self, column):
+        """Double-clicking a column's edge: it fits its contents again (and keeps fitting them)."""
+        self.dragged.discard(column)
+        self.schedule()
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Resize:
+            self.fill()
+        return False
 
 
 class _TaskSignals(QObject):

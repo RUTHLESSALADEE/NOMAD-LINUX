@@ -6,12 +6,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtGui import QColor, QIntValidator
-from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QFormLayout, QHBoxLayout, QHeaderView, \
-    QLabel, QLineEdit, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, \
+    QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
 
 from ..icmp import IcmpClient, resolve_host
 from ..mtr import MtrTrace, format_ms, report_text
-from .common import StoppableThread, set_hint
+from .common import ColumnFitter, StoppableThread, set_hint
 from .theme import COLORS, accent_button
 
 log = logging.getLogger(__name__)
@@ -165,9 +165,7 @@ class TracerouteTab(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_NAME, QHeaderView.Stretch)
+        ColumnFitter(self.table, stretch=COL_NAME)
         layout.addWidget(self.table, 1)
 
         self.start_button.clicked.connect(self.start_trace)

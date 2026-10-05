@@ -102,8 +102,62 @@ class Device:
         numbers = tuple(int(part) for part in ip.split("."))
         self.set(collect.ARP_PHYS_ADDRESS, if_index, numbers, string(mac_bytes(mac)))
 
-    def vlan(self, vlan):
+    def vlan(self, vlan, name=None):
         self.set(collect.VTP_VLAN_STATE, 1, vlan, number(1))
+        if name is not None:
+            self.set(collect.VTP_VLAN_NAME, 1, vlan, string(name))
+
+    def vtp(self, domain, mode=2):
+        self.set(collect.VTP_DOMAIN_ENTRY, 2, 1, string(domain))
+        self.set(collect.VTP_DOMAIN_ENTRY, 3, 1, number(mode))
+
+    def trunk(self, if_index, allowed, native=1, trunking=True):
+        """A vlanTrunkPortTable row: allowed is the VLAN numbers (set in the four bitmaps)."""
+        for column, first in collect.TRUNK_ALLOWED_COLUMNS.items():
+            bitmap = bytearray(128)
+            for vlan in allowed:
+                if first <= vlan < first + 1024:
+                    bitmap[(vlan - first) // 8] |= 0x80 >> ((vlan - first) % 8)
+            self.set(collect.TRUNK_PORT_ENTRY, column, if_index, string(bytes(bitmap)))
+        self.set(collect.TRUNK_PORT_ENTRY, collect.TRUNK_NATIVE, if_index, number(native))
+        self.set(collect.TRUNK_PORT_ENTRY, collect.TRUNK_STATUS, if_index, number(1 if trunking else 2))
+
+    def access(self, if_index, vlan, voice=None):
+        self.set(collect.VM_VLAN, if_index, number(vlan))
+        if voice is not None:
+            self.set(collect.VM_VOICE_VLAN, if_index, number(voice))
+
+    def q_vlan(self, vlan, name, ports=(), untagged=()):
+        """A Q-BRIDGE VLAN: its name, and the bridge ports it goes out of (untagged ones too)."""
+        def bitmap(members):
+            raw = bytearray(8)
+            for port in members:
+                raw[(port - 1) // 8] |= 0x80 >> ((port - 1) % 8)
+            return string(bytes(raw))
+        self.set(collect.Q_VLAN_STATIC_NAME, vlan, string(name))
+        self.set(collect.Q_VLAN_EGRESS, 0, vlan, bitmap(ports))
+        self.set(collect.Q_VLAN_UNTAGGED, 0, vlan, bitmap(untagged))
+
+    def cisco_vrf(self, vrf_index, name, if_indexes):
+        """A VRF in CISCO-VRF-MIB, with its interfaces."""
+        self.set(collect.CV_VRF_NAME, vrf_index, string(name))
+        for if_index in if_indexes:
+            self.set(collect.CV_VRF_INTERFACE_ENTRY, 2, vrf_index, if_index, number(1))
+
+    def vrf_route(self, vrf, destination, prefix, next_hop, if_index, kind=4, protocol=13):
+        """An MPLS-L3VPN-STD-MIB mplsL3VpnVrfRteTable row: kind 3 is connected, 4 remote; protocol 2 connected,
+        3 static, 13 OSPF."""
+        name = tuple(vrf.encode())
+        index = (len(name),) + name + (1, 4) + tuple(int(part) for part in destination.split(".")) + (prefix,)
+        index += (2, 0, 0)  # Policy: the OID 0.0
+        index += (1, 4) + tuple(int(part) for part in next_hop.split("."))
+        self.set(collect.L3VPN_ROUTE_ENTRY, 7, index, number(if_index))
+        self.set(collect.L3VPN_ROUTE_ENTRY, 8, index, number(kind))
+        self.set(collect.L3VPN_ROUTE_ENTRY, 9, index, number(protocol))
+
+    def pvid(self, bridge_port, if_index, vlan):
+        self.set(collect.Q_PVID, bridge_port, number(vlan))
+        self.set(collect.BASE_PORT_IFINDEX, bridge_port, number(if_index))
 
     def learned(self, mac, bridge_port, if_index, vlan=None, status=3):
         mib = self.mib if vlan is None else self.contexts.setdefault(vlan, {})

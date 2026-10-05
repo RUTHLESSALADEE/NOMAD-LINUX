@@ -5,14 +5,13 @@ import logging
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QFont, QKeySequence
 from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QComboBox, QFormLayout, QGroupBox, \
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QShortcut, QTableWidget, \
-    QVBoxLayout, QWidget
+    QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QShortcut, QTableWidget, QVBoxLayout, QWidget
 
 from ..routes import add_route, build_route_copy_command, delete_route, matching_routes, parse_route_lookup, \
     validate_route_input
 from ..snapshot import Route
 from ..system import CommandError
-from .common import SortableTableItem, set_hint, set_invalid
+from .common import ColumnFitter, SortableTableItem, set_hint, set_invalid
 from .theme import COLORS
 
 log = logging.getLogger(__name__)
@@ -76,9 +75,7 @@ class RoutingTab(QWidget):
         self.routing_table_widget.setSortingEnabled(True)
         self.routing_table_widget.sortByColumn(0, Qt.AscendingOrder)
         self.routing_table_widget.setContextMenuPolicy(Qt.CustomContextMenu)
-        header = self.routing_table_widget.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_INTERFACE, QHeaderView.Stretch)
+        ColumnFitter(self.routing_table_widget, stretch=COL_INTERFACE)
         routing_layout.addWidget(self.routing_table_widget, 1)
 
         # Row count and color legend

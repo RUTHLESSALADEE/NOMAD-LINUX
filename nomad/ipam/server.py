@@ -19,6 +19,10 @@ API (JSON; "Authorization: Bearer <secret>"):
     POST /api/edit {"action": ...}    one change, checked against the version the client last saw
     POST /api/import {"plans": [...]} import prepared networks (admin only)
 
+VLANs (API 7; see vlans.py) are rows like the rest, so they come with /api/changes and /api/log. Their edits are
+add_vlan_domain, update_vlan_domain, delete_vlan_domain, set_vlan, delete_vlan and set_vlans (several at once).
+Subnet placement (API 8; see placement.py): set_placement, plan_move, update_move and complete_move.
+
 Tribe maps (network maps shared by everyone; see nomad/netmap/shared.py), kept in maps.db:
     GET  /api/maps/changes?since=N    maps and map items changed after map revision N
     POST /api/maps/create             {"name", "changes": [...], "secrets": {...}}: a new shared map
@@ -53,6 +57,8 @@ from urllib.parse import parse_qs, urlparse
 from .. import __version__
 from ..netmap.shared import MapError, MapStore
 from .store import IpamError, IpamStore
+from .placement import PlacementStore
+from .vlans import VlanStore, check_number
 
 log = logging.getLogger(__name__)
 
@@ -66,8 +72,8 @@ TEAM, ADMIN = "team", "admin"
 ADMIN_ONLY_ACTIONS = {"add_network", "delete_network"}
 CERTIFICATE_YEARS = 20
 MAX_WAIT_SECONDS = 55
-API_LEVEL = 6  # 2 added /api/wait (instant sync), 3 /api/log (history), 4 loopback subnets, 5 sightings (last seen),
-# 6 tribe maps.
+API_LEVEL = 8  # 2 added /api/wait (instant sync), 3 /api/log (history), 4 loopback subnets, 5 sightings (last seen),
+# 6 tribe maps, 7 VLANs, 8 subnet placement.
 # Clients cope with servers below this
 
 
@@ -474,6 +480,94 @@ class IpamServer:
     def _edit_delete_network(self, request):
         self._check_version("networks", request["network_id"], request.get("expected_version"), "network")
         self.store.delete_network(request["network_id"])
+
+    # ----------------------------------------------------------------- VLANs
+
+    def _vlan_row(self, domain_id, number):
+        """The VLAN's current row, or its latest deleted one (to say who deleted it), or None."""
+        from .store import vlan_key
+        return self.store.db.execute("SELECT * FROM vlans WHERE domain_id = ? AND sort_key = ? "
+                                     "ORDER BY deleted, version DESC LIMIT 1",
+                                     (domain_id, vlan_key(check_number(number)))).fetchone()
+
+    def _check_vlan(self, request):
+        """Like _check_address: a VLAN recorded since the client last synced, or changed or deleted, is a
+        conflict."""
+        number = check_number(request["vlan"])
+        row = self._vlan_row(request["domain_id"], number)
+        expected = request.get("expected_version")
+        live = row is not None and not row["deleted"]
+        if expected is None and live:
+            named = f" ({row['name']})" if row["name"] else ""
+            raise ConflictError(f"VLAN {number}{named} was just recorded by {row['modified_by']} ({self._when(row)}). "
+                                "Pick another number.")
+        if expected is not None and not live:
+            who = f" by {row['modified_by']} ({self._when(row)})" if row is not None else ""
+            raise ConflictError(f"VLAN {number} was deleted{who} since you last synced.")
+        if expected is not None and row["version"] != expected:
+            raise ConflictError(f"VLAN {number} was changed by {row['modified_by']} ({self._when(row)}) since you "
+                                "last synced. Check it again, then make your change.")
+
+    @staticmethod
+    def _vlan_values(request):
+        return dict(name=request.get("name", ""), status=request.get("status", "active"),
+                    subnets=request.get("subnets") or [], description=request.get("description", ""),
+                    fields=request.get("fields"))
+
+    def _edit_add_vlan_domain(self, request):
+        VlanStore(self.store).add_domain(request["name"], request.get("network_id", ""),
+                                         request.get("vtp_domain", ""), request.get("description", ""),
+                                         request.get("ranges"), request.get("fields"))
+
+    def _edit_update_vlan_domain(self, request):
+        self._check_version("vlan_domains", request["domain_id"], request.get("expected_version"), "VLAN domain")
+        VlanStore(self.store).update_domain(request["domain_id"], **request["changes"])
+
+    def _edit_delete_vlan_domain(self, request):
+        self._check_version("vlan_domains", request["domain_id"], request.get("expected_version"), "VLAN domain")
+        VlanStore(self.store).delete_domain(request["domain_id"])
+
+    def _edit_set_vlan(self, request):
+        self._check_vlan(request)
+        VlanStore(self.store).set_vlan(request["domain_id"], request["vlan"], **self._vlan_values(request))
+
+    def _edit_delete_vlan(self, request):
+        self._check_vlan(dict(request, expected_version=request.get("expected_version", -1)))
+        VlanStore(self.store).delete_vlan(request["domain_id"], request["vlan"])
+
+    def _edit_set_vlans(self, request):
+        """Several VLANs in one domain at once (bringing in a network map's): all, or none if any conflicts."""
+        vlans = VlanStore(self.store)
+        for item in request["vlans"]:
+            self._check_vlan(dict(item, domain_id=request["domain_id"]))
+            vlans.set_vlan(request["domain_id"], item["vlan"], **self._vlan_values(item))
+
+    # ----------------------------------------------------------------- Subnet placement
+
+    def _edit_set_placement(self, request):
+        current = PlacementStore(self.store).placement(request["network_id"], request["cidr"])
+        expected = request.get("expected_version")
+        if current is not None and expected is not None and current.version != expected or \
+                current is not None and expected is None:
+            raise ConflictError(f"How {request['cidr']} is treated was changed by {current.modified_by} since you last "
+                                "synced. Check it again, then make your change.")
+        PlacementStore(self.store).set_placement(request["network_id"], request["cidr"], request.get("scope", "auto"),
+                                                 bool(request.get("one_segment")), request.get("note", ""))
+
+    def _edit_plan_move(self, request):
+        PlacementStore(self.store).plan_move(request["network_id"], request["cidr"],
+                                             **{name: request.get(name, default) for name, default in
+                                                (("from_domain_id", ""), ("from_vlan", 0), ("from_device", ""),
+                                                 ("to_domain_id", ""), ("to_vlan", 0), ("to_device", ""),
+                                                 ("planned_for", ""), ("note", ""))})
+
+    def _edit_update_move(self, request):
+        self._check_version("subnet_moves", request["move_id"], request.get("expected_version"), "move")
+        PlacementStore(self.store).update_move(request["move_id"], **request["changes"])
+
+    def _edit_complete_move(self, request):
+        self._check_version("subnet_moves", request["move_id"], request.get("expected_version"), "move")
+        PlacementStore(self.store).complete_move(request["move_id"])
 
     # ----------------------------------------------------------------- Backups
 

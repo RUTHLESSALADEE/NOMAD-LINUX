@@ -5,14 +5,13 @@ import time
 
 from PyQt5.QtCore import QObject, Qt, pyqtSignal
 from PyQt5.QtGui import QColor
-from PyQt5.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox, \
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QSpinBox, QSplitter, \
-    QTableWidget, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, \
+    QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QSpinBox, QSplitter, QTableWidget, QVBoxLayout, QWidget
 
 from ..system import allow_inbound_port
 from ..tftp import CLIENT_BLOCK_SIZE, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE, TFTP_PORT, TftpError, TftpServer, download, \
     upload
-from .common import SortableTableItem, StoppableThread, format_size, set_hint, set_invalid
+from .common import ColumnFitter, SortableTableItem, StoppableThread, format_size, set_hint, set_invalid
 from .theme import COLORS, accent_button
 
 log = logging.getLogger(__name__)
@@ -144,8 +143,8 @@ class TftpTab(QWidget):
         self.transfers.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.transfers.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.transfers.verticalHeader().setVisible(False)
-        self.transfers.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.transfers.horizontalHeader().setStretchLastSection(True)
+        ColumnFitter(self.transfers)
         layout.addWidget(self.transfers, 1)
 
         self.folder_browse.clicked.connect(self.browse_folder)
