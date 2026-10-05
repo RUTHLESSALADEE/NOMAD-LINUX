@@ -31,6 +31,8 @@ def test_vlan_text_and_parse_round_trip():
 def test_svi_and_subinterface_names():
     assert vlans.svi_vlan("Vlan10") == 10 and vlans.svi_vlan("Vl200") == 200 and vlans.svi_vlan("vlan.30") == 30
     assert vlans.svi_vlan("Gi1/0/1") == 0
+    assert vlans.bdi_vlan("BDI10") == 10 and vlans.bdi_vlan("BD2") == 2 and vlans.bdi_vlan("Vlan10") == 0
+    assert vlans.bdi_vlan("BDX1") == 0
     assert vlans.subinterface_vlan("ethernet1/3.20") == 20
     assert vlans.subinterface_vlan("GigabitEthernet0/0/1.100") == 100
     assert vlans.subinterface_vlan("ae1.5") == 5

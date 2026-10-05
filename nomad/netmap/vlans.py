@@ -18,6 +18,7 @@ ERROR, WARNING, INFO = "error", "warning", "info"
 SEVERITY_LABELS = {ERROR: "Problem", WARNING: "Warning", INFO: "Note"}
 MAX_VLAN = 4094
 SVI_PATTERN = re.compile(r"^(?:vlan|vl)[\s.]*(\d+)$", re.IGNORECASE)  # Vlan10, Vl10, and PAN-OS vlan.10
+BDI_PATTERN = re.compile(r"^(?:bdi|bd)(\d+)$", re.IGNORECASE)  # IOS XE bridge-domain interfaces: BDI10, BD10
 SUBINTERFACE_PATTERN = re.compile(r"^(?!tunnel|loopback|lo\d|tu\d)[a-z][\w\-/]*\d\.(\d+)$", re.IGNORECASE)
 
 
@@ -119,6 +120,14 @@ def svi_vlan(port):
     return number if 1 <= number <= MAX_VLAN else 0
 
 
+def bdi_vlan(port):
+    """The VLAN a bridge-domain interface (an IOS XE router's SVI: BDI10, or BD10 as its ifName gives it) is probably
+    in: its bridge-domain number, which is usually the VLAN's (but needn't be), or 0."""
+    match = BDI_PATTERN.match((port or "").strip())
+    number = int(match.group(1)) if match else 0
+    return number if 1 <= number <= MAX_VLAN else 0
+
+
 def subinterface_vlan(port):
     """The VLAN a subinterface is probably tagged with (ethernet1/3.20, Gi0/0/1.100: the number after the dot, which
     is the usual way to name them but not a rule), or 0."""
@@ -134,7 +143,7 @@ class Gateway:
     address: str
     prefix: int
     port: str
-    guessed: bool = False  # A subinterface: its VLAN is guessed from its name
+    guessed: bool = False  # A subinterface or bridge-domain interface: its VLAN is guessed from its name
 
     @property
     def subnet(self):
@@ -151,7 +160,7 @@ def gateways(device):
         vlan = svi_vlan(port)
         guessed = False
         if not vlan:
-            vlan, guessed = subinterface_vlan(port), True
+            vlan, guessed = bdi_vlan(port) or subinterface_vlan(port), True
         if vlan:
             found.append((vlan, Gateway(device.key, address, int(prefix), port, guessed)))
     return found

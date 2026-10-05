@@ -19,7 +19,7 @@ import ipaddress
 from dataclasses import dataclass, field
 
 from .model import port_key
-from .vlans import ACCESS, ONE_END, carries, focus, port_info, subinterface_vlan, svi_vlan
+from .vlans import ACCESS, ONE_END, bdi_vlan, carries, focus, port_info, subinterface_vlan, svi_vlan
 
 GLOBAL = ""  # The global routing table, as a VRF name
 MAX_HOPS = 16
@@ -38,7 +38,8 @@ class Place:
     address: str
     prefix: int
     vrf: str = GLOBAL
-    vlan: int = 0  # The VLAN of an SVI or subinterface (a subinterface's guessed from its name), else 0
+    vlan: int = 0  # The VLAN of an SVI, bridge-domain interface or subinterface (guessed from the latter two's
+    # names), else 0
 
 
 @dataclass
@@ -123,7 +124,7 @@ def places(network_map):
             except ValueError:
                 continue
             vrf = port_vrf(device, port)
-            vlan = svi_vlan(port) or subinterface_vlan(port)
+            vlan = svi_vlan(port) or bdi_vlan(port) or subinterface_vlan(port)
             found.setdefault((vrf, str(network)), []).append(Place(key, port, address, int(prefix), vrf, vlan))
     return found
 

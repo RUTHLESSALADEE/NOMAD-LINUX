@@ -4,10 +4,11 @@ from dataclasses import dataclass, replace
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
-from PyQt5.QtWidgets import QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QLabel, \
-    QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton, QSpinBox, QTableWidget, \
+from PyQt5.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, \
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton, QSpinBox, QTableWidget, \
     QTableWidgetItem, QVBoxLayout
 
+from ..ipam.roles import NOT_IN_VLANS
 from ..ipam.store import IpamError, VlanDomain
 from ..ipam.vlan_compare import ACTION_LABELS, ADD, LINK, MISSING, RENAME, apply_vlan_changes, compare_with_map
 from ..ipam.vlans import ACTIVE, MAX_VLAN, STATUSES, check_number, holding_subnet, name_problem, \
@@ -161,12 +162,14 @@ class SubnetChecklist(QListWidget):
 
 class VlanDialog(_EditDialog):
     """interfaces_of(number): the open network map's VLAN interfaces for a VLAN number, as [(address, prefix, port,
-    device name)], to point out the subnets they're in."""
+    device name)], to point out the subnets they're in. roles_of(network id): {CIDR: roles.RoleInfo} for its subnets,
+    so the ones that aren't in VLANs (point-to-point links, loopbacks, tunnels...) are left out of the list at first."""
 
-    def __init__(self, parent, source, domain, vlan=None, number=None, interfaces_of=None):
+    def __init__(self, parent, source, domain, vlan=None, number=None, interfaces_of=None, roles_of=None):
         super().__init__(parent, f"Edit VLAN {vlan.vlan}" if vlan else "New VLAN")
         self.source, self.domain, self.vlan = source, domain, vlan
         self.interfaces_of = interfaces_of or (lambda number: [])
+        self.roles_of = roles_of or (lambda network_id: {})
         self.number_input = QSpinBox()
         self.number_input.setRange(1, MAX_VLAN)
         self.number_input.setValue(vlan.vlan if vlan else number or source.vlans.next_free(domain.id) or 1)
@@ -194,6 +197,10 @@ class VlanDialog(_EditDialog):
         self.subnet_hint.setWordWrap(True)
         self.subnet_list = SubnetChecklist()
         self.subnet_list.setMinimumHeight(160)
+        self.others_check = QCheckBox()
+        self.others_check.setToolTip("Point-to-point links, loopbacks, tunnels, routed ports' subnets and containers "
+                                     "aren't usually in a VLAN (Subnet Placement's How to Treat It says what each "
+                                     "is for).")
         self.carried = set(vlan.subnets) if vlan else set()
         self.fill_subnets()
         self.description_input = QLineEdit(vlan.description if vlan else "")
@@ -206,6 +213,7 @@ class VlanDialog(_EditDialog):
             self.form.addRow("IPAM network:", self.network_combo)
         self.form.addRow("Subnets:", self.subnet_hint)
         self.form.addRow("", self.subnet_list)
+        self.form.addRow("", self.others_check)
         self.form.addRow("Description:", self.description_input)
         self.form.addRow("Details:", self.fields_editor)
         self.finish_layout()
@@ -213,6 +221,7 @@ class VlanDialog(_EditDialog):
         self.name_input.textChanged.connect(self.show_name_problem)
         self.network_combo.currentIndexChanged.connect(self.refill_subnets)
         self.subnet_list.itemChanged.connect(self.show_ticked)
+        self.others_check.toggled.connect(self.refill_subnets)
         self.show_range()
         self.show_name_problem()
 
@@ -244,6 +253,14 @@ class VlanDialog(_EditDialog):
             subnet = holding_subnet(subnets, address)
             if subnet is not None:
                 interfaces.setdefault(subnet.cidr, []).append(f"{address}/{prefix} on {device} {port}")
+        roles = self.roles_of(self.network_id()) if subnets else {}
+        not_vlans = [subnet for subnet in subnets if subnet.cidr in roles and roles[subnet.cidr].role in NOT_IN_VLANS
+                     and subnet.cidr not in self.carried and subnet.cidr not in interfaces]
+        self.others_check.setText(f"Also list the {len(not_vlans)} subnet{'s' if len(not_vlans) != 1 else ''} that "
+                                  "aren't VLANs' (point-to-point links, loopbacks, tunnels...)")
+        self.others_check.setVisible(bool(not_vlans))
+        if not self.others_check.isChecked():
+            subnets = [subnet for subnet in subnets if subnet not in not_vlans]
         if not subnets:
             item = QListWidgetItem("Choose the domain's IPAM network above to tick its subnets."
                                    if not self.network_id() else "The domain's network has no subnets.")
@@ -254,6 +271,9 @@ class VlanDialog(_EditDialog):
             text = f"{subnet.cidr}  {subnet.name}".strip()
             if other is not None:
                 text += f"  (VLAN {other.vlan}'s)"
+            role = roles.get(subnet.cidr)
+            if role is not None and role.role in NOT_IN_VLANS:
+                text += f"  [{role.name}]"
             if subnet.cidr in interfaces:
                 text += f"  ← VLAN interface on the map: {', '.join(interfaces[subnet.cidr][:2])}"
             item = QListWidgetItem(text)
@@ -577,10 +597,11 @@ class LinkSuggestionsDialog(QDialog):
     """Subnets of the domain's network whose names (or details) say which VLAN they're in: tick the ones to link.
     The subnets themselves are left exactly as they are."""
 
-    def __init__(self, parent, source, domain):
+    def __init__(self, parent, source, domain, roles=None):
         super().__init__(parent)
         self.source, self.domain = source, domain
         self.made = 0
+        roles = roles or {}  # {CIDR: roles.RoleInfo}: subnets that aren't VLANs' aren't suggested
         self.setWindowTitle(f"Link Subnets to {domain.name}'s VLANs")
         self.resize(900, 480)
         layout = QVBoxLayout(self)
@@ -589,7 +610,8 @@ class LinkSuggestionsDialog(QDialog):
                        "subnets keep their names, and export to the workbook as before.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
-        self.suggestions = suggested_links(source.ipam, source.vlans, domain)
+        self.suggestions = suggested_links(source.ipam, source.vlans, domain,
+                                           skip={cidr for cidr, role in roles.items() if role.role in NOT_IN_VLANS})
         self.table = _table(["", "VLAN", "Subnet", "Why"])
         self.table.setRowCount(len(self.suggestions))
         names = {subnet.cidr: subnet.name for subnet in source.ipam.subnets(domain.network_id)} \

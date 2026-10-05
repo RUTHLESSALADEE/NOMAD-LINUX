@@ -6,6 +6,19 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+### Added
+
+- **Subnet roles** (Subnet Placement): what each subnet is for: VLAN, point-to-point, loopbacks, tunnel, routed port, container (a block holding other subnets) or other (not known yet, so nothing is expected of it). Worked out from the network map (tunnel and loopback interfaces, including Palo Alto's tunnel.N and loopback.N; SVIs and subinterfaces; a router's or firewall's port plugged into a switch's access VLAN; the two ends of a link), then IPAM (a loopback subnet, a /32, a /30 or /31, subnets inside it, a name such as Vlan 6) and the VLANs page. Shown in a new **Role** column with a **Role** filter, and in each subnet's details. **How to Treat It** can set it (Other included); it's shared with the tribe and kept beside the placements, never on the IPAM subnet.
+- Subnet Placement checks by role: one loopback address on two devices (a problem), a point-to-point subnet with more than two devices in it, a role set that doesn't fit the map (a tunnel set as point-to-point, say), a tunnel or loopback linked to a VLAN, and a VLAN's subnet (by its name, say) not linked to a VLAN when the network has VLAN domains.
+
+### Changed
+
+- Subnet Placement: a tunnel's ends (a DMVPN hub and its spokes) and a point-to-point link's two ends (a circuit the map has no link for) count as one place, so advertising them isn't "in several places". Router loopbacks (/32s on the map) inside IPAM's loopback subnet belong to it rather than being "not a subnet in this IPAM network". Only VLAN subnets are noted as not linked to a VLAN.
+- Network Map: an IOS XE router's bridge-domain interfaces (BDI10, or BD10 as its ifName gives them) are treated like SVIs: in the VLAN of their bridge-domain number (which is usually the VLAN's, so it's marked guessed, like a subinterface's), on the VLANs tab, the VLANs page and Subnet Placement.
+- VLANs page: a VLAN's subnet list, and Link Subnets Named for VLANs, leave out subnets that aren't VLANs' (point-to-point links, loopbacks, tunnels, routed ports' subnets, containers); a tick box in the VLAN's window lists them too.
+- The IP Addresses page's Export to Workbook and Export to CSV are checked against saved copies by the tests, so neither changes by accident.
+- Roles need the IPAM server updated to this version (Tools > Tribe Management > Update Service; API level 9) before tribe roles can be set; until then the role choice is turned off. Laptops sync everything once after updating, to fetch roles. Laptops still on 1.16 keep working with the updated server (they don't see roles).
+
 ## [1.16.0] - 2026-10-04
 
 ### Added

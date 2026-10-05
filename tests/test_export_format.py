@@ -156,6 +156,9 @@ def test_vlans_and_placement_leave_ipam_and_its_exports_alone(local, tmp_path):
     placements.set_placement(sipr.id, "10.1.0.0/16", ADVERTISED, note="one place only")
     placements.set_placement(sipr.id, "10.0.0.16/30", LOCAL, one_segment=True)
     placements.set_placement(sipr.id, "10.0.0.16/30")  # Back to automatic
+    placements.set_role(sipr.id, "172.16.5.0/24", "tunnel")
+    placements.set_role(sipr.id, "10.0.0.20/31", "other")
+    placements.set_role(sipr.id, "10.0.0.20/31")  # Back to automatic
     move = placements.plan_move(sipr.id, "10.2.1.0/24", site.id, 101, "sw1", other.id, 31, "sw2",
                                 planned_for="Saturday")
     placements.update_move(move.id, status=IN_PROGRESS)
@@ -178,7 +181,8 @@ def test_tribe_vlans_and_placement_leave_ipam_and_its_exports_alone(server, tmp_
     domain = vlans.add_domain("SIPR", network.id, "CORP")
     vlans.set_vlan(domain.id, 10, "USERS", subnets=["10.0.0.0/24"])
     placements.set_placement(network.id, "10.0.0.0/24", LOCAL, note="reused at every site")
-    move = placements.plan_move(network.id, "10.0.0.0/24", from_domain_id=domain.id, from_vlan=10,
+    placements.set_role(network.id, "10.0.0.0/24", "routed")
+    move =placements.plan_move(network.id, "10.0.0.0/24", from_domain_id=domain.id, from_vlan=10,
                                 to_domain_id=domain.id, to_vlan=20)
     placements.complete_move(move.id)
     alice.close()

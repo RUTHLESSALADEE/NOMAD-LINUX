@@ -21,7 +21,7 @@ API (JSON; "Authorization: Bearer <secret>"):
 
 VLANs (API 7; see vlans.py) are rows like the rest, so they come with /api/changes and /api/log. Their edits are
 add_vlan_domain, update_vlan_domain, delete_vlan_domain, set_vlan, delete_vlan and set_vlans (several at once).
-Subnet placement (API 8; see placement.py): set_placement, plan_move, update_move and complete_move.
+Subnet placement (API 8; see placement.py): set_placement, plan_move, update_move and complete_move; set_role (API 9).
 
 Tribe maps (network maps shared by everyone; see nomad/netmap/shared.py), kept in maps.db:
     GET  /api/maps/changes?since=N    maps and map items changed after map revision N
@@ -72,8 +72,8 @@ TEAM, ADMIN = "team", "admin"
 ADMIN_ONLY_ACTIONS = {"add_network", "delete_network"}
 CERTIFICATE_YEARS = 20
 MAX_WAIT_SECONDS = 55
-API_LEVEL = 8  # 2 added /api/wait (instant sync), 3 /api/log (history), 4 loopback subnets, 5 sightings (last seen),
-# 6 tribe maps, 7 VLANs, 8 subnet placement.
+API_LEVEL = 9  # 2 added /api/wait (instant sync), 3 /api/log (history), 4 loopback subnets, 5 sightings (last seen),
+# 6 tribe maps, 7 VLANs, 8 subnet placement, 9 subnet roles.
 # Clients cope with servers below this
 
 
@@ -553,6 +553,14 @@ class IpamServer:
                                 "synced. Check it again, then make your change.")
         PlacementStore(self.store).set_placement(request["network_id"], request["cidr"], request.get("scope", "auto"),
                                                  bool(request.get("one_segment")), request.get("note", ""))
+
+    def _edit_set_role(self, request):
+        current = PlacementStore(self.store).role(request["network_id"], request["cidr"])
+        expected = request.get("expected_version")
+        if current is not None and expected is not None and current.version != expected or                 current is not None and expected is None:
+            raise ConflictError(f"What {request['cidr']} is for was changed by {current.modified_by} since you last "
+                                "synced. Check it again, then make your change.")
+        PlacementStore(self.store).set_role(request["network_id"], request["cidr"], request.get("role", "auto"))
 
     def _edit_plan_move(self, request):
         PlacementStore(self.store).plan_move(request["network_id"], request["cidr"],
