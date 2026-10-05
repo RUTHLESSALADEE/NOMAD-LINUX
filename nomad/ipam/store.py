@@ -35,14 +35,16 @@ from ..system import app_data_dir
 log = logging.getLogger(__name__)
 
 FILE_NAME = "ipam.db"
-SCHEMA_VERSION = 4  # 2 added subnets.loopbacks, 3 the VLAN tables, 4 subnet placement (overrides and moves)
+SCHEMA_VERSION = 5  # 2 added subnets.loopbacks, 3 the VLAN tables, 4 subnet placement (overrides and moves),
+# 5 subnet roles
 USED, RESERVED = "used", "reserved"
 ANYWHERE, VALUE, NAME, DESCRIPTION, MAC = "anywhere", "value", "name", "description", "mac"  # Where search looks
 STATUSES = {USED: "Used", RESERVED: "Reserved"}
 MAX_NEXT_FREE_SCAN = 1 << 20  # Stop looking for a free address after this many (a /12's worth)
-TABLES = ("networks", "subnets", "addresses", "vlan_domains", "vlans", "placements", "subnet_moves")
+TABLES = ("networks", "subnets", "addresses", "vlan_domains", "vlans", "placements", "subnet_moves", "subnet_roles")
 # Unique by sort_key within
-PARENTS = {"subnets": "network_id", "addresses": "network_id", "vlans": "domain_id", "placements": "network_id"}
+PARENTS = {"subnets": "network_id", "addresses": "network_id", "vlans": "domain_id", "placements": "network_id",
+           "subnet_roles": "network_id"}
 JSON_COLUMNS = ("fields", "subnets", "ranges")
 
 SCHEMA = """
@@ -95,6 +97,10 @@ CREATE TABLE IF NOT EXISTS subnet_moves (
     to_vlan INTEGER NOT NULL DEFAULT 0, to_device TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
     planned_for TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '', finished TEXT NOT NULL DEFAULT '',
     version INTEGER NOT NULL, modified TEXT NOT NULL, modified_by TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS subnet_roles (
+    id TEXT PRIMARY KEY, network_id TEXT NOT NULL, cidr TEXT NOT NULL, sort_key TEXT NOT NULL, role TEXT NOT NULL,
+    version INTEGER NOT NULL, modified TEXT NOT NULL, modified_by TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0);
+CREATE UNIQUE INDEX IF NOT EXISTS subnet_roles_unique ON subnet_roles (network_id, sort_key) WHERE deleted = 0;
 CREATE INDEX IF NOT EXISTS sightings_seq ON sightings (seq);
 CREATE INDEX IF NOT EXISTS sweeps_seq ON sweeps (seq);
 """
@@ -331,8 +337,21 @@ class SubnetMove:
     modified_by: str = ""
 
 
+@dataclass
+class SubnetRole:
+    """What a subnet of a network is for (a VLAN, a point-to-point link, loopbacks...), where someone said so over
+    what the map and IPAM suggest. Kept beside the placements, never on the subnet."""
+    id: str
+    network_id: str
+    cidr: str
+    role: str
+    version: int = 1
+    modified: str = ""
+    modified_by: str = ""
+
+
 ENTITIES = {"networks": Network, "subnets": Subnet, "addresses": Address, "vlan_domains": VlanDomain, "vlans": Vlan,
-            "placements": Placement, "subnet_moves": SubnetMove}
+            "placements": Placement, "subnet_moves": SubnetMove, "subnet_roles": SubnetRole}
 EDITABLE = {
     "networks": {"name", "description", "fields"},
     "subnets": {"name", "gateway", "description", "fields", "loopbacks"},
@@ -342,6 +361,7 @@ EDITABLE = {
     "placements": {"scope", "one_segment", "note"},
     "subnet_moves": {"from_domain_id", "from_vlan", "from_device", "to_domain_id", "to_vlan", "to_device", "status",
                      "planned_for", "note", "finished"},
+    "subnet_roles": {"role"},
 }
 
 
@@ -422,7 +442,7 @@ class IpamStore:
             row["sort_key"] = ip_key(item.address)
         elif table == "vlans":
             row["sort_key"] = vlan_key(item.vlan)
-        elif table in ("placements", "subnet_moves"):
+        elif table in ("placements", "subnet_moves", "subnet_roles"):
             row["sort_key"] = subnet_key(parse_subnet(item.cidr))
         names = ", ".join(row)
         self.db.execute(f"INSERT INTO {table} ({names}) VALUES ({', '.join('?' * len(row))})", list(row.values()))

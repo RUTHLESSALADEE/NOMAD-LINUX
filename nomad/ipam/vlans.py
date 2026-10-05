@@ -259,14 +259,15 @@ def vlan_named_in(text):
     return number if 1 <= number <= MAX_VLAN else 0
 
 
-def suggested_links(ipam_store, vlan_store, domain):
+def suggested_links(ipam_store, vlan_store, domain, skip=()):
     """Subnets of the domain's network that say which VLAN they're in, by name ("Vlan 6") or in a detail (such as
     the "Vlan 10" column some workbook pages have), and aren't in a VLAN of the domain yet: [(VLAN, CIDR, why)].
-    Only read: the subnets are left exactly as they are."""
+    skip: CIDRs not to suggest (subnets whose role isn't a VLAN's). Only read: the subnets are left exactly as they
+    are."""
     linked = {cidr for vlan in vlan_store.vlans(domain.id) for cidr in vlan.subnets}
     found = []
     for subnet in (ipam_store.subnets(domain.network_id) if domain.network_id else []):
-        if subnet.cidr in linked:
+        if subnet.cidr in linked or subnet.cidr in skip:
             continue
         number, why = vlan_named_in(subnet.name), f"its name is {subnet.name}"
         if not number:

@@ -1,7 +1,8 @@
 """Subnet Placement page (Manage > Subnet Placement): where each subnet of a network is planned to be (the VLANs it's
 linked to on the VLANs page), where the network map finds it, whether it's advertised (from the map's routing
-tables, per VRF, or as someone set it), and what's wrong: an advertised subnet in two places, routers reaching it in
-different places, a local-only subnet leaking into the routing tables, a subnet not where it was planned. Subnets
+tables, per VRF, or as someone set it), what it's for (its role: a VLAN, a point-to-point link, loopbacks, a tunnel...),
+and what's wrong: an advertised subnet in two places, routers reaching it in different places, a local-only subnet
+leaking into the routing tables, a subnet not where it was planned, a loopback address on two devices. Subnets
 are moved here too: plan a move, start it, check it on the map, and complete it (which relinks it on the VLANs
 page).
 
@@ -19,6 +20,7 @@ from PyQt5.QtWidgets import QAbstractItemView, QComboBox, QHBoxLayout, QLabel, Q
 from ..ipam.placement import ADVERTISED, CANCELLED, DONE, IN_PROGRESS, LOCAL, MOVE_STATUSES, NOTE, OPEN, PROBLEM, \
     SEVERITY_LABELS, UNKNOWN, WARNING, PlacementStore, evaluate, move_check
 from ..ipam.placement_team import TeamPlacementStore
+from ..ipam.roles import ROLE_NAMES
 from ..ipam.store import IpamError
 from ..ipam.vlan_team import TeamVlanStore
 from ..ipam.vlans import VlanStore
@@ -30,8 +32,9 @@ from .theme import COLORS
 
 log = logging.getLogger(__name__)
 
-COLUMNS = ["Subnet", "VRF", "IPAM Name", "Scope", "Planned (VLANs Page)", "On the Map", "Advertised", "Status",
-           "Move"]
+COLUMNS = ["Subnet", "VRF", "IPAM Name", "Role", "Scope", "Planned (VLANs Page)", "On the Map", "Advertised",
+           "Status", "Move"]
+COL_ROLE, COL_SCOPE, COL_STATUS = 3, 4, 8
 SHOW = [("Everything", None), ("Problems and warnings", "issues"), ("Advertised", ADVERTISED), ("Local", LOCAL),
         ("Moving", "moving"), ("On the map, not in this network", "outside")]
 SEVERITY_COLORS = {PROBLEM: "error", WARNING: "warning", NOTE: "muted"}
@@ -71,6 +74,14 @@ class PlacementTab(QWidget):
         for label, key in SHOW:
             self.show_combo.addItem(label, key)
         top.addWidget(self.show_combo)
+        top.addWidget(QLabel("Role:"))
+        self.role_combo = QComboBox()
+        self.role_combo.setToolTip("Only subnets with this role: what they're for, as set or as the map and IPAM "
+                                   "suggest.")
+        self.role_combo.addItem("Any", None)
+        for key, label in ROLE_NAMES.items():
+            self.role_combo.addItem(label, key)
+        top.addWidget(self.role_combo)
         top.addStretch()
         self.map_label = QLabel()
         top.addWidget(self.map_label)
@@ -96,7 +107,7 @@ class PlacementTab(QWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table_filter = TableFilter(self.table)
-        self.table_filter.columns.widest = {4: 260, 5: 320}
+        self.table_filter.columns.widest = {5: 260, 6: 320}
         self.details = QTextBrowser()
         self.details.setOpenLinks(False)
         splitter = QSplitter(Qt.Horizontal)
@@ -108,8 +119,9 @@ class PlacementTab(QWidget):
         layout.addWidget(splitter, 1)
         buttons = QHBoxLayout()
         self.scope_button = QPushButton("How to Treat It...")
-        self.scope_button.setToolTip("Advertised (must be in one place) or local (may be in several), over what the "
-                                     "routing tables suggest; or its places one L2 segment the map can't see.")
+        self.scope_button.setToolTip("What it's for (a VLAN, a point-to-point link, loopbacks, a tunnel, other...), "
+                                     "and advertised (must be in one place) or local (may be in several), over what "
+                                     "the map suggests; or its places one L2 segment the map can't see.")
         self.move_button = QPushButton("Plan Move...")
         self.move_button.setProperty("accent", True)
         self.start_button = QPushButton("Start Move")
@@ -135,6 +147,7 @@ class PlacementTab(QWidget):
 
         self.network_combo.currentIndexChanged.connect(self.on_network_chosen)
         self.show_combo.currentIndexChanged.connect(self.fill_table)
+        self.role_combo.currentIndexChanged.connect(self.fill_table)
         self.search_input.textChanged.connect(self.table_filter.set_text)
         self.table.itemSelectionChanged.connect(self.on_selection)
         self.table.customContextMenuRequested.connect(self.show_menu)
@@ -277,16 +290,17 @@ class PlacementTab(QWidget):
     # ----------------------------------------------------------------- The table
 
     def shown_rows(self):
-        mode = self.show_combo.currentData()
+        mode, role = self.show_combo.currentData(), self.role_combo.currentData()
+        rows = [row for row in self.rows if role is None or row.role.role == role]
         if mode == "issues":
-            return [row for row in self.rows if row.severity in (PROBLEM, WARNING)]
+            return [row for row in rows if row.severity in (PROBLEM, WARNING)]
         if mode in (ADVERTISED, LOCAL):
-            return [row for row in self.rows if row.scope == mode]
+            return [row for row in rows if row.scope == mode]
         if mode == "moving":
-            return [row for row in self.rows if row.move is not None]
+            return [row for row in rows if row.move is not None]
         if mode == "outside":
-            return [row for row in self.rows if row.found is not None and row.subnet is None]
-        return list(self.rows)
+            return [row for row in rows if row.found is not None and row.subnet is None and row.pool is None]
+        return rows
 
     def fill_table(self, select=None):
         network_map = self.network_map()
@@ -314,15 +328,17 @@ class PlacementTab(QWidget):
             move = ""
             if row.move is not None:
                 move = f"{MOVE_STATUSES[row.move.status]}: to VLAN {row.move.to_vlan}"
+            name = row.subnet.name if row.subnet else (f"(in {row.pool.cidr} {row.pool.name})".replace(" )", ")")
+                                                       if row.pool is not None else "")
             values = [(row.cidr, (row.network.version, int(row.network.network_address), row.network.prefixlen)),
-                      (vrf_text(row.vrf), None), (row.subnet.name if row.subnet else "", None), (scope, None),
-                      (planned, None), (found, None), (routed, None), (status, None), (move, None)]
+                      (vrf_text(row.vrf), None), (name, None), (row.role.text, None), (scope, None), (planned, None),
+                      (found, None), (routed, None), (status, None), (move, None)]
             for column, (text, sort_key) in enumerate(values):
                 item = SortableTableItem(text, sort_key, row if column == 0 else None)
-                item.setToolTip(text)
-                if column == 7 and row.severity in (PROBLEM, WARNING):
+                item.setToolTip(row.role.why if column == COL_ROLE else text)
+                if column == COL_STATUS and row.severity in (PROBLEM, WARNING):
                     item.setForeground(QColor(COLORS[SEVERITY_COLORS[row.severity]]))
-                if column == 3 and row.scope == UNKNOWN:
+                if column == COL_SCOPE and row.scope == UNKNOWN or column == COL_ROLE and row.role.role == "other":
                     item.setForeground(QColor(COLORS["muted"]))
                 self.table.setItem(number, column, item)
         self.table.setSortingEnabled(True)
@@ -375,7 +391,11 @@ class PlacementTab(QWidget):
     @staticmethod
     def help_html():
         return ("<p>Each subnet of the network, and each one a device on the open network map has an address in, "
-                "per VRF.</p><p><b>Advertised</b> subnets (other devices have a route to them) must be in one place; "
+                "per VRF.</p><p>Its <b>role</b> says what it's for: a VLAN's subnet, a point-to-point link or a "
+                "tunnel (whose ends count as one place), loopbacks (each address on one device only), a routed "
+                "port's, a container holding other subnets, or other (not known yet: nothing is expected of it). "
+                "The map and IPAM suggest it, unless you set it (How to Treat It).</p>"
+                "<p><b>Advertised</b> subnets (other devices have a route to them) must be in one place; "
                 "<b>local</b> ones may be reused. The routing tables decide which, unless you set it (How to Treat "
                 "It). A subnet only covered by a summary counts as local.</p>"
                 "<p>To move a subnet to another VLAN or device: Plan Move, Start Move when the work begins, Read "
@@ -395,6 +415,9 @@ class PlacementTab(QWidget):
             details = ", ".join(part for part in (row.subnet.name, f"gateway {row.subnet.gateway}"
                                                   if row.subnet.gateway else "") if part)
             parts.append(f"<p>IPAM: {escape(details) or '(no name)'}</p>")
+        elif row.pool is not None:
+            parts.append(f"<p>IPAM: in the loopback subnet {escape(row.pool.cidr)} {escape(row.pool.name)}</p>")
+        parts.append(f"<p><b>{escape(row.role.name)}</b>: {escape(row.role.why)}</p>")
         parts.append(f"<p><b>{SCOPE_LABELS[row.scope]}</b>: {escape(row.scope_why)}</p>")
         if row.findings:
             parts.append("<h4>Findings</h4>")

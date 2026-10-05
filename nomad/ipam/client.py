@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS sightings_out (
 SET, FREE = "set_address", "free_address"
 VLAN_API = 7  # The server API level that keeps VLANs
 PLACEMENT_API = 8  # And subnet placement
+ROLES_API = 9  # And subnet roles
 
 
 class ServerUnreachable(IpamError):
@@ -359,7 +360,8 @@ class TeamStore:
         """Empty the copy (for a different server), so the next sync fetches everything."""
         with self.copy.transaction():
             for table in ("networks", "subnets", "addresses", "changes", "pending", "history", "sightings", "sweeps",
-                          "sightings_out", "vlan_domains", "vlans", "vlan_pending", "placements", "subnet_moves"):
+                          "sightings_out", "vlan_domains", "vlans", "vlan_pending", "placements", "subnet_moves",
+                          "subnet_roles"):
                 self.copy.db.execute(f"DELETE FROM {table}")
             self.copy.set_meta("revision", 0)
             self.copy.set_meta("sighting_revision", 0)
@@ -418,6 +420,11 @@ class TeamStore:
     def server_keeps_placement(self):
         """Whether the server is new enough to keep subnet placement (assumed so before the first sync)."""
         return self.server_api == 0 or self.server_api >= PLACEMENT_API
+
+    @property
+    def server_keeps_roles(self):
+        """Whether the server is new enough to keep subnet roles (assumed so before the first sync)."""
+        return self.server_api == 0 or self.server_api >= ROLES_API
 
     @property
     def server_keeps_vlans(self):

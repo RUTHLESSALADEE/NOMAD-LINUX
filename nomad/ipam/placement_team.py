@@ -2,11 +2,13 @@
 changed through the server only (like subnets and networks, these change rarely and matter to everyone, so they wait
 for the server rather than risk two people moving one subnet at once)."""
 from .client import OldServerError, ServerUnreachable
+from .roles import AUTO
 from .placement import PlacementStore
 from .store import parse_subnet
 
 OLD_SERVER = "The IPAM server is running an older version of NOMAD that doesn't keep subnet placement: it needs " \
              "updating (Tools > Tribe Management > Update Service, on the server)."
+OLD_SERVER_ROLES = "The IPAM server is running an older version of NOMAD that doesn't keep what subnets are for "                    "(their roles): it needs updating (Tools > Tribe Management > Update Service, on the server)."
 
 
 class TeamPlacementStore:
@@ -15,7 +17,7 @@ class TeamPlacementStore:
         self.local = PlacementStore(team.copy)
 
     def __getattr__(self, name):
-        if name in ("placements", "placement", "moves", "move", "open_move"):
+        if name in ("placements", "placement", "moves", "move", "open_move", "roles", "role"):
             return getattr(self.local, name)
         raise AttributeError(name)
 
@@ -41,6 +43,18 @@ class TeamPlacementStore:
         self._send("set_placement", network_id=network_id, cidr=str(parse_subnet(cidr)), scope=scope,
                    one_segment=bool(one_segment), note=note, expected_version=current.version if current else None)
         return self.local.placement(network_id, cidr)
+
+    @property
+    def can_change_roles(self):
+        return self.can_change and self.team.server_keeps_roles
+
+    def set_role(self, network_id, cidr, role=AUTO):
+        current = self.local.role(network_id, cidr)
+        if not self.team.server_keeps_roles:
+            raise OldServerError(OLD_SERVER_ROLES)
+        self._send("set_role", network_id=network_id, cidr=str(parse_subnet(cidr)), role=role,
+                   expected_version=current.version if current else None)
+        return self.local.role(network_id, cidr)
 
     def plan_move(self, network_id, cidr, **details):
         reply = self._send("plan_move", network_id=network_id, cidr=str(parse_subnet(cidr)), **details)

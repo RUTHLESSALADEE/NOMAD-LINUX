@@ -4,7 +4,8 @@ network map finds it, and whether it's advertised, so a subnet that must be in o
 Kept in the IPAM database beside the VLANs: per subnet of a network, how to treat it when the map's routing tables
 don't say it right (Placement: advertised or local, or its places one L2 segment the map can't see), and moves
 (SubnetMove) from one VLAN, and device, to another. Finishing a move relinks the subnet from the old VLAN to the new
-one, in the same change. As with VLANs, nothing is written to IPAM's networks, subnets or addresses.
+one, in the same change. And what a subnet is for (its role, see roles.py) where someone set it. As with VLANs,
+nothing is written to IPAM's networks, subnets or addresses.
 
 evaluate() puts the database and a map's netmap.placement.analyse() together into Rows, with what's wrong with each.
 """
@@ -14,7 +15,9 @@ import uuid
 from dataclasses import dataclass, field
 
 from ..netmap.placement import GLOBAL, segment_text, vrf_text
-from .store import IpamError, Placement, SubnetMove, _from_row, parse_subnet, subnet_key
+from .roles import LOOPBACK, ONE_PLACE, POINT_TO_POINT, ROLE_NAMES, TUNNEL, VLAN, inside, loopback_pool, role_info, \
+    single_address
+from .store import IpamError, Placement, SubnetMove, SubnetRole, _from_row, parse_subnet, subnet_key
 from .vlans import ACTIVE, VlanStore, check_number
 
 AUTO, ADVERTISED, LOCAL, UNKNOWN = "auto", "advertised", "local", "unknown"
@@ -68,6 +71,32 @@ class PlacementStore:
             if existing is not None:
                 return self.store._update("placements", existing, values)
             return self.store._insert("placements", Placement(uuid.uuid4().hex, network_id, cidr, **values))
+
+    # ----------------------------------------------------------------- What subnets are for
+
+    def roles(self, network_id):
+        """{CIDR: SubnetRole} for the network's subnets someone set a role for."""
+        rows = self.db.execute("SELECT * FROM subnet_roles WHERE network_id = ? AND deleted = 0", (network_id,))
+        return {row["cidr"]: _from_row(SubnetRole, row) for row in rows}
+
+    def role(self, network_id, cidr):
+        return self.roles(network_id).get(str(parse_subnet(cidr)))
+
+    def set_role(self, network_id, cidr, role=AUTO):
+        """What a subnet is for (roles.ROLE_NAMES); back to automatic forgets it."""
+        if role != AUTO and role not in ROLE_NAMES:
+            raise IpamError(f"Unknown role {role!r}.")
+        cidr = str(parse_subnet(cidr))
+        with self.store.transaction():
+            self.store.network(network_id)
+            existing = self.role(network_id, cidr)
+            if role == AUTO:
+                if existing is not None:
+                    self.store._delete("subnet_roles", existing)
+                return None
+            if existing is not None:
+                return self.store._update("subnet_roles", existing, {"role": role})
+            return self.store._insert("subnet_roles", SubnetRole(uuid.uuid4().hex, network_id, cidr, role))
 
     # ----------------------------------------------------------------- Moves
 
@@ -173,6 +202,8 @@ class Row:
     move: object = None  # The SubnetMove under way, or None
     scope: str = UNKNOWN  # ADVERTISED, LOCAL or UNKNOWN, after any override
     scope_why: str = ""
+    role: object = None  # roles.RoleInfo: what it's for
+    pool: object = None  # For a single address on the map: IPAM's loopback subnet holding it, or None
     findings: list = field(default_factory=list)
 
     @property
@@ -192,6 +223,12 @@ class Row:
     def map_vlans(self):
         return sorted({place.vlan for place in self.places if place.vlan})
 
+    @property
+    def one_segment(self):
+        """Whether its places count as one: marked so, or a tunnel's or point-to-point link's ends."""
+        return (self.placement is not None and self.placement.one_segment) or \
+            (self.role is not None and self.role.role in ONE_PLACE)
+
 
 def evaluate(network_map, ipam_store, vlan_store, placement_store, network_id):
     """Rows for the network's subnets and every subnet on the map (None: no map), with their findings, worst first
@@ -205,6 +242,7 @@ def evaluate(network_map, ipam_store, vlan_store, placement_store, network_id):
             for cidr in vlan.subnets:
                 planned.setdefault(cidr, []).append((domain, vlan))
     placements = placement_store.placements(network_id) if network_id else {}
+    roles = placement_store.roles(network_id) if network_id else {}
     moves = {}
     for move in (placement_store.moves(network_id, open_only=True) if network_id else []):
         moves.setdefault(move.cidr, move)
@@ -214,7 +252,7 @@ def evaluate(network_map, ipam_store, vlan_store, placement_store, network_id):
     for item in found:
         rows[(item.vrf, item.cidr)] = Row(item.vrf, item.cidr, found=item)
     on_map = {cidr for _, cidr in rows}
-    for cidr in set(subnets) | set(planned) | set(placements) | set(moves):
+    for cidr in set(subnets) | set(planned) | set(placements) | set(moves) | set(roles):
         if cidr not in on_map:
             rows[(GLOBAL, cidr)] = Row(GLOBAL, cidr)
     for row in rows.values():
@@ -222,8 +260,14 @@ def evaluate(network_map, ipam_store, vlan_store, placement_store, network_id):
         row.planned = planned.get(row.cidr, [])
         row.placement = placements.get(row.cidr)
         row.move = moves.get(row.cidr)
+        if row.subnet is None:
+            row.pool = loopback_pool(subnets.values(), row.network)
+        row.role = role_info(row.cidr, roles.get(row.cidr), subnet=row.subnet, places=row.places,
+                             network_map=network_map, linked=[vlan.vlan for _, vlan in row.planned],
+                             inner=inside(row.subnet, subnets.values()) if row.subnet is not None else (),
+                             pool=row.pool)
         _scope(row, network_map is not None, network_map)
-        _findings(row, network_map, subnets, network_id)
+        _findings(row, network_map, subnets, network_id, bool(domains))
     _overlaps(rows.values(), network_map)
     for row in rows.values():
         row.findings.sort(key=lambda finding: SEVERITY_ORDER[finding.severity])
@@ -261,12 +305,27 @@ def _scope(row, have_map, network_map=None):
         row.scope, row.scope_why = detected
 
 
-def _findings(row, network_map, subnets, network_id):
+def _findings(row, network_map, subnets, network_id, has_domains=False):
     add = row.findings.append
-    item, move = row.found, row.move
-    one_segment = row.placement is not None and row.placement.one_segment
+    item, move, role = row.found, row.move, row.role.role
+    one_segment = row.one_segment
     segments = item.segments if item is not None else []
-    if row.scope == ADVERTISED and len(segments) > 1 and not one_segment:
+    devices = sorted({place.device for place in row.places})
+    duplicate_loopback = role == LOOPBACK and single_address(row.network) and len(devices) > 1
+    if duplicate_loopback:
+        add(Finding(PROBLEM, f"The same loopback address on {len(devices)} devices: "
+                             f"{'; '.join(segment_text(network_map, segment) for segment in segments)}. Each device's "
+                             "loopback must be its own (it's often the router ID)."))
+    if role == POINT_TO_POINT and len(devices) > 2:
+        add(Finding(WARNING, f"A point-to-point subnet, but {len(devices)} devices have addresses in it: "
+                             f"{'; '.join(segment_text(network_map, segment) for segment in segments)}."))
+    if row.role.mismatch():
+        add(Finding(WARNING, row.role.mismatch()))
+    if row.planned and role in (TUNNEL, LOOPBACK):
+        where = ", ".join(f"VLAN {vlan.vlan} ({domain.name})" for domain, vlan in row.planned)
+        add(Finding(WARNING, f"Linked to {where} on the VLANs page, but it's a {ROLE_NAMES[role].lower()}: those "
+                             "aren't in VLANs."))
+    if row.scope == ADVERTISED and len(segments) > 1 and not one_segment and not duplicate_loopback:
         where = "; ".join(segment_text(network_map, segment) for segment in segments)
         if move is not None and move.status == IN_PROGRESS:
             add(Finding(PROBLEM, f"Advertised from both its old and new place while it moves: {where}. Remove it from "
@@ -308,13 +367,15 @@ def _findings(row, network_map, subnets, network_id):
             add(Finding(WARNING, f"On the map in VLAN {', '.join(str(vlan) for vlan in sorted({place.vlan for place in stray}))} "
                                  f"({where}), but linked to VLAN {', '.join(str(vlan) for vlan in plan_vlans)}"
                                  + (" (plan a move, or link it where it is)" if move is None else "") + "."))
-    if item is not None and not row.planned and row.map_vlans and row.subnet is not None:
+    if item is not None and not row.planned and row.map_vlans and row.subnet is not None and role == VLAN:
         add(Finding(NOTE, f"In VLAN {', '.join(str(vlan) for vlan in row.map_vlans)} on the map, but not linked to a "
                           "VLAN on the VLANs page."))
+    elif not row.planned and not row.map_vlans and row.subnet is not None and role == VLAN and has_domains:
+        add(Finding(NOTE, f"A VLAN's subnet ({row.role.why}), but not linked to a VLAN on the VLANs page."))
     if item is None and row.planned and network_map is not None:
         add(Finding(NOTE, "Linked to " + ", ".join(f"VLAN {vlan.vlan} ({domain.name})" for domain, vlan in row.planned)
                           + ", but no device on the map has an address in it."))
-    if item is not None and network_id and row.subnet is None:
+    if item is not None and network_id and row.subnet is None and row.pool is None:
         add(Finding(NOTE, "Not a subnet in this IPAM network."))
     if item is not None and not item.learned and item.summaries:
         summary, keys = item.summaries[0]
@@ -333,7 +394,8 @@ def _findings(row, network_map, subnets, network_id):
     if item is not None and item.routes_unknown:
         add(Finding(NOTE, f"The routes in VRF {vrf_text(row.vrf)} couldn't be read on "
                           f"{len(item.routes_unknown)} device{'s' if len(item.routes_unknown) != 1 else ''}."))
-    if item is not None and row.scope != ADVERTISED and len(segments) > 1 and not one_segment:
+    if item is not None and row.scope != ADVERTISED and len(segments) > 1 and not one_segment and \
+            not duplicate_loopback:
         add(Finding(NOTE, f"Local, in {len(segments)} places (a local subnet may be)."))
     if move is not None:
         add(Finding(NOTE, f"Moving ({MOVE_STATUSES[move.status].lower()}): {move_check(row, move, network_map)[1]}"))

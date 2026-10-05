@@ -20,6 +20,8 @@ from PyQt5.QtWidgets import QAbstractItemView, QComboBox, QFileDialog, QHBoxLayo
 from ..ipam.client import ServerUnreachable, TeamKeyError
 from ..ipam.server import ConflictError
 from ..ipam.store import IpamError
+from ..ipam.placement import PlacementStore
+from ..ipam.roles import subnet_roles
 from ..ipam.vlan_team import TeamVlanStore
 from ..ipam.vlans import STATUSES, VlanStore, name_problem, range_for
 from ..netmap import store as map_store
@@ -298,7 +300,7 @@ class VlanTab(QWidget):
         source, domain = self.source(), self.domain()
         if domain is None:
             return
-        dialog = LinkSuggestionsDialog(self, source, domain)
+        dialog = LinkSuggestionsDialog(self, source, domain, self.roles_of(source)(domain.network_id))
         if dialog.exec_():
             self.after_change(source)
             self.fill_table()
@@ -596,6 +598,19 @@ class VlanTab(QWidget):
             action.setEnabled(button.isEnabled())
         menu.exec_(self.table.viewport().mapToGlobal(position))
 
+    def roles_of(self, source):
+        """For the VLAN dialogs: what each subnet of a network is for ({CIDR: roles.RoleInfo}), from the open map and
+        the roles set on the Subnet Placement page."""
+        def roles(network_id):
+            if not network_id:
+                return {}
+            try:
+                return subnet_roles(source.ipam, PlacementStore(getattr(source.ipam, "copy", source.ipam)),
+                                    source.vlans, network_id, self.open_map())
+            except IpamError:
+                return {}
+        return roles
+
     def interface_finder(self, domain):
         """For the VLAN dialog: a VLAN number's interfaces on the open map."""
         on_map = self.map_vlans_for(domain)
@@ -608,7 +623,8 @@ class VlanTab(QWidget):
         source, domain = self.source(), self.domain()
         if domain is None:
             return
-        dialog = VlanDialog(self, source, domain, number=number, interfaces_of=self.interface_finder(domain))
+        dialog = VlanDialog(self, source, domain, number=number, interfaces_of=self.interface_finder(domain),
+                            roles_of=self.roles_of(source))
         if dialog.exec_():
             self.after_change(source)
             self.fill_table(select=[dialog.result_item.vlan] if dialog.result_item else None)
@@ -625,7 +641,8 @@ class VlanTab(QWidget):
         source, domain, vlan = self.source(), self.domain(), self.selected_vlan()
         if vlan is None or not source.can_edit_vlans:
             return
-        dialog = VlanDialog(self, source, domain, vlan, interfaces_of=self.interface_finder(domain))
+        dialog = VlanDialog(self, source, domain, vlan, interfaces_of=self.interface_finder(domain),
+                            roles_of=self.roles_of(source))
         if dialog.exec_():
             self.after_change(source)
             self.fill_table()
