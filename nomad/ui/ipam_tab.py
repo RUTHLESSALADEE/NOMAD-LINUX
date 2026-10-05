@@ -619,7 +619,11 @@ class IpamTab(QWidget):
         self.add_subnet_button = QPushButton("Add Subnet...")
         self.edit_subnet_button = QPushButton("Edit...")
         self.delete_subnet_button = QPushButton("Delete")
-        for button in (self.add_subnet_button, self.edit_subnet_button, self.delete_subnet_button):
+        self.move_subnet_button = QPushButton("Move...")
+        self.move_subnet_button.setToolTip("Move the subnet, with its addresses, to another network (also on its "
+                                           "right-click: Move to Another Network).")
+        for button in (self.add_subnet_button, self.edit_subnet_button, self.delete_subnet_button,
+                       self.move_subnet_button):
             subnet_buttons.addWidget(button)
         subnet_buttons.addStretch()
         left_layout.addLayout(subnet_buttons)
@@ -726,6 +730,7 @@ class IpamTab(QWidget):
         self.add_subnet_button.clicked.connect(lambda: self.add_subnet())
         self.edit_subnet_button.clicked.connect(self.edit_subnet)
         self.delete_subnet_button.clicked.connect(self.delete_subnet)
+        self.move_subnet_button.clicked.connect(self.move_to_network)
         self.next_free_button.clicked.connect(self.use_next_free)
         self.sweep_button.clicked.connect(self.sweep_subnet)
         self.record_found_button.clicked.connect(self.record_found)
@@ -1306,7 +1311,8 @@ class IpamTab(QWidget):
                                            "page) into this computer's IPAM (Local). The tribe's networks are "
                                            "imported on the server.")
         tip = "" if editable or not has_network else OFFLINE_NOTE
-        for widget in (self.add_subnet_button, self.edit_subnet_button, self.delete_subnet_button):
+        for widget in (self.add_subnet_button, self.edit_subnet_button, self.delete_subnet_button,
+                       self.move_subnet_button):
             widget.setToolTip(tip)
 
     def network(self):
@@ -1488,12 +1494,44 @@ class IpamTab(QWidget):
     def add_subnet(self, cidr=""):
         if not self.can_edit():
             return False
-        dialog = SubnetDialog(self, self.store, self.network_id, cidr=cidr)
+        dialog = SubnetDialog(self, self.store, self.network_id, cidr=cidr, extras=self.subnet_extras())
         accepted = dialog.exec_()
         self.after_dialog()
         if accepted:
             self.fill_tree(select=dialog.result_item)
+            if dialog.extra_problem:
+                set_hint(self.status_label, dialog.extra_problem, "warning")
         return bool(accepted)
+
+    def subnet_extras(self):
+        """(VLANs, placements) of the selected network's source, for a new subnet's role and VLAN; or None."""
+        integration = hub(self.window)
+        if integration is None or self.as_of is not None:
+            return None
+        _, vlans, placements, can_change = integration.stores(self.source)
+        return (vlans, placements) if vlans is not None and can_change else None
+
+    def tidy_after_delete(self, subnet, links, has_settings):
+        """A subnet's gone: its VLAN links and its role and placement settings go too (they'd point at nothing)."""
+        integration = hub(self.window)
+        if integration is None:
+            return ""
+        from ..ipam.roles import AUTO
+        _, vlans, placements, _ = integration.stores(self.source)
+        try:
+            for domain, vlan in links:
+                current = vlans.vlan(domain.id, vlan.vlan)
+                if current is not None and subnet.cidr in current.subnets:
+                    vlans.set_vlan(domain.id, current.vlan, current.name, current.status,
+                                   [cidr for cidr in current.subnets if cidr != subnet.cidr], current.description,
+                                   current.fields)
+            if has_settings:
+                placements.set_role(self.network_id, subnet.cidr, AUTO)
+                placements.set_placement(self.network_id, subnet.cidr)
+        except IpamError as error:
+            return f" Its VLAN links or settings weren't all removed: {error}"
+        integration.invalidate()
+        return ""
 
     def selected_subnets(self):
         """Every subnet selected in the list (Ctrl/Shift-click selects several)."""
@@ -1518,10 +1556,27 @@ class IpamTab(QWidget):
         if subnet is None:
             return
         count = self.store.count_addresses(self.network_id, subnet.network)
+        try:
+            from ..ipam.network_move import plan
+            ties = plan(self.store, self.network_id, subnet.cidr, take_nested=False)
+        except IpamError:
+            ties = None
+        if ties is not None and ties.problems:
+            QMessageBox.warning(self, "Delete Subnet", f"{subnet.cidr} can't be deleted now. " + " ".join(ties.problems))
+            return
+        links = ties.links if ties is not None else []
+        has_settings = ties is not None and bool(ties.roles or ties.placements)
+        notes = []
+        if links:
+            notes.append("Its link to " + ", ".join(f"VLAN {vlan.vlan} ({domain.name})" for domain, vlan in links)
+                         + " is removed too.")
+        if has_settings:
+            notes.append("Its role and placement settings are removed too.")
         box = QMessageBox(QMessageBox.Question, "Delete Subnet", f"Delete {subnet.cidr} ({subnet.name or 'no name'})?",
                           parent=self)
-        if count:
-            box.setInformativeText(f"It has {count} recorded address{'' if count == 1 else 'es'}.")
+        if count or notes:
+            box.setInformativeText(" ".join(([f"It has {count} recorded address{'' if count == 1 else 'es'}."]
+                                             if count else []) + notes))
             with_addresses = box.addButton("Delete Subnet and Addresses", QMessageBox.DestructiveRole)
             box.addButton("Delete Just the Subnet", QMessageBox.AcceptRole)
         else:
@@ -1536,8 +1591,31 @@ class IpamTab(QWidget):
         except IpamError as error:
             self.report(error, "Deleting the subnet")
             return
+        problem = self.tidy_after_delete(subnet, links, has_settings) if links or has_settings else ""
         self.current = None
         self.fill_tree()
+        if problem:
+            set_hint(self.status_label, f"Deleted {subnet.cidr}.{problem}", "warning")
+
+    def move_to_network(self):
+        """Move the subnet chosen (with its addresses, and maybe the subnets inside it) to another network."""
+        from .network_move_dialog import MoveToNetworkDialog
+        subnet = self.selected_subnet()
+        if subnet is None or not self.can_edit():
+            return
+        dialog = MoveToNetworkDialog(self, self, self.source, self.network_id, subnet)
+        if not dialog.exec_():
+            self.after_dialog()
+            return
+        source, _, network_id = dialog.moved_to.partition(":")
+        integration = hub(self.window)
+        if integration is not None:
+            integration.invalidate()
+        moved = len(dialog.done.subnets) if dialog.done is not None else 1
+        self.go_to_subnet(source, network_id, subnet.cidr)  # Shown where it is now
+        set_hint(self.status_label, f"Moved {subnet.cidr}" + (f" and the {moved - 1} subnets inside it" if moved > 2
+                                                              else " and the subnet inside it" if moved == 2 else "")
+                 + f" to {self.store.network(network_id).name}.", "success")
 
     def subnet_menu(self, position):
         if self.network_id is None:
@@ -1555,6 +1633,7 @@ class IpamTab(QWidget):
         if subnet is not None:
             menu.addAction("Edit...", self.edit_subnet).setEnabled(editable)
             menu.addAction("Delete...", self.delete_subnet).setEnabled(editable)
+            menu.addAction("Move to Another Network...", self.move_to_network).setEnabled(editable)
             menu.addSeparator()
             menu.addAction("Copy Subnet", lambda: QApplication.clipboard().setText(subnet.cidr))
             menu.addAction("Open in Subnet Calculator", lambda: self.open_calculator(subnet.cidr))
@@ -1836,6 +1915,7 @@ class IpamTab(QWidget):
         has_subnet = self.selected_subnet() is not None
         self.edit_subnet_button.setEnabled(has_subnet and editable)
         self.delete_subnet_button.setEnabled(has_subnet and editable)
+        self.move_subnet_button.setEnabled(has_subnet and editable and len(self.selected_subnets()) <= 1)
         subnet = self.selected_subnet()
         # Sweep is IPv4 only, and checks the present (not a view of the past); while one runs, the button stops it
         running = self.sweep_worker is not None

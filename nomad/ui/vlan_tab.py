@@ -802,8 +802,11 @@ class VlanTab(QWidget):
         if not selected:
             return
         listed = ", ".join(str(vlan.vlan) for vlan in selected[:10]) + ("..." if len(selected) > 10 else "")
+        moving = self.moves_using(domain, {vlan.vlan for vlan in selected})
+        note = (" A subnet move on the Subnet Placement page uses " + "; ".join(moving) + ": it keeps that VLAN "
+                "number.") if moving else ""
         if QMessageBox.question(self, "Delete VLANs", f"Delete VLAN{'s' if len(selected) > 1 else ''} {listed} from "
-                                f"{domain.name}? IPAM's subnets aren't touched.") != QMessageBox.Yes:
+                                f"{domain.name}? IPAM's subnets aren't touched.{note}") != QMessageBox.Yes:
             return
         try:
             for vlan in selected:
@@ -812,6 +815,17 @@ class VlanTab(QWidget):
             self.report(error, "Deleting")
         self.after_change(source)
         self.fill_table(select=[])
+
+    def moves_using(self, domain, numbers):
+        """Subnet moves under way to or from these VLANs of the domain, as text."""
+        if not domain.network_id:
+            return []
+        from ..ipam.placement import PlacementStore
+        source = self.source()
+        moves = PlacementStore(getattr(source.ipam, "copy", source.ipam)).moves(domain.network_id, open_only=True)
+        return [f"{move.cidr} (from VLAN {move.from_vlan} to {move.to_vlan})" for move in moves
+                if (move.from_domain_id == domain.id and move.from_vlan in numbers)
+                or (move.to_domain_id == domain.id and move.to_vlan in numbers)]
 
     def show_vlan_history(self):
         from .ipam_history_dialog import HistoryDialog

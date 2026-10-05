@@ -48,6 +48,7 @@ class PlacementTab(QWidget):
         super().__init__(window)
         self.window = window
         self.rows = []
+        self.rows_map = None  # The map the rows were worked out with: they're shown with it
         self.source_key, self.network_id = None, None
         self.saved_network = ""
         self.stale = True  # Something changed while the page was hidden: worked out again when it's shown
@@ -311,7 +312,7 @@ class PlacementTab(QWidget):
         network_map = self.network_map()
         selected = self.selected_row()
         self.rows = []
-        integration = hub(self.window)
+        integration, facts = hub(self.window), None
         if ipam is not None and self.network_id:
             facts = integration.facts(f"{self.source_key}:{self.network_id}") if integration is not None else None
             try:
@@ -319,6 +320,7 @@ class PlacementTab(QWidget):
                                                                           self.network_id)
             except IpamError as error:  # The network was deleted meanwhile
                 set_hint(self.status_label, str(error), "error")
+        self.rows_map = facts.network_map if facts is not None else network_map
         page = getattr(self.window, "netmap_tab", None)
         open_map = getattr(page, "network_map", None)
         if network_map is None and open_map is not None:
@@ -369,8 +371,9 @@ class PlacementTab(QWidget):
         return rows
 
     def fill_table(self, select=None):
-        network_map = self.network_map()
+        network_map = self.rows_map
         rows = self.shown_rows()
+        self.table.blockSignals(True)  # No selection news mid-way: the rows left over are another network's
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(rows))
         for number, row in enumerate(rows):
@@ -408,6 +411,7 @@ class PlacementTab(QWidget):
                     item.setForeground(QColor(COLORS["muted"]))
                 self.table.setItem(number, column, item)
         self.table.setSortingEnabled(True)
+        self.table.blockSignals(False)
         self.table_filter.apply()
         if select is not None:
             for number in range(self.table.rowCount()):
@@ -476,7 +480,7 @@ class PlacementTab(QWidget):
 
     def row_html(self, row):
         escape = html.escape
-        network_map = self.network_map()
+        network_map = self.rows_map
         devices = network_map.devices if network_map is not None else {}
 
         def label(key):

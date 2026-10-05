@@ -22,6 +22,7 @@ API (JSON; "Authorization: Bearer <secret>"):
 VLANs (API 7; see vlans.py) are rows like the rest, so they come with /api/changes and /api/log. Their edits are
 add_vlan_domain, update_vlan_domain, delete_vlan_domain, set_vlan, delete_vlan and set_vlans (several at once).
 Subnet placement (API 8; see placement.py): set_placement, plan_move, update_move and complete_move; set_role (API 9).
+Moving subnets between networks (API 10; see network_move.py): move_subnet, and take_subnets (from a laptop's own).
 
 Tribe maps (network maps shared by everyone; see nomad/netmap/shared.py), kept in maps.db:
     GET  /api/maps/changes?since=N    maps and map items changed after map revision N
@@ -72,8 +73,8 @@ TEAM, ADMIN = "team", "admin"
 ADMIN_ONLY_ACTIONS = {"add_network", "delete_network"}
 CERTIFICATE_YEARS = 20
 MAX_WAIT_SECONDS = 55
-API_LEVEL = 9  # 2 added /api/wait (instant sync), 3 /api/log (history), 4 loopback subnets, 5 sightings (last seen),
-# 6 tribe maps, 7 VLANs, 8 subnet placement, 9 subnet roles.
+API_LEVEL = 10  # 2 added /api/wait (instant sync), 3 /api/log (history), 4 loopback subnets, 5 sightings (last seen),
+# 6 tribe maps, 7 VLANs, 8 subnet placement, 9 subnet roles, 10 moving subnets between networks.
 # Clients cope with servers below this
 
 
@@ -469,6 +470,17 @@ class IpamServer:
     def _edit_delete_subnet(self, request):
         self._check_version("subnets", request["subnet_id"], request.get("expected_version"), "subnet")
         self.store.delete_subnet(request["subnet_id"], with_addresses=bool(request.get("with_addresses")))
+
+    def _edit_move_subnet(self, request):
+        from .network_move import move
+        link = request.get("link")
+        move(self.store, request["network_id"], request["cidr"], request["to_network_id"],
+             bool(request.get("take_nested", True)), tuple(link) if link else None)
+
+    def _edit_take_subnets(self, request):
+        from .network_move import receive
+        link = request.get("link")
+        receive(self.store, request["to_network_id"], request["data"], tuple(link) if link else None)
 
     def _edit_add_network(self, request):
         self.store.add_network(request["name"], request.get("description", ""), request.get("fields"))

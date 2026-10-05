@@ -208,6 +208,8 @@ The **IP Addresses** page keeps track of addresses for several separate networks
 - **Loopback subnets:** every address is its own /32, with no network, broadcast or gateway address.
 - **Select several** addresses or subnets to change them together.
 - **Find Free Blocks** (right-click a subnet) shows the unused space in it, ready to add new subnets in.
+- **Move to Another Network** (right-click a subnet, or **Move...** under the subnet list) moves it, with its recorded addresses, to another network: when a plan changes after the import and a block belongs to another enclave's page. You choose whether the subnets inside it go too; its role and Subnet Placement settings go with it; its VLAN links (the old network's) are dropped and a VLAN of the new network can be linked instead (the same number, if it has one). Anything in the way there (an overlapping subnet, an address recorded in it) or a placement move under way stops it. Tribe networks move on the server (it needs this version); this computer's networks can move into the tribe's, never the other way. The old network's history keeps what it had; the new one shows it added.
+- **Add Subnet** can say what the new subnet is for and link it to a VLAN of the network's domains (the next free number, or one there is) as it's added. **Delete** takes its VLAN links and role and placement settings with it (and won't while it's being moved on Subnet Placement), and Subnet Placement flags links or settings left behind for a subnet that's no longer in IPAM.
 
 **Sweeps and Last Seen**
 

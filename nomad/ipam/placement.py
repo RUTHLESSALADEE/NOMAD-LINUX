@@ -377,6 +377,14 @@ def _findings(row, network_map, subnets, network_id, has_domains=False):
                           + ", but no device on the map has an address in it."))
     if item is not None and network_id and row.subnet is None and row.pool is None:
         add(Finding(NOTE, "Not a subnet in this IPAM network."))
+    left_over = [what for what, there in (("linked to " + ", ".join(f"VLAN {vlan.vlan} ({domain.name})"
+                                                                    for domain, vlan in row.planned), row.planned),
+                                          ("given a role", row.role.set is not None),
+                                          ("given a scope", row.placement is not None)) if there]
+    if network_id and row.subnet is None and row.pool is None and left_over:
+        add(Finding(WARNING, f"Not a subnet in IPAM now (deleted, or moved to another network?), but still "
+                             f"{' and '.join(left_over)}: unlink it on the VLANs page, or set it back to automatic "
+                             "(Role and Scope)."))
     if item is not None and not item.learned and item.summaries:
         summary, keys = item.summaries[0]
         names = ", ".join(network_map.devices[key].label for key in keys[:4] if key in network_map.devices)

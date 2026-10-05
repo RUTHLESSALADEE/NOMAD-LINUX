@@ -270,3 +270,20 @@ def test_map_reopened_at_start_shows_its_network_once_ipam_is_open(pages, tmp_pa
     window.integration.stores_opened()
     assert window.integration.network == key(lab_network) and ipam.network_id == lab_network.id
     assert window.netmap_tab.ipam_network_button.text() == "IPAM Network: Lab..."  # Says which, always
+
+
+def test_placement_follows_away_from_the_maps_network_with_a_mapped_subnet_selected(pages, tmp_path):
+    """The rows left in the table mid-refill are the old network's (with places on the map), while the page is on
+    the new one (no map): they mustn't be shown with the wrong map (it was an error after Move to Another Network)."""
+    window, store, lab_network, other, _ = pages
+    window.netmap_tab.show_map(lab(), tmp_path / "lab.nomadmap")
+    window.netmap_tab.set_ipam_network(key(lab_network))
+    placement = window.placement_tab
+    placement.fill_networks()
+    placement.go_to_subnet("local", lab_network.id, "10.50.0.0/24")
+    assert placement.selected_row().found is not None and "On the map" in placement.details.toHtml()
+    window.ipam_tab.fill_networks(key(other))  # The pages go to a network the map isn't of
+    assert placement.network_id == other.id and placement.rows_map is None
+    assert all(row.found is None for row in placement.rows)
+    placement.go_to_subnet("local", lab_network.id, "10.50.0.0/24")  # And back
+    assert placement.rows_map is window.netmap_tab.network_map and "On the map" in placement.details.toHtml()
