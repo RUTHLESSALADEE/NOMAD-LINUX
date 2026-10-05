@@ -174,19 +174,20 @@ class MainWindow(QMainWindow):
             ("This Computer", [(self.adapter_tab, "Interfaces"), (self.routing_tab, "Routing Table"),
                                (self.neighbors_tab, "ARP"), (self.connections_tab, "Connections"),
                                (self.netreset_tab, "Network Reset")]),
-            ("Connect", [(self.terminal_tab, "Terminal"), (self.scp_tab, "SCP")]),
-            ("Manage", [(self.ipam_tab, "IP Addresses"), (self.vlan_tab, "VLANs"),
-                        (self.placement_tab, "Subnet Placement")]),
-            ("Test", [(self.ping_tab, "Ping"), (self.latency_tab, "Latency"), (self.traceroute_tab, "Traceroute"),
-                      (self.mtu_tab, "MTU"), (self.ports_tab, "Ports"), (self.iperf_tab, "iperf")]),
+            ("Connect & Transfer", [(self.terminal_tab, "Terminal"), (self.scp_tab, "SCP"),
+                                    (self.tftp_tab, "TFTP"), (self.wake_tab, "Wake-on-LAN")]),
             ("Discover", [(self.sweep_tab, "Sweep"), (self.switch_tab, "Switch Port"),
-                          (self.dhcp_tab, "DHCP Servers")]),
-            ("SNMP", [(self.netmap_tab, "Network Map"), (self.snmp_tab, "SNMP Walk"),
-                      (self.snmp_config_tab, "SNMP Config")]),
-            ("DNS & Web", [(self.lookup_tab, "DNS Lookup"), (self.dns_servers_tab, "DNS Servers"),
-                           (self.web_check_tab, "Web Check")]),
-            ("Tools", [(self.capture_tab, "Packet Capture"), (self.syslog_tab, "Syslog"), (self.tftp_tab, "TFTP"),
-                       (self.subnet_tab, "Subnet Calculator"), (self.wake_tab, "Wake-on-LAN")]),
+                          (self.dhcp_tab, "DHCP Servers"), (self.snmp_tab, "SNMP Walk")]),
+            ("Diagnostics: Connectivity & Performance", [(self.ping_tab, "Ping"), (self.latency_tab, "Latency"),
+                (self.traceroute_tab, "Traceroute"), (self.mtu_tab, "MTU"), (self.ports_tab, "Ports"),
+                (self.iperf_tab, "iperf")]),
+            ("Diagnostics: DNS & Web", [(self.lookup_tab, "DNS Lookup"), (self.dns_servers_tab, "DNS Servers"),
+                                      (self.web_check_tab, "Web Check")]),
+            ("Network Management", [(self.netmap_tab, "Network Map"), (self.ipam_tab, "IP Addresses"),
+                (self.vlan_tab, "VLANs"), (self.placement_tab, "Subnet Placement"),
+                (self.snmp_config_tab, "SNMP Config")]),
+            ("Capture & Logs", [(self.capture_tab, "Packet Capture"), (self.syslog_tab, "Syslog")]),
+            ("Utilities", [(self.subnet_tab, "Subnet Calculator")]),
         ]
         self.all_tabs = []
         for section, pages in sections:
@@ -235,9 +236,9 @@ class MainWindow(QMainWindow):
         edit_menu.addAction("Clear &Recent Connections", self.terminal_tab.manager.clear_recent)
 
         view_menu = self.menuBar().addMenu("&View")
-        self.sidebar_action = QAction("Show &Sidebar", self)
+        self.sidebar_action = QAction("Keep Tool &Drawer Open", self)
         self.sidebar_action.setCheckable(True)
-        self.sidebar_action.setChecked(True)
+        self.sidebar_action.setChecked(False)
         self.sidebar_action.setShortcut("Ctrl+B")
         self.sidebar_action.triggered.connect(self.navigator.set_sidebar_visible)
         self.navigator.sidebarToggled.connect(self.on_sidebar_toggled)
@@ -345,14 +346,14 @@ class MainWindow(QMainWindow):
             self.restoreGeometry(geometry)
         self.saved_adapter_name = self.settings.value("window/adapter", "", str)
         self.set_text_scale(self.settings.value("view/text_scale", DEFAULT_TEXT_SCALE, float))
-        self.navigator.set_sidebar_visible(self.settings.value("view/sidebar", True, bool))
+        self.navigator.restore_settings(self.settings)
         self.navigator.setCurrentWidget(self.adapter_tab)  # Always start on Interfaces rather than the last tab used
         for tab in self.all_tabs:
             tab.restore_settings(self.settings)
 
     def save_settings(self):
         self.settings.setValue("window/geometry", self.saveGeometry())
-        self.settings.setValue("view/sidebar", self.navigator.sidebar_visible())
+        self.navigator.save_settings(self.settings)
         adapter = self.current_adapter()
         if adapter is not None:
             self.settings.setValue("window/adapter", adapter.name)
@@ -686,7 +687,8 @@ class MainWindow(QMainWindow):
                                 "F5\tRefresh network settings\n"
                                 "Ctrl+R\tRun a diagnostics report on the selected adapter\n"
                                 "Ctrl+Tab / Ctrl+Shift+Tab\tNext / previous page\n"
-                                "Ctrl+B\tHide or show the sidebar\n"
+                                "Ctrl+K\tFind a tool\n"
+                                "Ctrl+B\tKeep the tool drawer open or close it\n"
                                 "F11\tFocus mode: give the page (such as a terminal) the whole window\n"
                                 "Ctrl+= / Ctrl+-\tLarger / smaller text (Ctrl+0 for the default size)\n"
                                 "Ctrl+F\tSearch or filter on the page showing (routes, ARP, connections, syslog, "

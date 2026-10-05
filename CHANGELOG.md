@@ -6,6 +6,20 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.18.0] - 2026-10-05
+
+### Added
+
+- **Favorites rail:** one-click access to pinned tools in a narrow strip beside the workspace. Right-click a tool in the drawer to pin or unpin it, or right-click its rail icon to unpin it. Drag rail icons to reorder them; favorites and their order are saved between launches.
+- **Tools drawer:** search all tools with **Ctrl+K**, including terms such as "bandwidth" for iperf and "file transfer" for SCP and TFTP. Favorites and recent tools appear above the full list; category headings can be collapsed. Selecting a tool, clicking outside the drawer or pressing Escape closes the temporary drawer.
+- **Keep drawer open** retains full navigation beside the workspace and is saved between launches. Toggle it in the drawer, under **View > Keep Tool Drawer Open**, or with **Ctrl+B**.
+- Function-specific outline icons for all 30 tools, shared by the rail and drawer, with the selected tool highlighted in green and full tool names available on hover.
+
+### Changed
+
+- The compact rail replaces the full sidebar by default, giving tools more working space. The current tool's name appears above its page. Ctrl+Tab / Ctrl+Shift+Tab still cycle through all pages, and F11 still hides navigation for focus mode.
+- Tools are grouped by task: **This Computer**, **Connect & Transfer**, **Discover**, **Diagnostics** (Connectivity & Performance, and DNS & Web), **Network Management**, **Capture & Logs**, and **Utilities**. Network Map, IP Addresses, VLANs, Subnet Placement and SNMP Config are together under Network Management; SNMP Walk is under Discover, and TFTP and Wake-on-LAN are under Connect & Transfer.
+
 ## [1.17.0] - 2026-10-05
 
 ### Added

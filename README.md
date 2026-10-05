@@ -2,13 +2,15 @@
 
 **Network Operations, Monitoring And Diagnostics**: one Windows app to set up network adapters, troubleshoot networks, talk to devices and keep track of IP addresses. (Formerly NIC Manager, with the RADAR subnet sweep and the Latenct latency monitor built in.)
 
+**Version 1.18.0** adds a compact favorites rail, searchable tool drawer, reorganized categories and function-specific icons. See the [changelog](CHANGELOG.md#1180---2026-10-05).
+
 ![The Interfaces page](docs/screenshots/interfaces.png)
 
 - **Works offline.** Tests only talk to the hosts you give them, and the MAC vendor list is built in.
 - **One exe, nothing to install.** `NOMAD-<version>.exe` runs on its own ([build it](#running-from-source-and-building) with `build.ps1`).
 - **Safe changes.** New IP settings, and disabling an adapter, revert on their own unless you confirm within 15 seconds, so a change that cuts off your remote session undoes itself.
 
-Screenshots use made-up demo data.
+Screenshots use made-up demo data; some show the earlier navigation layout.
 
 ## Contents
 
@@ -26,7 +28,9 @@ Screenshots use made-up demo data.
 
 ## Getting around
 
-- Pick a page from the **sidebar** (Ctrl+Tab and Ctrl+Shift+Tab move between pages). Hide it with **«**, View > Show Sidebar or Ctrl+B.
+- Switch tools with the **favorites rail** on the left, or open the **Tools drawer** for the full list. **Ctrl+K** opens tool search (try “bandwidth” or “file transfer”). Right-click a tool to pin or unpin it; drag favorites in the rail to reorder them. Favorites and their order are saved.
+- Each tool has its own outline icon, used in both the rail and drawer. Hover over a rail icon to see its full name; the selected tool is highlighted in green.
+- The drawer lists favorites, recent tools and collapsible categories. It closes when you choose a tool, click outside it or press Escape. Choose **Keep drawer open** (also View > Keep Tool Drawer Open or Ctrl+B) for persistent navigation; this preference is saved. Ctrl+Tab and Ctrl+Shift+Tab move between all tools.
 - Pick an **adapter** at the top of the window. Interfaces, MTU, Ping, Sweep, DHCP Servers and other pages work with it.
 - **F11** (focus mode) hides everything but the current page.
 - **View > Text Size** scales all text from 90% to 200% (Ctrl+= and Ctrl+- too, and Ctrl+0 to reset).
@@ -45,22 +49,25 @@ Screenshots use made-up demo data.
 
 ![The Routing Table page](docs/screenshots/routing.png)
 
-### Connect
+### Connect & Transfer
 
 | Page | What it does |
 | --- | --- |
 | **Terminal** | SSH, Telnet, serial and raw TCP sessions in tabs, tiles and pop-out windows. [More below.](#terminal-and-scp) |
 | **SCP** | A WinSCP-style file manager for SSH servers. [More below.](#terminal-and-scp) |
+| **TFTP** | A TFTP server and client for firmware and config transfers. |
+| **Wake-on-LAN** | Wake a computer by its MAC, and save the ones you wake often. |
 
-### Manage
+### Discover
 
 | Page | Functions |
 | --- | --- |
-| **IP Addresses** | IP address management for several separate networks, shared with the tribe through an IPAM server and usable offline. [More below.](#ip-address-management-ipam) |
-| **VLANs** | Each VLAN domain's VLANs and the subnets they carry, brought in from what the network map finds, shared with the tribe. [More below.](#vlans) |
-| **Subnet Placement** | Where each subnet is planned to be and where the network map finds it, whether it's advertised, what's wrong, and moving subnets between VLANs and devices. [More below.](#subnet-placement) |
+| **Sweep** | Finds every host on a subnet (ping, plus ARP on local subnets), with names, MACs and vendors. **Compare with IPAM** shows which hosts IPAM has, is missing or records with a different MAC. |
+| **Switch Port** | Which switch, port and VLAN you're plugged into, from LLDP and CDP. |
+| **DHCP Servers** | Every DHCP server that answers, with each option it offers decoded, and warns about rogue servers. Nothing is leased. |
+| **SNMP Walk** | Walk or get over SNMP v1, v2c or v3 (a user with authentication and privacy), with presets and a per-port interface summary. |
 
-### Test
+### Diagnostics: Connectivity & Performance
 
 | Page | Functions |
 | --- | --- |
@@ -71,23 +78,7 @@ Screenshots use made-up demo data.
 | **Ports** | Open, closed or filtered, for common port presets or any list and range. |
 | **iperf** | Bandwidth tests with a built-in iperf3-compatible client and server. |
 
-### Discover
-
-| Page | Functions |
-| --- | --- |
-| **Sweep** | Finds every host on a subnet (ping, plus ARP on local subnets), with names, MACs and vendors. **Compare with IPAM** shows which hosts IPAM has, is missing or records with a different MAC. |
-| **Switch Port** | Which switch, port and VLAN you're plugged into, from LLDP and CDP. |
-| **DHCP Servers** | Every DHCP server that answers, with each option it offers decoded, and warns about rogue servers. Nothing is leased. |
-
-### SNMP
-
-| Page | Functions |
-| --- | --- |
-| **Network Map** | Crawls switches, routers and firewalls over SNMP from a starting device and draws what's plugged into what (CDP/LLDP), with the hosts on each switch port, and the subnets and routes between them. See [Network map](#network-map). |
-| **SNMP Walk** | Walk or get over SNMP v1, v2c or v3 (a user with authentication and privacy), with presets and a per-port interface summary. |
-| **SNMP Config** | Builds the Cisco IOS / IOS-XE configuration that sets a switch up for NOMAD, and types it into a terminal session to the switch. See [Setting switches up for NOMAD](#setting-switches-up-for-nomad). |
-
-### DNS & Web
+### Diagnostics: DNS & Web
 
 | Page | Functions |
 | --- | --- |
@@ -95,15 +86,28 @@ Screenshots use made-up demo data.
 | **DNS Servers** | Times how fast each DNS server answers, and checks reverse (PTR) records. |
 | **Web Check** | DNS, connect, TLS and first-byte timings, the certificate, and redirects. |
 
-### Tools
+### Network Management
+
+| Page | Functions |
+| --- | --- |
+| **IP Addresses** | IP address management for several separate networks, shared with the tribe through an IPAM server and usable offline. [More below.](#ip-address-management-ipam) |
+| **VLANs** | Each VLAN domain's VLANs and the subnets they carry, brought in from what the network map finds, shared with the tribe. [More below.](#vlans) |
+| **Subnet Placement** | Where each subnet is planned to be and where the network map finds it, whether it's advertised, what's wrong, and moving subnets between VLANs and devices. [More below.](#subnet-placement) |
+| **Network Map** | Crawls switches, routers and firewalls over SNMP from a starting device and draws what's plugged into what (CDP/LLDP), with the hosts on each switch port, and the subnets and routes between them. See [Network map](#network-map). |
+| **SNMP Config** | Builds the Cisco IOS / IOS-XE configuration that sets a switch up for NOMAD, and types it into a terminal session to the switch. See [Setting switches up for NOMAD](#setting-switches-up-for-nomad). |
+
+### Capture & Logs
 
 | Page | Functions |
 | --- | --- |
 | **Packet Capture** | Captures to a pcapng file for Wireshark with Windows' built-in pktmon. Nothing to install. |
 | **Syslog** | Receives syslog from network devices, coloured by severity and filterable. |
-| **TFTP** | A TFTP server and client for firmware and config transfers. |
+
+### Utilities
+
+| Page | Functions |
+| --- | --- |
 | **Subnet Calculator** | Network, mask, host range and counts for IPv4 and IPv6, and splitting a network into smaller subnets. |
-| **Wake-on-LAN** | Wake a computer by its MAC, and save the ones you wake often. |
 
 ![The Subnet Calculator](docs/screenshots/subnet-calculator.png)
 
@@ -281,7 +285,7 @@ Spreadsheets are imported, and tribe networks added or deleted, only in NOMAD on
 
 ## VLANs
 
-The **VLANs** page (Manage > VLANs) keeps each VLAN domain's VLANs: number, name, status (active, reserved or planned), description and the subnets each carries.
+The **VLANs** page (Network Management > VLANs) keeps each VLAN domain's VLANs: number, name, status (active, reserved or planned), description and the subnets each carries.
 
 - **Domains:** a domain is where VLAN numbers are unique: a VTP domain, or a site's switches. **New Domain** makes a Tribe one (shared through the IPAM server, like tribe networks) or a Local one. A domain can belong to one IPAM network, whose subnets its VLANs carry, and can have ranges set aside (100-199 for users, say), which **Next Free** picks from.
 - **IPAM stays as it is:** a VLAN names its subnets by CIDR, in its domain's network. Nothing is written to the subnets, so the IP Addresses page and its export to the workbook don't change. **Domain > Link Subnets Named for VLANs** links subnets whose names (Vlan 6) or details (a Vlan 10 column) say which VLAN they're in, without touching them.
@@ -295,7 +299,7 @@ VLANs stay up to date as the map does: mapping again, **Crawl from Here** and wa
 
 ## Subnet placement
 
-An advertised subnet (one other routers have a route to) can be in only one place at a time; a local one (that nobody routes to, such as a printer subnet reused at every site) can be in several. The **Subnet Placement** page (Manage > Subnet Placement) checks this for an IPAM network against the network map open on the Network Map page.
+An advertised subnet (one other routers have a route to) can be in only one place at a time; a local one (that nobody routes to, such as a printer subnet reused at every site) can be in several. The **Subnet Placement** page (Network Management > Subnet Placement) checks this for an IPAM network against the network map open on the Network Map page.
 
 - **Each subnet** (per VRF) shows where it's planned to be (the VLANs it's linked to on the VLANs page), where the map finds it (each device's address in it, with places that are one L2 segment counted as one: HSRP/VRRP SVIs on a trunked VLAN, a link's two ends, a router subinterface and the switch it's on, two linked devices whose link can carry it, such as OSPF neighbors on a transit subnet), and whether it's advertised: the protocols and how many routers have a route to it, each route followed to where it leads, so each place says whether that device advertises it or only has an address in it. Routers on it the map couldn't read (a next hop in it no device on the map has, or a linked device that didn't answer SNMP) are noted. A subnet only covered by a summary counts as local, with the summary noted.
 - **What's wrong:** an advertised subnet in two places; routers reaching it in different places; an advertised subnet linked to two VLANs; a subnet in another VLAN on the map than it's linked to; a local-only subnet that's leaking into the routing tables; an advertised subnet inside another one advertised elsewhere. **Show** picks problems, advertised, local, moving, or subnets on the map that aren't in the network.
@@ -327,7 +331,8 @@ An advertised subnet (one other routers have a route to) can be in only one plac
 | --- | --- |
 | F5 | Refresh |
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous page |
-| Ctrl+B | Hide or show the sidebar |
+| Ctrl+K | Open tool search |
+| Ctrl+B | Keep the tool drawer open or close it |
 | F11 | Focus mode |
 | Ctrl+R | Diagnostics report |
 | Ctrl+F | Search or filter on the page showing (routes, ARP, connections, syslog, IP addresses, network map) |
