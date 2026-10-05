@@ -442,7 +442,8 @@ class SimpleNodeItem(NodeItem):
         path = QPainterPath()
         path.addRoundedRect(self.rect, radius, radius)
         painter.fillPath(path, QColor(COLORS["panel_alt"] if node.kind == SUBNET else COLORS["panel"]))
-        pen = QPen(QColor(COLORS["link"] if node.kind == SUBNET else COLORS["muted"]), 1.4)
+        pen = QPen(QColor(COLORS[node.tone] if node.tone else COLORS["link"] if node.kind == SUBNET
+                          else COLORS["muted"]), 2.2 if node.tone in ("error", "warning") else 1.4)
         if node.kind in (HOP, STAR):
             pen.setStyle(Qt.DashLine)
         painter.setPen(pen)

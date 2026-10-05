@@ -253,3 +253,20 @@ def test_tribe_map_without_a_network_is_asked_about_once(pages, monkeypatch, tmp
     page.ask_tribe_map_network()  # Not again, on this computer
     assert asked == [True] and maps.asked(3, "ipam_network")
     maps.close()
+
+
+def test_map_reopened_at_start_shows_its_network_once_ipam_is_open(pages, tmp_path):
+    window, store, lab_network, other, _ = pages
+    ipam = window.ipam_tab
+    network_map = lab()
+    network_map.ipam_network = key(lab_network)
+    ipam.local_store = None  # At start: IPAM's databases aren't open yet when the last map is reopened
+    window.netmap_tab.show_map(network_map, tmp_path / "lab.nomadmap")
+    assert window.integration.waiting_network == key(lab_network)
+    assert window.netmap_tab.ipam_network_button.text() == "IPAM Network..."  # Its name isn't known yet
+    ipam.local_store = store
+    ipam.saved_network_id = key(other)  # The IP Addresses page was on another network last time
+    ipam.fill_networks()
+    window.integration.stores_opened()
+    assert window.integration.network == key(lab_network) and ipam.network_id == lab_network.id
+    assert window.netmap_tab.ipam_network_button.text() == "IPAM Network: Lab..."  # Says which, always
