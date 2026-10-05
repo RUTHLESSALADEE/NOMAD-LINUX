@@ -14,8 +14,8 @@ from pathlib import Path
 from PyQt5.QtCore import QSettings, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QKeySequence
 from PyQt5.QtWidgets import QAbstractItemView, QActionGroup, QApplication, QCheckBox, QComboBox, QDialog, \
-    QFileDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QShortcut, \
-    QSplitter, QTabWidget, QTextBrowser, QToolButton, QVBoxLayout, QWidget
+    QAction, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, \
+    QShortcut, QSplitter, QTabWidget, QTextBrowser, QToolButton, QVBoxLayout, QWidget
 
 from ..ipam.client import ADMIN, current_key, is_tribe_server, read_key_file, save_key
 from ..ipam.map_compare import DEVICE as DEVICE_ADDRESS, compare_map
@@ -575,11 +575,15 @@ class NetworkMapTab(QWidget):
 
     def build_map_menu(self):
         """The compact bar's Map menu: what the classic bar's map file buttons do, each as enabled as its button."""
+        # Its actions and submenus are made here, not by addAction(text) or addMenu(text): Qt doesn't tell Python when
+        # it deletes ones it made, so those kept below would outlive the menu as wrappers of freed memory, which a
+        # later lookup of another object at that address can be handed (ColumnFitter was, crashing the tests)
         menu = self.map_menu
-        self.map_entries = []  # (action, the classic bar's button it stands for)
+        self.map_entries = []  # (action or submenu, the classic bar's button it stands for)
         self.mirrored = {}  # Submenu -> (the classic bar's button's menu, what fills that, or None)
         # The crawl row (start from, the adapter's gateway, credentials, scope, Start and Stop), as Crawl shows it
-        self.crawl_action = menu.addAction("Crawl: Start From, Gateway, Start, Stop")
+        self.crawl_action = QAction("Crawl: Start From, Gateway, Start, Stop", menu)
+        menu.addAction(self.crawl_action)
         self.crawl_action.setCheckable(True)
         self.crawl_action.toggled.connect(self.show_crawl_row)
         menu.addSeparator()
@@ -595,13 +599,15 @@ class NetworkMapTab(QWidget):
                 menu.addSeparator()
                 continue
             if source is None:
-                action = menu.addAction(button.text(), button.click)
+                entry = QAction(button.text(), menu)
+                entry.triggered.connect(button.click)
+                menu.addAction(entry)
             else:
-                submenu = menu.addMenu(button.text())
-                self.mirrored[submenu] = source, fill
-                submenu.aboutToShow.connect(self.mirror_menu)  # A method, as a lambda or partial isn't safe here
-                action = submenu.menuAction()
-            self.map_entries.append((action, button))
+                entry = QMenu(button.text(), menu)
+                menu.addMenu(entry)
+                self.mirrored[entry] = source, fill
+                entry.aboutToShow.connect(self.mirror_menu)  # A method, as a lambda or partial isn't safe here
+            self.map_entries.append((entry, button))
         menu.aboutToShow.connect(self.update_map_menu)
 
     def show_crawl_row(self, shown):
@@ -615,10 +621,12 @@ class NetworkMapTab(QWidget):
         self.crawl_action.setChecked(self.crawl_row.isVisibleTo(self) if self.compact_top else True)
         self.crawl_action.setEnabled(self.crawl_button.isEnabled())
         self.crawl_action.blockSignals(False)
-        for action, button in self.map_entries:
-            action.setEnabled(button.isEnabled())
-            if action.menu() is None:
-                action.setText(button.text())  # Such as IPAM Network: <the map's>...
+        for entry, button in self.map_entries:
+            if isinstance(entry, QMenu):
+                entry.menuAction().setEnabled(button.isEnabled())  # Its entry in the Map menu
+            else:
+                entry.setEnabled(button.isEnabled())
+                entry.setText(button.text())  # Such as IPAM Network: <the map's>...
 
     def mirror_menu(self, submenu=None):
         """Fill one of the Map menu's submenus (the one about to show, if None) with what the classic bar's button's

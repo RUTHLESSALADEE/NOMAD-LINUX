@@ -775,6 +775,9 @@ def test_map_menu_does_what_the_map_buttons_do(tab, crawled, monkeypatch):
     assert list(entries) == ["Crawl: Start From, Gateway, Start, Stop", "New Map", "Open...", "Recent", "Save As...", "Export", "Compare", "IPAM Network...",
                              "Record in IPAM...", "Credentials...", "Scope...", "Tribe"]
     assert all(action.isEnabled() for action in entries.values())
+    from PyQt5 import sip
+    kept = [tab.crawl_action] + [entry for entry, _ in tab.map_entries]
+    assert all(sip.ispycreated(item) for item in kept)  # Ones Qt made would outlive the menu as stale wrappers
     recent = entries["Recent"].menu()
     recent.aboutToShow.emit()
     assert recent.actions() and [action.text() for action in recent.actions()] == \

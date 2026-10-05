@@ -1,5 +1,6 @@
 """Saved maps: JSON files in the app's folder (or wherever the user saves one)."""
 import datetime
+import time
 from pathlib import Path
 
 from ..system import app_data_dir
@@ -7,6 +8,7 @@ from .model import NetworkMap
 
 EXTENSION = ".nomadmap"
 RECENT_LIMIT = 10
+REPLACE_TRIES = 20  # 50 ms apart: a second at most
 
 
 def maps_dir():
@@ -37,7 +39,16 @@ def save(network_map, path=None, folder=None):
             number += 1
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(network_map.to_json(), encoding="utf-8")
-    temporary.replace(path)
+    # Windows refuses the replace while something else has the file open for a moment, as the virus scanner does
+    # just after it's written: about 1 in 30 saves in quick succession. Try again for a little while
+    for attempt in range(REPLACE_TRIES):
+        try:
+            temporary.replace(path)
+            break
+        except PermissionError:
+            if attempt == REPLACE_TRIES - 1:
+                raise
+            time.sleep(0.05)
     return path
 
 
