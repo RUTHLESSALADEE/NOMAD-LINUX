@@ -17,7 +17,7 @@ class ScopeDialog(_EditDialog):
     (may repeat), over what the routing tables suggest; and whether its places are one L2 segment the map can't see."""
 
     def __init__(self, parent, placements, network_id, row):
-        super().__init__(parent, f"How to Treat {row.cidr}")
+        super().__init__(parent, f"Role and Scope of {row.cidr}")
         self.placements, self.network_id, self.row = placements, network_id, row
         role = row.role
         self.role_combo = QComboBox()
