@@ -82,9 +82,10 @@ class Facts:
     """What's known about a network's subnets: Subnet Placement's rows (role, VLANs linked, where the map has it,
     findings) by CIDR, the global routing table's first."""
 
-    def __init__(self, rows, with_map):
+    def __init__(self, rows, network_map):
         self.rows = rows
-        self.with_map = with_map  # Whether a map of the network was open to check against
+        self.network_map = network_map  # The map they were worked out with (of the network), or None
+        self.with_map = network_map is not None
         self.by_cidr = {}
         for row in rows:
             if row.cidr not in self.by_cidr or row.vrf == GLOBAL:
@@ -268,7 +269,7 @@ class Integration(QObject):
             cached = self.cache.get(key)
             if cached is not None and cached[0] is network_map and cached[1] == subnets:
                 return cached[2]
-            facts = Facts(evaluate(network_map, ipam, vlans, placements, network_id), network_map is not None)
+            facts = Facts(evaluate(network_map, ipam, vlans, placements, network_id), network_map)
         except IpamError:
             return None
         self.cache[key] = (network_map, subnets, facts)
@@ -339,7 +340,7 @@ class Integration(QObject):
     def subnet_links(self, key, cidr, row=None, skip=()):
         """HTML links to a subnet on the other pages: IP Addresses, its VLANs, Subnet Placement, the map."""
         source, network_id = split_key(key)
-        row = row if row is not None else (self.facts(key) or Facts([], False)).row(cidr)
+        row = row if row is not None else (self.facts(key) or Facts([], None)).row(cidr)
         parts = []
         if IPAM not in skip and row is not None and row.subnet is not None:
             parts.append(anchor("IP Addresses", IPAM, src=source, net=network_id, cidr=cidr))

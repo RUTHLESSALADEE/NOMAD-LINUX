@@ -106,9 +106,14 @@ class NetworkDialog(_EditDialog):
 
 
 class SubnetDialog(_EditDialog):
-    def __init__(self, parent, store, network_id, subnet=None, cidr=""):
+    """extras (a new subnet only): ((VlanStore-like, PlacementStore-like)) to set its role and link it to a VLAN of the
+    network's domains as it's added; kept beside IPAM, so its export is the same."""
+
+    def __init__(self, parent, store, network_id, subnet=None, cidr="", extras=None):
         super().__init__(parent, "Edit Subnet" if subnet else "New Subnet")
         self.store, self.network_id, self.subnet = store, network_id, subnet
+        self.extras = extras if subnet is None else None
+        self.extra_problem = ""
         self.cidr_input = QLineEdit(subnet.cidr if subnet else cidr)
         self.cidr_input.setPlaceholderText("10.1.2.0/24 or 10.1.2.0 255.255.255.0")
         if subnet:
@@ -129,7 +134,54 @@ class SubnetDialog(_EditDialog):
         self.form.addRow("Gateway:", self.gateway_input)
         self.form.addRow("Description:", self.description_input)
         self.form.addRow("Details:", self.fields_editor)
+        if self.extras is not None:
+            self.add_extra_rows()
         self.finish_layout()
+
+    def add_extra_rows(self):
+        """What it's for, and the VLAN carrying it (next free, or one there is), when the network has VLAN domains."""
+        from ..ipam.roles import AUTO, ROLE_NAMES
+        vlans, _ = self.extras
+        self.role_combo = QComboBox()
+        self.role_combo.addItem("Automatic (from the map and IPAM)", AUTO)
+        for key, label in ROLE_NAMES.items():
+            self.role_combo.addItem(label, key)
+        self.role_combo.setToolTip("What the subnet is for (Subnet Placement's Role and Scope). Kept beside IPAM.")
+        self.form.addRow("It's for:", self.role_combo)
+        self.vlan_combo = QComboBox()
+        self.vlan_combo.addItem("(not in a VLAN, or link it later)", None)
+        for domain in vlans.domains():
+            if domain.network_id != self.network_id:
+                continue
+            number = vlans.next_free(domain.id)
+            if number:
+                self.vlan_combo.addItem(f"New VLAN {number} in {domain.name} (the next free)", ("new", domain.id))
+            for vlan in vlans.vlans(domain.id):
+                self.vlan_combo.addItem(f"VLAN {vlan.vlan} {vlan.name} ({domain.name})".replace("  ", " "),
+                                        (domain.id, vlan.vlan))
+        self.vlan_combo.setToolTip("Link it to a VLAN of the network's domains (VLANs page). IPAM isn't changed.")
+        if self.vlan_combo.count() > 1:
+            self.form.addRow("VLAN:", self.vlan_combo)
+
+    def apply_extras(self, subnet):
+        """Its role and VLAN, once it's added. A failure here doesn't undo the subnet: it's said instead."""
+        from ..ipam.roles import AUTO
+        from ..ipam.vlans import ACTIVE
+        vlans, placements = self.extras
+        role = self.role_combo.currentData()
+        choice = self.vlan_combo.currentData() if self.vlan_combo.count() > 1 else None
+        try:
+            if role != AUTO:
+                placements.set_role(self.network_id, subnet.cidr, role)
+            if choice is not None and choice[0] == "new":
+                number = vlans.next_free(choice[1])
+                vlans.set_vlan(choice[1], number, "", ACTIVE, [subnet.cidr])
+            elif choice is not None:
+                vlan = vlans.vlan(*choice)
+                vlans.set_vlan(choice[0], vlan.vlan, vlan.name, vlan.status, vlan.subnets + [subnet.cidr],
+                               vlan.description, vlan.fields)
+        except IpamError as error:
+            self.extra_problem = f"{subnet.cidr} was added, but its role or VLAN wasn't set: {error}"
 
     def on_loopbacks_toggled(self, loopbacks):
         self.gateway_input.setEnabled(not loopbacks)
@@ -141,7 +193,10 @@ class SubnetDialog(_EditDialog):
                       description=self.description_input.text().strip(), fields=self.fields_editor.fields(),
                       loopbacks=loopbacks)
         if self.subnet is None:
-            return self.store.add_subnet(self.network_id, self.cidr_input.text(), **values)
+            subnet = self.store.add_subnet(self.network_id, self.cidr_input.text(), **values)
+            if self.extras is not None:
+                self.apply_extras(subnet)
+            return subnet
         return self.store.update_subnet(self.subnet.id, **values)
 
 

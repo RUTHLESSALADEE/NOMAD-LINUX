@@ -59,6 +59,7 @@ SET, FREE = "set_address", "free_address"
 VLAN_API = 7  # The server API level that keeps VLANs
 PLACEMENT_API = 8  # And subnet placement
 ROLES_API = 9  # And subnet roles
+MOVE_API = 10  # And moving subnets between networks
 
 
 class ServerUnreachable(IpamError):
@@ -427,6 +428,11 @@ class TeamStore:
         return self.server_api == 0 or self.server_api >= ROLES_API
 
     @property
+    def server_moves_subnets(self):
+        """Whether the server is new enough to move subnets between networks (assumed so before the first sync)."""
+        return self.server_api == 0 or self.server_api >= MOVE_API
+
+    @property
     def server_keeps_vlans(self):
         """Whether the server is new enough to keep VLANs (unknown until the first sync: assumed so)."""
         return self.server_api == 0 or self.server_api >= VLAN_API
@@ -688,6 +694,23 @@ class TeamStore:
     def delete_subnet(self, subnet_id, with_addresses=False):
         self._send("delete_subnet", subnet_id=subnet_id, with_addresses=with_addresses,
                    expected_version=self.copy.subnet(subnet_id).version)
+
+    def move_subnet(self, network_id, cidr, to_network_id, take_nested=True, link=None):
+        """Move a subnet (and those inside it, with take_nested) to another tribe network, on the server."""
+        self._needs_move_api()
+        self._send("move_subnet", network_id=network_id, cidr=cidr, to_network_id=to_network_id,
+                   take_nested=bool(take_nested), link=list(link) if link else None)
+
+    def take_subnets(self, to_network_id, data, link=None):
+        """Put subnets moved from this computer's own networks into a tribe network (network_move.payload)."""
+        self._needs_move_api()
+        self._send("take_subnets", to_network_id=to_network_id, data=data, link=list(link) if link else None)
+
+    def _needs_move_api(self):
+        if not self.server_moves_subnets:
+            raise OldServerError("The IPAM server is running an older version of NOMAD that can't move subnets "
+                                 "between networks: it needs updating (Tools > Tribe Management > Update Service, "
+                                 "on the server).")
 
     def add_network(self, name, description="", fields=None):
         reply = self._send("add_network", name=name, description=description, fields=fields or {})
