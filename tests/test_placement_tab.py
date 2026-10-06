@@ -158,3 +158,33 @@ def test_moving_a_subnet(page):
     assert cell(tab, "10.50.0.0/24", "Planned (VLANs Page)") == "VLAN 60 (Site)"
     select(tab, "10.50.0.0/24")
     assert "Earlier moves" in tab.details.toHtml()
+
+
+def test_plan_move_without_vlan_domain(page):
+    tab, store, network, domain, window = page
+    vlans = VlanStore(store)
+    vlans.delete_domain(domain.id)
+    tab.changed()
+    row = select(tab, "10.30.0.0/24")
+    dialog = MoveDialog(tab, PlacementStore(store), vlans, network.id, row, window.netmap_tab.network_map)
+    assert dialog.to_domain.currentData() == "" and not dialog.to_vlan.isEnabled()
+    dialog.to_device.setCurrentIndex(dialog.to_device.findData("r2"))
+    dialog.save()
+    tab.changed()
+    move = PlacementStore(store).open_move(network.id, row.cidr)
+    assert move.to_vlan == 0 and move.to_domain_id == "" and move.to_device == "r2"
+    assert cell(tab, row.cidr, "Move") == "Planned: to no VLAN"
+    select(tab, row.cidr)
+    tab.complete_move()
+    assert vlans.domains() == [] and PlacementStore(store).move(move.id).status == DONE
+
+
+def test_plan_routed_move_without_map(page):
+    tab, store, network, _, _ = page
+    row = select(tab, "10.30.0.0/24")
+    dialog = MoveDialog(tab, PlacementStore(store), VlanStore(store), network.id, row)
+    assert dialog.to_domain.currentData() == ""
+    dialog.to_device.setEditText("future-router")
+    dialog.save()
+    move = PlacementStore(store).open_move(network.id, row.cidr)
+    assert move.to_device == "future-router" and move.to_vlan == 0

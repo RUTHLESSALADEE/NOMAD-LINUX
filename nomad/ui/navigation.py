@@ -344,15 +344,21 @@ class Navigator(SidebarNavigator):
         self.search.textChanged.connect(self.fill_drawer)
         self.search.returnPressed.connect(self.activate_first)
         self.panel.layout().insertWidget(1, self.search)
-        self.quick_list = QListWidget()
-        self.quick_list.setObjectName("navigationQuick")
-        self.quick_list.setIconSize(QSize(20, 20))
-        self.quick_list.itemClicked.connect(self.activate_item)
-        self.panel.layout().insertWidget(2, self.quick_list)
-        for listing in (self.sidebar, self.quick_list):
-            listing.setContextMenuPolicy(Qt.CustomContextMenu)
-            listing.customContextMenuRequested.connect(lambda pos, listing=listing: self.pin_menu(listing, pos))
-        self.sidebar.itemClicked.connect(self.activate_item)
+        # Keep the original sidebar as the page registry for stack navigation.
+        # The drawer shows favorites, recents, and categories in one shared viewport.
+        self.panel.layout().removeWidget(self.sidebar)
+        self.sidebar.hide()
+        self.drawer_list = QListWidget(self.panel)
+        self.drawer_list.setObjectName("navigation")
+        self.drawer_list.setItemDelegate(NavigationDelegate(self.drawer_list))
+        self.drawer_list.setIconSize(QSize(20, 20))
+        self.drawer_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.drawer_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.drawer_list.itemClicked.connect(self.activate_item)
+        self.panel.layout().insertWidget(2, self.drawer_list, 1)
+        self.drawer_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.drawer_list.customContextMenuRequested.connect(
+            lambda pos: self.pin_menu(self.drawer_list, pos))
         self.keep_open = QCheckBox("Keep drawer open")
         self.keep_open.toggled.connect(self.set_sidebar_visible)
         self.panel.layout().addWidget(self.keep_open)
@@ -398,6 +404,11 @@ class Navigator(SidebarNavigator):
 
     def eventFilter(self, watched, event):
         if hasattr(self, "content"):
+            if (event.type() == QEvent.KeyPress and event.key() in (Qt.Key_Return, Qt.Key_Enter)
+                    and self.panel.isVisible() and isinstance(watched, QWidget)
+                    and (watched is self.panel or self.panel.isAncestorOf(watched))):
+                self.activate_first()
+                return True
             if watched is self.content and event.type() == QEvent.Resize:
                 self.position_drawer()
             if event.type() == QEvent.MouseButtonPress and self.drawer_open and not self.sidebar_visible():
@@ -430,6 +441,7 @@ class Navigator(SidebarNavigator):
         self.drawer_open = True
         self.fill_drawer()
         self.apply_navigation()
+        self.search.setFocus()
 
     def open_search(self):
         self.open_drawer()
@@ -467,9 +479,9 @@ class Navigator(SidebarNavigator):
             self.stack.currentWidget().setFocus()
 
     def activate_first(self):
-        for row in self.page_rows():
-            item = self.sidebar.item(row)
-            if not item.isHidden():
+        for row in range(self.drawer_list.count()):
+            item = self.drawer_list.item(row)
+            if item.data(PAGE_ROLE) is not None and not item.isHidden():
                 self.activate_item(item)
                 return
 
@@ -478,12 +490,16 @@ class Navigator(SidebarNavigator):
         aliases = {"iperf": "bandwidth throughput", "SCP": "file transfer ssh", "TFTP": "file transfer firmware",
                    "Network Map": "topology snmp", "Interfaces": "adapter nic ip configuration",
                    "ARP": "neighbors mac", "Ports": "scan tcp", "DNS Servers": "dns benchmark"}
-        self.quick_list.clear()
+        self.drawer_list.clear()
         if not query:
             for heading, titles in (("Favorites", self.favorites), ("Recent", self.recent)):
                 header = QListWidgetItem(heading.upper())
-                header.setFlags(Qt.NoItemFlags)
-                self.quick_list.addItem(header)
+                header.setFlags(Qt.ItemIsEnabled)
+                header.setData(SECTION_ROLE, heading)
+                header.setToolTip(heading + " — click to expand or collapse")
+                self.drawer_list.addItem(header)
+                if heading in self.collapsed_sections:
+                    continue
                 for title in titles:
                     for row in self.page_rows():
                         source = self.sidebar.item(row)
@@ -491,9 +507,7 @@ class Navigator(SidebarNavigator):
                             item = QListWidgetItem(title)
                             item.setIcon(source.icon())
                             item.setData(PAGE_ROLE, source.data(PAGE_ROLE))
-                            self.quick_list.addItem(item)
-        self.quick_list.setVisible(not query)
-        self.quick_list.setMaximumHeight(min(300, max(80, self.content.height() // 3)))
+                            self.drawer_list.addItem(item)
         heading, visible = None, False
         for row in range(self.sidebar.count()):
             item = self.sidebar.item(row)
@@ -507,6 +521,10 @@ class Navigator(SidebarNavigator):
                 visible |= match
         if heading is not None:
             heading.setHidden(not visible)
+        for row in range(self.sidebar.count()):
+            source = self.sidebar.item(row)
+            if not source.isHidden():
+                self.drawer_list.addItem(QListWidgetItem(source))
         self.position_drawer()
 
     def rebuild_rail(self):

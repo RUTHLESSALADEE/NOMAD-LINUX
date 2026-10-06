@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 
 from ..oui import format_mac
 from ..snmp import IP_ADDRESS, OBJECT_ID, oid_text, parse_oid
-from .model import AP, FIREWALL, HOST, PHONE, ROUTER, SWITCH, UNKNOWN
+from .model import AP, FIREWALL, HOST, PHONE, ROUTER, SWITCH, UNKNOWN, normalize_vtp_domain
 
 SYS_DESCR, SYS_OBJECT_ID, SYS_NAME = "1.3.6.1.2.1.1.1.0", "1.3.6.1.2.1.1.2.0", "1.3.6.1.2.1.1.5.0"
 IF_DESCR = "1.3.6.1.2.1.2.2.1.2"
@@ -239,12 +239,15 @@ def lldp_local_ports(rows):
 
 
 def lldp_management_addresses(rows):
-    """lldpRemManAddrTable, walked by one column: {(local port, remote index): IPv4 address}. The address is in the
+    """lldpRemManAddrTable, walked by one column: {(local port, remote index): [IPv4 addresses]}. The address is in the
     index (time mark, local port, remote index, address subtype, length, address bytes)."""
     addresses = {}
     for index in column(rows, LLDP_REM_MAN_ADDR_IF_SUBTYPE):
         if len(index) >= 9 and index[3] == 1 and index[4] == 4:
-            addresses.setdefault((index[1], index[2]), ".".join(str(number) for number in index[5:9]))
+            address = ".".join(str(number) for number in index[5:9])
+            found = addresses.setdefault((index[1], index[2]), [])
+            if address not in found:
+                found.append(address)
     return addresses
 
 
@@ -271,11 +274,11 @@ def lldp_neighbors(rows, local_ports, interfaces, management_addresses):
             port = text(row.get(8)) or (text(port_id) if port_id is not None and is_printable(port_id.value) else "")
         local_port = local_ports.get(local) or interfaces.get(local, f"port {local}")
         descr = text(row.get(10))
-        neighbors.append(Neighbor(local_port=local_port, name=name, port=port,
-                                  address=management_addresses.get((local, remote), ""),
-                                  platform=descr.splitlines()[0][:80] if descr else "",
-                                  capabilities=lldp_capabilities(row.get(12)), protocol="lldp",
-                                  chassis_mac=chassis_mac))
+        for address in management_addresses.get((local, remote), []) or [""]:
+            neighbors.append(Neighbor(local_port=local_port, name=name, port=port, address=address,
+                                      platform=descr.splitlines()[0][:80] if descr else "",
+                                      capabilities=lldp_capabilities(row.get(12)), protocol="lldp",
+                                      chassis_mac=chassis_mac))
     return neighbors
 
 
@@ -297,7 +300,7 @@ def usable_vlan(value, highest=4094):
 def vtp_domain(rows):
     """(VTP domain name, its mode here: server, client, transparent or off) from managementDomainTable."""
     for _, row in sorted(columns(rows, VTP_DOMAIN_ENTRY).items()):
-        name = text(row.get(2))
+        name = normalize_vtp_domain(text(row.get(2)))
         mode = VTP_MODES.get(row[3].value, "") if 3 in row else ""
         if name or mode:
             return name, mode

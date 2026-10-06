@@ -4,9 +4,7 @@ from PyQt5.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit
 
 from ..ipam.placement import AUTO, SCOPES
 from ..ipam.roles import ROLE_HELP, ROLE_NAMES
-from ..ipam.store import IpamError
 from ..ipam.vlans import MAX_VLAN
-from .common import set_hint
 from .ipam_dialogs import _EditDialog
 
 ANY_DEVICE = ""
@@ -65,7 +63,7 @@ class ScopeDialog(_EditDialog):
 
 
 class MoveDialog(_EditDialog):
-    """Plan moving a subnet: from the VLAN it's linked to (and the device it's on), to another VLAN (and device)."""
+    """Plan moving a subnet between VLANs or devices, with an optional destination VLAN."""
 
     def __init__(self, parent, placements, vlans, network_id, row, network_map=None):
         super().__init__(parent, f"Move {row.cidr}")
@@ -74,7 +72,8 @@ class MoveDialog(_EditDialog):
         devices = network_map.devices if network_map is not None else {}
         intro = QLabel(f"<b>{row.cidr}</b>{f' ({row.subnet.name})' if row.subnet and row.subnet.name else ''}. "
                        "While it moves, the page expects it at the old place or the new one, and still flags it if "
-                       "it's advertised from both. Complete Move relinks it on the VLANs page.")
+                       "it's advertised from both. Complete Move updates its VLAN links, or leaves it without a "
+                       "VLAN for a routed or point-to-point move.")
         intro.setWordWrap(True)
         self.layout.insertWidget(0, intro)
         self.from_combo = QComboBox()
@@ -93,6 +92,9 @@ class MoveDialog(_EditDialog):
         self.to_domain = QComboBox()
         for domain in self.domains:
             self.to_domain.addItem(domain.name, domain.id)
+        self.to_domain.addItem("(no VLAN: routed / point-to-point)", "")
+        if not row.planned:
+            self.to_domain.setCurrentIndex(self.to_domain.count() - 1)
         self.to_vlan = QSpinBox()
         self.to_vlan.setRange(1, MAX_VLAN)
         self.to_vlan_label = QLabel()
@@ -102,12 +104,14 @@ class MoveDialog(_EditDialog):
         to_row.addWidget(self.to_vlan)
         to_row.addWidget(self.to_vlan_label, 1)
         self.to_device = QComboBox()
+        self.to_device.setEditable(True)
         self.to_device.addItem("(any device)", ANY_DEVICE)
         for key, device in sorted(devices.items(), key=lambda item: item[1].label.lower()):
             if device.interfaces_l3 or device.vlans:
                 self.to_device.addItem(device.label, key)
         self.to_device.setToolTip("The device it's moving to, when it matters: the check that it's done looks for it "
-                                  "there (a VLAN number can be the same at two sites).")
+                                  "there (a VLAN number can be the same at two sites). Required for a move without "
+                                  "a VLAN. Choose a mapped device or type its device key when no map is open.")
         self.when_input = QLineEdit()
         self.when_input.setPlaceholderText("When (a date or change window), optional")
         self.note_input = QLineEdit()
@@ -121,13 +125,14 @@ class MoveDialog(_EditDialog):
         self.finish_layout()
         self.to_domain.currentIndexChanged.connect(self.show_vlan)
         self.to_vlan.valueChanged.connect(self.show_vlan)
-        if not self.domains:
-            set_hint(self.error_label, "There's no VLAN domain for this network yet: make one on the VLANs page.",
-                     "error")
         self.show_vlan()
 
     def show_vlan(self):
         domain_id = self.to_domain.currentData()
+        self.to_vlan.setEnabled(bool(domain_id))
+        if not domain_id:
+            self.to_vlan_label.setText("Choose the target device below; no VLAN link will be added.")
+            return
         vlan = self.vlans.vlan(domain_id, self.to_vlan.value()) if domain_id else None
         if vlan is None:
             self.to_vlan_label.setText("(new: added to the domain when the move is completed)")
@@ -135,11 +140,13 @@ class MoveDialog(_EditDialog):
             self.to_vlan_label.setText(vlan.name + (f", carrying {', '.join(vlan.subnets)}" if vlan.subnets else ""))
 
     def apply(self):
-        if not self.domains:
-            raise IpamError("There's no VLAN domain for this network yet: make one on the VLANs page.")
         from_domain, from_vlan = self.from_combo.currentData()
+        target_device = self.to_device.currentData()
+        if self.to_device.currentText() != self.to_device.itemText(self.to_device.currentIndex()):
+            target_device = self.to_device.currentText().strip()
         return self.placements.plan_move(
             self.network_id, self.row.cidr, from_domain_id=from_domain, from_vlan=from_vlan,
             from_device=self.from_device.currentData(), to_domain_id=self.to_domain.currentData(),
-            to_vlan=self.to_vlan.value(), to_device=self.to_device.currentData(), planned_for=self.when_input.text(),
+            to_vlan=self.to_vlan.value() if self.to_domain.currentData() else 0,
+            to_device=target_device or "", planned_for=self.when_input.text(),
             note=self.note_input.text())

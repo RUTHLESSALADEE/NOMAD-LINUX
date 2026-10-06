@@ -111,10 +111,11 @@ class Difference:
     def options(self):
         """[(choice, label)] the user picks from."""
         if self.summary is None:
-            return [(DETAIL, "Add it"), (SKIP, "Leave it out")]
+            return [(DETAIL, "Import subnet from Detailed Info"), (SKIP, "Skip this subnet")]
         if self.detail is None:
-            return [(SUMMARY, "Add it"), (SKIP, "Leave it out")]
-        return [(SUMMARY, "Use the summary's"), (DETAIL, "Use the detailed info's"), (SKIP, "Leave it out")]
+            return [(SUMMARY, "Import subnet from Summary"), (SKIP, "Skip this subnet")]
+        return [(SUMMARY, "Import subnet using Summary"), (DETAIL, "Import subnet using Detailed Info"),
+                (SKIP, "Skip this subnet")]
 
     def describe(self):
         if self.summary is None:

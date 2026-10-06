@@ -6,8 +6,8 @@ import pytest
 from netmap_fakes import (ACC1_MAC, CORE_MAC, FW_MAC, LAB_MACS, PC1_MAC, PHONE_MAC, PRINTER_MAC, FakeAgentClient,
                           build_network)
 
-from nomad.netmap.crawl import CrawlSettings, Crawler
-from nomad.netmap.model import FIREWALL, NO_SNMP, ROUTER, SNMP, SWITCH, UNREACHABLE
+from nomad.netmap.crawl import NO_ANSWER, PINGS_NO_SNMP, CrawlSettings, Crawler
+from nomad.netmap.model import FIREWALL, NEIGHBOR, NO_SNMP, ROUTER, SNMP, SWITCH, UNREACHABLE
 
 
 def crawl(network, **options):
@@ -84,6 +84,65 @@ def test_unreachable_seed():
     network_map = crawl(network, seeds=["10.9.9.9"])
     assert list(network_map.devices) == ["ip:10.9.9.9"]
     assert network_map.devices["ip:10.9.9.9"].source == UNREACHABLE
+
+
+@pytest.mark.parametrize("answers", [(), ("10.0.0.5",), ("10.0.0.6",)])
+def test_crawl_pings_every_lldp_address_before_marking_device_unreachable(answers):
+    network = build_network()
+    del network.devices["10.0.0.5"]  # Neither management address answers SNMP
+    network.pingable.discard("10.0.0.5")
+    network.pingable.update(answers)
+    network.devices["10.0.0.1"].lldp(3, "TenGigabitEthernet1/0/3", 1, "pa-fw1", "ethernet1/1",
+                                      "10.0.0.6", "00-1B-17-00-00-05", 0x08, "Palo Alto PA-3220")
+    pinged = []
+
+    def ping(address):
+        pinged.append(address)
+        return network.ping(address)
+
+    crawler = Crawler(CrawlSettings(seeds=["10.0.0.1"], trace=False), client_factory=network.client,
+                      pinger=ping)
+    network_map = crawler.run()
+    firewall = network_map.devices["pa-fw1"]
+    assert {"10.0.0.5", "10.0.0.6"} <= set(pinged)
+    assert firewall.addresses == ["10.0.0.5", "10.0.0.6"]
+    assert firewall.source == (NO_SNMP if answers else UNREACHABLE)
+    assert firewall.error == (PINGS_NO_SNMP if answers else NO_ANSWER)
+    if answers:
+        assert firewall.mgmt_ip == answers[0]
+    assert len(network_map.links_of("pa-fw1")) == 1
+    assert crawler.counts["unreachable"] == (0 if answers else 1)
+
+
+@pytest.mark.parametrize("first", [NO_ANSWER, PINGS_NO_SNMP])
+def test_a_failed_address_does_not_override_a_ping_reply_or_pending_address(first):
+    crawler = Crawler(CrawlSettings(seeds=[], trace=False))
+    device = crawler.add_device("fw", mgmt_ip="10.0.0.5")
+    crawler.aliases["10.0.0.6"] = "fw"
+    crawler.asked.update(["10.0.0.5", "10.0.0.6"])
+    crawler.record("10.0.0.5", 1, "fw", None, first)
+    assert device.source == (NO_SNMP if first == PINGS_NO_SNMP else NEIGHBOR)
+    crawler.record("10.0.0.6", 1, "fw", None, NO_ANSWER)
+    assert device.source == (NO_SNMP if first == PINGS_NO_SNMP else UNREACHABLE)
+    assert crawler.counts["no_snmp"] == int(first == PINGS_NO_SNMP)
+    assert crawler.counts["unreachable"] == int(first == NO_ANSWER)
+
+
+@pytest.mark.parametrize("responds", [False, True])
+def test_a_failed_device_read_still_checks_ping(responds):
+    pinged = []
+
+    def client(*args, **kwargs):
+        raise ValueError("Unexpected SNMP response")
+
+    def ping(address):
+        pinged.append(address)
+        return responds
+
+    network_map = Crawler(CrawlSettings(seeds=["10.0.0.5"], trace=False), client_factory=client,
+                          pinger=ping).run()
+    assert pinged == ["10.0.0.5"]
+    assert network_map.devices["ip:10.0.0.5"].source == (NO_SNMP if responds else UNREACHABLE)
 
 
 def test_same_device_at_two_addresses_is_one_device():

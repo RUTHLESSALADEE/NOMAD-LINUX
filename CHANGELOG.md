@@ -6,6 +6,26 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.19.0] - 2026-10-05
+
+### Added
+
+- **Export SSH Sessions to SecureCRT** (File menu): XML with session folders, hosts, ports, usernames, notes, key paths and saved SSH passwords. Passwords use SecureCRT's salted encryption format and the destination's configuration passphrase, entered and confirmed during export. NOMAD unlocks its saved credentials when needed; unreadable credentials stop the export without replacing an existing file. Private key files and saved key passphrases are excluded. Import into SecureCRT was verified manually.
+- **Export / Import NOMAD Terminal Settings and Sessions** (File menu): password-protected portable backups of all saved sessions and credentials, empty folders, recent connections, command buttons, highlighting, Terminal/SCP preferences and text scale. Import validates the backup before replacement confirmation, protects credentials using the destination's Windows account and current NOMAD master password, and rolls back failed saves. Live connections stay open; private keys and logs remain external files.
+- **IP address context actions** across tables, text, labels and map items: open terminal or file sessions, browse, diagnose, show in IPAM or on the map, and copy the address. Existing context menus keep their own actions; the clicked cell or text line supplies the target. IPv6 web addresses are formatted correctly.
+- **Subnet moves without a VLAN:** choose a routed or point-to-point destination and its target device. Completing the move removes the old VLAN link without creating a destination VLAN link; move checks distinguish routed locations from VLAN interfaces.
+
+### Changed
+
+- The tool drawer uses one scrolling list for Favorites, Recent and tool categories. Favorites and Recent collapse independently. Opening the drawer focuses search, and Enter activates the first visible tool in drawer order.
+- VLAN tables and check findings have context menus for their existing actions. Escape clears VLAN highlighting on the map, or cancels a drawing in progress.
+
+### Fixed
+
+- Workbook import keeps subnets found in only Summary or Detailed Info when a bulk source preference is chosen. Those subnets default to import from the available section; conflicting entries still require a choice, and individual subnets can be skipped.
+- Network discovery tries all LLDP management addresses before marking a device unreachable. A failed address no longer overrides a ping reply or another pending address; device-read failures still check ping, status counters follow the final outcome, and preview address lists are copied independently.
+- VLAN highlighting respects domain boundaries and requires a VLAN to exist on a switch before treating a trunk's allowed list as carrying it. Unset VTP-domain placeholders are normalized consistently.
+
 ## [1.18.0] - 2026-10-05
 
 ### Added

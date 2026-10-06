@@ -12,6 +12,7 @@ passphrase apart from a right one.
 """
 import hashlib
 import os
+import tempfile
 import xml.etree.ElementTree as ElementTree
 from dataclasses import dataclass, field
 
@@ -76,7 +77,7 @@ def decrypt_password(stored, passphrase=""):
 
 
 def encrypt_password(password, passphrase="", salt=None):
-    """SecureCRT's "03:" format (or "02:" without a salt). For tests; NOMAD never writes SecureCRT files."""
+    """SecureCRT's "03:" format (or "02:" without a salt)."""
     plain = password.encode("utf-8")
     plain = len(plain).to_bytes(4, "little") + plain + hashlib.sha256(plain).digest()
     plain += os.urandom(-len(plain) % 16)
@@ -232,3 +233,68 @@ def import_securecrt(store, export, protect=None):
     if added:
         store.save()
     return added, saved
+
+
+def write_securecrt_export(path, sessions, reveal=None, passphrase=""):
+    """Write SSH import XML. With reveal, encrypt saved passwords using the destination config passphrase.
+
+    No configuration-wide security settings are changed by the XML. The destination must use this passphrase.
+    Private key contents and saved private key passphrases are not exported.
+    """
+    if reveal is not None and not passphrase:
+        raise SecureCrtError("Enter the destination SecureCRT configuration passphrase to encrypt saved passwords.")
+    root = ElementTree.Element("VanDyke", version="3.0")
+    sessions_key = ElementTree.SubElement(root, "key", name="Sessions")
+    folders = {"": sessions_key}
+    used = {}
+    count = 0
+    sessions = [session for session in sessions if session.protocol == SSH]
+    # Create folders first so session names cannot shadow a later folder.
+    for session in sessions:
+        folder = normalize_folder(session.folder)
+        parent = sessions_key
+        parts = folder.split("/") if folder else []
+        for index, part in enumerate(parts):
+            prefix = "/".join(parts[:index + 1])
+            if prefix not in folders:
+                folders[prefix] = ElementTree.SubElement(parent, "key", name=part)
+            parent = folders[prefix]
+    for session in sessions:
+        folder = normalize_folder(session.folder)
+        parent = folders[folder]
+        # SecureCRT stores folders and sessions in the same namespace.
+        taken = used.setdefault(folder, {child.get("name", "").lower() for child in parent})
+        name = session.name
+        suffix = 2
+        while name.lower() in taken or (not folder and name.lower() == "default"):
+            name = f"{session.name} ({suffix})"
+            suffix += 1
+        taken.add(name.lower())
+        key = ElementTree.SubElement(parent, "key", name=name)
+        password = (encrypt_password(reveal(session.saved_password), passphrase, salt=os.urandom(16))
+                    if reveal is not None and session.saved_password else "")
+        values = [("string", "Protocol Name", "SSH2"), ("dword", "Is Session", 1),
+                  ("string", "Hostname", session.host), ("dword", "[SSH2] Port", session.port),
+                  ("string", "Username", session.username), ("dword", "Session Password Saved", int(bool(password)))]
+        if password:
+            values.append(("string", "Password V2", password))
+        if session.auth == AUTH_KEY:
+            values.extend([("dword", "Use Global Public Key", 0),
+                           ("string", "Identity Filename V2", session.key_file)])
+        for tag, name, value in values:
+            ElementTree.SubElement(key, tag, name=name).text = str(value)
+        description = ElementTree.SubElement(key, "array", name="Description")
+        for line in session.notes.splitlines():
+            ElementTree.SubElement(description, "string").text = line
+        count += 1
+    ElementTree.indent(root)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=os.path.dirname(os.path.abspath(path)), delete=False) as file:
+            temporary = file.name
+            ElementTree.ElementTree(root).write(file, encoding="utf-8", xml_declaration=True)
+        os.replace(temporary, path)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+    return count

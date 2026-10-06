@@ -23,6 +23,7 @@ from .dns_servers_tab import DnsServersTab
 from .iperf_tab import IperfTab
 from .integration import Integration
 from .ipam_tab import IpamTab
+from .ip_menu import IpContextMenus
 from .latency_tab import LatencyTab
 from .lookup_tab import LookupTab
 from .mtu_tab import MtuTab
@@ -48,6 +49,7 @@ from .tftp_tab import TftpTab
 from .theme import COLORS, DEFAULT_TEXT_SCALE, TEXT_SCALES, set_text_scale
 from .traceroute_tab import TracerouteTab
 from .terminal_tab import TerminalTab
+from .terminal_transfer import export_securecrt, export_terminal, import_terminal
 from .vlan_tab import VlanTab
 from .wake_tab import WakeTab
 from .web_check_tab import WebCheckTab
@@ -87,6 +89,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{APP_NAME} {__version__} - {APP_FULL_NAME}" + (" (Administrator)" if self.admin else ""))
         self.resize(1180, 800)
         self.init_ui()
+        self.ip_context_menus = IpContextMenus(self)
         self.init_menus()
         self.restore_settings()
         # Windows logging off or restarting (for updates, say) with NOMAD open: it may never get to close the window
@@ -222,6 +225,10 @@ class MainWindow(QMainWindow):
                             lambda: self.show_terminal(self.terminal_tab.manager.import_from_putty))
         file_menu.addAction("Import Sessions from &SecureCRT...",
                             lambda: self.show_terminal(self.terminal_tab.manager.import_from_securecrt))
+        file_menu.addAction("Export SSH Sessions to SecureCRT...", lambda: export_securecrt(self))
+        file_menu.addSeparator()
+        file_menu.addAction("Export NOMAD Terminal Settings and Sessions...", lambda: export_terminal(self))
+        file_menu.addAction("Import NOMAD Terminal Settings and Sessions...", lambda: import_terminal(self))
         file_menu.addSeparator()
         if not self.admin:
             file_menu.addAction("Restart as &Administrator", self.restart_as_admin)

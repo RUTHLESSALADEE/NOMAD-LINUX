@@ -2,7 +2,7 @@
 
 **Network Operations, Monitoring And Diagnostics**: one Windows app to set up network adapters, troubleshoot networks, talk to devices and keep track of IP addresses. (Formerly NIC Manager, with the RADAR subnet sweep and the Latenct latency monitor built in.)
 
-**Version 1.18.0** adds a compact favorites rail, searchable tool drawer, reorganized categories and function-specific icons. See the [changelog](CHANGELOG.md#1180---2026-10-05).
+**Version 1.19.0** adds encrypted terminal backups, SecureCRT password exports, IP address context actions and subnet moves without a VLAN, with improvements to navigation, workbook imports and network mapping. See the [changelog](CHANGELOG.md#1190---2026-10-05).
 
 ![The Interfaces page](docs/screenshots/interfaces.png)
 
@@ -156,6 +156,8 @@ The **SNMP Config** page (under SNMP) builds the Cisco IOS / IOS-XE configuratio
 **Sessions**
 
 - Save sessions in folders, and import them from PuTTY or a SecureCRT export.
+- **File > Export SSH Sessions to SecureCRT...** writes an XML file for SecureCRT's **Tools > Import Settings from XML File**. Includes folders, hosts, ports, usernames, notes, private key paths and saved SSH passwords. When passwords are present, unlock NOMAD if needed and enter/confirm the destination SecureCRT configuration passphrase. Passwords are encrypted in SecureCRT's salted `03:` format; the destination must use the same configuration passphrase before importing (set one in SecureCRT first if needed). The export does not change SecureCRT's global security settings. Private key contents and saved key passphrases are excluded.
+- **File > Export / Import NOMAD Terminal Settings and Sessions...** saves or restores a password-protected `.nomad` backup: all saved sessions and credentials, empty folders, recent connections, command buttons, highlighting, Terminal/SCP preferences and text scale. Import replaces these settings after confirmation and protects credentials with the destination installation's Windows account and current NOMAD master password. Keep the backup password to restore on another computer. Private keys and logs remain external files; live connections are not part of the backup.
 - **Quick connect** takes `admin@10.0.0.1`, `telnet 10.0.0.5`, `raw 10.0.0.9:9100` or `COM3:115200`.
 - **Recent** at the top of the list keeps your last 10 connections.
 - **Layout** tiles sessions side by side, stacked, or in a 2 × 2 or 3 × 2 grid. Drag tabs between panes and windows.

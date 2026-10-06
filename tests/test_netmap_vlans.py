@@ -42,6 +42,24 @@ def test_svi_and_subinterface_names():
 
 # --------------------------------------------------------------------- Parsing what switches say
 
+@pytest.mark.parametrize("domain", ["", "(no vtp domain)", "NULL", "Local-Transparent", " null ", None])
+def test_unset_vtp_domains_share_vlan_group_and_focus(domain):
+    network_map = NetworkMap()
+    network_map.devices = {
+        "a": MapDevice("a", "a", vtp_domain=domain, vlans=[[10, "USERS"]]),
+        "b": MapDevice("b", "b", vtp_domain="", vlans=[[10, "USERS"]]),
+        "c": MapDevice("c", "c", vtp_domain="CORP", vlans=[[10, "USERS"]]),
+    }
+    items = vlans.map_vlans(network_map)
+    assert len(items) == 2
+    assert items[0].domain == "" and items[0].switches == ["a", "b"]
+    assert vlans.domains(network_map) == ["", "CORP"]
+    assert set(vlans.focus(network_map, 10, domain or "").devices) == {"a", "b"}
+    switch = Device("sw", "Cisco IOS", CISCO_SWITCH)
+    switch.vtp(domain or "", 3)
+    assert collect.vtp_domain(rows(switch)) == ("", "transparent")
+
+
 def test_vtp_domain_names_and_ports_from_cisco_mibs():
     switch = Device("sw1", "Cisco IOS", CISCO_SWITCH)
     switch.vtp("CORP", 3)
@@ -152,6 +170,39 @@ def test_link_known_at_one_end_only_counts_that_end():
     sw1 = network_map.devices["sw1"]
     assert vlans.carries(vlans.port_info(sw1, "TenGigabitEthernet1/0/1"), 30) == vlans.TAGGED
     assert vlans.carries(vlans.port_info(sw1, "Te1/0/1"), 40) == ""
+
+
+def test_highlight_does_not_treat_trunk_allowed_list_as_vlan_membership():
+    network_map = NetworkMap()
+    for key, domain, numbers in (("a", "CORP", [10]), ("b", "CORP", [20]),
+                                 ("c", "CORP", [20]), ("d", "OTHER", [10])):
+        network_map.devices[key] = MapDevice(
+            key, key, vtp_domain=domain, vlans=[[number, "USERS"] for number in numbers],
+            port_vlans={"Gi1": {"mode": "trunk", "allowed": "1-4094"}})
+    network_map.links = [Link("a", "Gi1", "b", "Gi1"), Link("b", "Gi1", "c", "Gi1"),
+                         Link("a", "Gi1", "d", "Gi1")]
+    item = next(item for item in vlans.map_vlans(network_map) if item.domain == "CORP" and item.vlan == 10)
+    assert item.switches == ["a"]
+    focused = vlans.focus(network_map, 10, "CORP")
+    assert set(focused.devices) == {"a"}
+    assert focused.links == {id(network_map.links[0]): vlans.ONE_END,
+                             id(network_map.links[2]): vlans.ONE_END}
+
+
+def test_highlight_does_not_promote_unknown_or_noncarrying_link_endpoint():
+    network_map = NetworkMap()
+    network_map.devices["a"] = MapDevice(
+        "a", "a", vlans=[[10, "USERS"]], port_vlans={"Gi1": {"mode": "access", "vlan": 10}})
+    network_map.devices["b"] = MapDevice("b", "b")
+    link = Link("a", "Gi1", "b", "Gi1")
+    network_map.links = [link]
+    focused = vlans.focus(network_map, 10, "")
+    assert set(focused.devices) == {"a"}
+    assert focused.links[id(link)] == vlans.ACCESS
+    network_map.devices["b"].port_vlans = {"Gi1": {"mode": "access", "vlan": 20}}
+    focused = vlans.focus(network_map, 10, "")
+    assert set(focused.devices) == {"a"}
+    assert focused.links[id(link)] == vlans.ONE_END
 
 
 def test_router_subinterfaces_count_in_linked_switches_domain():

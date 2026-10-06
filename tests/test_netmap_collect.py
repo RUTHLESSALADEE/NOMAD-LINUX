@@ -53,6 +53,16 @@ def test_lldp_neighbor_without_system_name_uses_chassis_mac():
     assert "station" in neighbor.capabilities
 
 
+def test_lldp_keeps_every_management_address():
+    device = Device("core", "", CISCO_SWITCH)
+    device.lldp(3, "Te1/0/3", 1, "fw", "eth1", "10.0.0.5")
+    device.lldp(3, "Te1/0/3", 1, "fw", "eth1", "10.0.0.6")
+    table = rows(device)
+    found = collect.lldp_neighbors(table, collect.lldp_local_ports(table), {},
+                                   collect.lldp_management_addresses(table))
+    assert [neighbor.address for neighbor in found] == ["10.0.0.5", "10.0.0.6"]
+
+
 def test_vlans_skip_reserved_and_inactive():
     device = Device("sw", "", CISCO_SWITCH)
     for vlan in (1, 10, 20, 1002, 1005):

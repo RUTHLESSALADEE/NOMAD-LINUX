@@ -18,7 +18,7 @@ from ..oui import format_mac, vendor
 from ..snmp import V2C, SnmpClient, SnmpError, parse_oid
 from ..snmpv3 import credential_from_json, credential_to_json, is_v3, users_from_json
 from . import collect, l3, vlans
-from .model import AP, HOST, KIND_NAMES, NETWORK_KINDS, NO_SNMP, PHONE, SERVER, SNMP, UNKNOWN, UNREACHABLE, Device, \
+from .model import AP, HOST, KIND_NAMES, NEIGHBOR, NETWORK_KINDS, NO_SNMP, PHONE, SERVER, SNMP, UNKNOWN, UNREACHABLE, Device, \
     Host, Link, NetworkMap, Trace, display_name, normalize_name, port_key, short_port
 
 log = logging.getLogger(__name__)
@@ -148,6 +148,7 @@ class Crawler:
         self.aliases = {}  # Address or normalized name -> device key
         self.tables = {}  # Device key -> DeviceTables, for placing hosts at the end
         self.asked = set()  # Addresses already asked (or queued)
+        self.completed = set()  # Visits recorded: don't mark a device down while another address is pending
         self.capabilities = {}  # Device key -> what its neighbors' CDP/LLDP say it is (router, switch...)
         # Names (normalized) that more than one device has: those devices are keyed by address, not found by name
         self.ambiguous = set()
@@ -217,6 +218,13 @@ class Crawler:
                     except Exception as crash:  # A bug reading one device shouldn't lose the whole map
                         log.exception("Reading %s failed", address)
                         tables, error = None, f"Couldn't read it: {crash}"
+                        if self.should_stop():
+                            error = STOPPED
+                        else:
+                            self.events("step", address, "Pinging")
+                            if self.pinger(address):
+                                self.events("log", f"{address}: {error}")
+                                error = PINGS_NO_SNMP
                     queue.extend(self.record(address, hops, key, tables, error))
                     changed = True
                     self.report_counts(len(running), len(queue))
@@ -257,6 +265,8 @@ class Crawler:
         """A copy of the devices and links found so far, for drawing while the crawl goes on."""
         snapshot = NetworkMap(seeds=list(self.map.seeds), started=self.map.started)
         snapshot.devices = {key: copy.copy(device) for key, device in self.map.devices.items()}
+        for device in snapshot.devices.values():
+            device.addresses = list(device.addresses)
         snapshot.links = [copy.copy(link) for link in self.map.links]
         for link in snapshot.links:
             link.protocols = list(link.protocols)
@@ -670,17 +680,28 @@ class Crawler:
 
     def record(self, address, hops, key, tables, error):
         """Put a visit's results on the map. Returns the neighbors to visit next as [(address, hops, key)]."""
+        self.completed.add(address)
         if tables is None:
             key = key or self.find(address) or f"ip:{address}"
             device = self.add_device(key, mgmt_ip=self.found_address(key, address))
             if error == STOPPED:
                 self.events("finished", address, "stopped")
             elif device.source != SNMP:
-                device.source = NO_SNMP if error == PINGS_NO_SNMP else UNREACHABLE
-                device.error = error
+                outcome = NO_SNMP if error == PINGS_NO_SNMP else UNREACHABLE
+                pending = any(ip not in self.completed and self.current_key(self.aliases.get(ip), ip) == key
+                              for ip in self.asked)
+                previous = device.source
+                if outcome == NO_SNMP:
+                    device.source, device.error = NO_SNMP, PINGS_NO_SNMP
+                    if self.found_address(key, address):
+                        device.mgmt_ip = address  # Prefer an address that actually answered ping
+                elif device.source != NO_SNMP and not pending:
+                    device.source, device.error = UNREACHABLE, error
                 device.hops = hops
-                self.counts["no_snmp" if device.source == NO_SNMP else "unreachable"] += 1
-                self.events("finished", address, device.source)
+                if previous != device.source:
+                    for source, counter in ((NO_SNMP, "no_snmp"), (UNREACHABLE, "unreachable")):
+                        self.counts[counter] += int(device.source == source) - int(previous == source)
+                self.events("finished", address, outcome)
                 self.events("log", f"{device.label}: {error}")
             return []
 
@@ -708,6 +729,8 @@ class Crawler:
             self.merge(key, existing)  # Found under two names (a neighbor's view, and its own sysName)
             key = existing
         device = self.add_device(key)
+        if device.source in (NO_SNMP, UNREACHABLE):
+            self.counts["no_snmp" if device.source == NO_SNMP else "unreachable"] -= 1
         answered_at = self.found_address(key, address)
         if answered_at:  # Where it answered SNMP, over an address a neighbor advertised (which may not answer)
             device.mgmt_ip = answered_at
@@ -771,6 +794,10 @@ class Crawler:
                 self.aliases.setdefault(address, other)
             other_device = self.add_device(other, name=display_name(neighbor.name), mgmt_ip=neighbor.address,
                                            platform=neighbor.platform)
+            if neighbor.address:
+                self.aliases.setdefault(neighbor.address, other)
+                if other_device.source != SNMP and neighbor.address not in other_device.addresses:
+                    other_device.addresses.append(neighbor.address)
             if fresh:  # What the map says it is, if it's on it (an access point's port isn't an uplink)
                 other_device.kind = found_kind
                 if on_map:  # What the crawl found it to be before (the correction goes back on at the end)
@@ -810,6 +837,9 @@ class Crawler:
                     self.events("log", f"Not asking {name}: {why_not}")
                 continue
             self.asked.add(address)
+            if other_device.source == UNREACHABLE:
+                other_device.source, other_device.error = NEIGHBOR, ""
+                self.counts["unreachable"] -= 1
             next_visits.append((address, hops + 1, other))
         return next_visits
 

@@ -5,7 +5,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
 from netmap_fakes import LAB_MACS, PC1_MAC, build_network  # noqa: E402
-from PyQt5.QtCore import QRectF, QSettings, pyqtSignal  # noqa: E402
+from PyQt5.QtCore import QRectF, QSettings, Qt, pyqtSignal  # noqa: E402
+from PyQt5.QtTest import QTest  # noqa: E402
 from PyQt5.QtWidgets import QApplication, QWidget  # noqa: E402
 
 from nomad.netmap import export, store  # noqa: E402
@@ -65,6 +66,46 @@ def test_showing_a_map(tab, crawled, tmp_path):
             if key < other:
                 a, b = device_items[key].pos(), device_items[other].pos()
                 assert (a - b).manhattanLength() > 50
+
+
+@pytest.mark.parametrize("focus_widget", ["view", "find_input", "devices_table"])
+def test_escape_clears_vlan_highlight(tab, crawled, focus_widget):
+    tab.setParent(None)
+    tab.on_crawled(crawled)
+    tab.highlight_vlan(10)
+    tab.show()
+    if focus_widget == "devices_table":
+        tab.tabs.setCurrentWidget(tab.devices_table)
+    widget = getattr(tab, focus_widget)
+    widget.setFocus()
+    QApplication.processEvents()
+    assert tab.view.vlan_focus is not None
+    assert tab.vlan_bar.isVisible()
+
+    QTest.keyClick(widget, Qt.Key_Escape)
+
+    assert tab.vlan_shown is None
+    assert tab.view.vlan_focus is None
+    assert not tab.vlan_bar.isVisible()
+    tab.hide()
+
+
+def test_escape_cancels_link_drawing_before_clearing_vlan(tab, crawled):
+    tab.setParent(None)
+    tab.on_crawled(crawled)
+    tab.highlight_vlan(10)
+    tab.show()
+    assert tab.view.start_drawing("acc1")
+    QApplication.processEvents()
+
+    QTest.keyClick(tab.view, Qt.Key_Escape)
+
+    assert tab.view.drawing is None
+    assert tab.vlan_shown == (10, None)
+    QTest.keyClick(tab.view, Qt.Key_Escape)
+    assert tab.vlan_shown is None
+    assert tab.view.vlan_focus is None
+    tab.hide()
 
 
 def test_finding_a_host_opens_its_switch(tab, crawled):

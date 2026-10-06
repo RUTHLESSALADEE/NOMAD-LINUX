@@ -186,11 +186,62 @@ def test_placement_and_moves_through_the_tribe(server, tmp_path):
         placements.update_move(move.id, note="too late")
     alice.sync()
     assert TeamVlanStore(alice).vlan(domain.id, 20).subnets == ["10.0.0.0/24"]
+    routed = placements.plan_move(network.id, "10.0.0.0/24", from_domain_id=domain.id, from_vlan=20,
+                                  to_device="r2")
+    placements.complete_move(routed.id)
+    bob.sync()
+    assert bob_placements.move(routed.id).status == DONE
+    assert TeamVlanStore(bob).vlan(domain.id, 20).subnets == []
     alice.close()
     offline = TeamPlacementStore(offline_store(server, tmp_path))
     assert offline.placement(network.id, "10.0.0.0/24").scope == LOCAL  # Readable offline
     with pytest.raises(ServerUnreachable, match="can't be changed right now"):
         offline.set_placement(network.id, "10.0.0.0/24", ADVERTISED)
+
+
+@pytest.mark.parametrize("cidr,prefix", [("10.9.0.0/31", 31), ("10.9.0.0/24", 24)])
+def test_move_without_vlan(local, cidr, prefix):
+    network = local.add_network("Routed")
+    subnet = local.add_subnet(network.id, cidr)
+    local.set_address(network.id, "10.9.0.1", name="router")
+    placements, vlans = PlacementStore(local), VlanStore(local)
+    move = placements.plan_move(network.id, cidr, from_device="old", to_device="new")
+    network_map = NetworkMap()
+    network_map.devices["old"] = Device("old", "old", interfaces_l3=[["10.9.0.1", prefix, "Gi0/1"]])
+    network_map.devices["new"] = Device("new", "new", interfaces_l3=[["10.9.0.1", prefix, "Vlan10"]])
+
+    def check():
+        row = next(row for row in evaluate(network_map, local, vlans, placements, network.id) if row.cidr == cidr)
+        return move_check(row, move, network_map)
+
+    assert not check()[0] and "no VLAN" in check()[1]
+    network_map.devices["new"].interfaces_l3 = [["10.9.0.1", prefix, "Gi0/2"]]
+    assert not check()[0] and "still at the old place" in check()[1]
+    network_map.devices["old"].interfaces_l3 = []
+    assert check()[0]
+    placements.complete_move(move.id)
+    assert placements.move(move.id).status == DONE and vlans.domains() == []
+    assert local.subnets(network.id)[0].id == subnet.id
+    assert local.address(network.id, "10.9.0.1").name == "router"
+
+
+def test_move_from_vlan_to_routed(local):
+    network = local.add_network("Lab")
+    cidr = "10.9.0.0/24"
+    local.add_subnet(network.id, cidr)
+    vlans, placements = VlanStore(local), PlacementStore(local)
+    domain = vlans.add_domain("Site", network.id)
+    vlans.set_vlan(domain.id, 10, subnets=[cidr])
+    with pytest.raises(IpamError, match="device"):
+        placements.plan_move(network.id, cidr, from_domain_id=domain.id, from_vlan=10)
+    with pytest.raises(IpamError, match="VLAN and domain"):
+        placements.plan_move(network.id, cidr, to_domain_id=domain.id, to_device="r2")
+    with pytest.raises(IpamError, match="already"):
+        placements.plan_move(network.id, cidr, from_device="r2", to_device=" r2 ")
+    move = placements.plan_move(network.id, cidr, from_domain_id=domain.id, from_vlan=10, to_device="r2")
+    placements.complete_move(move.id)
+    assert vlans.vlan(domain.id, 10).subnets == []
+    assert [vlan.vlan for vlan in vlans.vlans(domain.id)] == [10]
 
 
 def test_watch_notes_subnets_that_move():

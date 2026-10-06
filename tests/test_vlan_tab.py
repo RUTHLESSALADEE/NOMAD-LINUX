@@ -202,6 +202,78 @@ def test_map_vlans_tab_and_highlight(map_page):
     assert "Access VLAN 10, voice VLAN 20" in port_html(tab.network_map, "sw1", "Gi1/0/2")
 
 
+def test_map_highlight_fades_switch_without_vlan_even_when_trunk_allows_it(map_page):
+    tab = map_page
+    network_map = crawl(two_switches())
+    switch = network_map.devices["sw2"]
+    switch.vlans = [item for item in switch.vlans if item[0] != 30]
+    switch.port_vlans["Gi1/0/5"]["vlan"] = 20
+    switch.port_vlans["Te1/1/1"]["allowed"] = "1-4094"
+    tab.on_crawled(network_map)
+    item = next(item for item in tab.vlan_panel.items if item.vlan == 30)
+    assert item.switches == ["sw1"]
+    tab.highlight_vlan(30, item.domain)
+    devices = {item.key: item for item in tab.view.scene().items() if isinstance(item, DeviceItem)}
+    assert devices["sw1"].opacity() == 1.0
+    assert devices["sw2"].opacity() == FADED
+    [link] = [item for item in tab.view.scene().items() if isinstance(item, LinkItem)]
+    assert link.vlan_kind == map_vlans.ONE_END
+
+
+@pytest.mark.parametrize("action_text, signal_name", [
+    ("Highlight on Map", "highlight_requested"),
+    ("Show on VLANs Page", "vlans_page_requested"),
+    ("Add to VLAN Database...", "add_to_database_requested"),
+])
+def test_map_vlan_context_menu_uses_right_clicked_row(map_page, monkeypatch, action_text, signal_name):
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtWidgets import QMenu
+    tab = map_page
+    tab.on_crawled(crawl(two_switches()))
+    panel = tab.vlan_panel
+    tab.tabs.setCurrentWidget(panel)
+    tab.show()
+    QApplication.processEvents()
+    panel.table.sortItems(1, Qt.DescendingOrder)
+    panel.table.selectRow(0)
+    cell = panel.table.item(2, 0)
+    target = cell.data_object
+    received = []
+    getattr(panel, signal_name).disconnect()
+    getattr(panel, signal_name).connect(lambda *args: received.append(args))
+
+    def choose(menu, position):
+        assert panel.selected_item() is target
+        return next(action for action in menu.actions() if action.text() == action_text)
+
+    monkeypatch.setattr(QMenu, "exec_", choose)
+    assert panel.table.contextMenuPolicy() == Qt.CustomContextMenu
+    panel.table.customContextMenuRequested.emit(panel.table.visualItemRect(cell).center())
+    assert received == ([()] if signal_name == "add_to_database_requested" else [(target.vlan, target.domain)])
+
+
+def test_map_checks_context_menu_shows_clicked_finding_and_expands(map_page, monkeypatch):
+    from PyQt5.QtWidgets import QMenu
+    tab = map_page
+    tab.on_crawled(crawl(two_switches()))
+    panel = tab.vlan_panel
+    tab.tabs.setCurrentWidget(panel)
+    tab.show()
+    QApplication.processEvents()
+    cell = panel.checks.item(0, 0)
+    finding = cell.data_object
+    received = []
+    panel.show_requested.connect(lambda *args: received.append(args))
+    chosen_text = "Show on Map"
+    monkeypatch.setattr(QMenu, "exec_", lambda menu, position:
+                        next(action for action in menu.actions() if action.text() == chosen_text))
+    panel.checks.customContextMenuRequested.emit(panel.checks.visualItemRect(cell).center())
+    assert received == [(finding.device, finding.port)]
+    chosen_text = "Expand Notes and Warnings"
+    panel.checks.customContextMenuRequested.emit(panel.checks.visualItemRect(cell).center())
+    assert panel.expand_checks_button.isChecked()
+
+
 def test_stop_highlighting_on_the_menus(map_page):
     from PyQt5.QtWidgets import QMenu
     tab = map_page

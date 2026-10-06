@@ -396,7 +396,8 @@ class PlacementTab(QWidget):
                 status = "OK" if row.found is not None or network_map is None else "Not on the map"
             move = ""
             if row.move is not None:
-                move = f"{MOVE_STATUSES[row.move.status]}: to VLAN {row.move.to_vlan}"
+                destination = f"VLAN {row.move.to_vlan}" if row.move.to_vlan else "no VLAN"
+                move = f"{MOVE_STATUSES[row.move.status]}: to {destination}"
             name = row.subnet.name if row.subnet else (f"(in {row.pool.cidr} {row.pool.name})".replace(" )", ")")
                                                        if row.pool is not None else "")
             values = [(row.cidr, (row.network.version, int(row.network.network_address), row.network.prefixlen)),
@@ -475,8 +476,8 @@ class PlacementTab(QWidget):
                 "<b>local</b> ones may be reused. The routing tables decide which, unless you set it (Role and "
                 "Scope). A subnet only covered by a summary counts as local.</p>"
                 "<p>To move a subnet to another VLAN or device: Plan Move, Start Move when the work begins, Read "
-                "Routes Again once it's done on the switches, Check Move, then Complete Move, which relinks it on the "
-                "VLANs page.</p>")
+                "Routes Again once it's done on the devices, Check Move, then Complete Move, which updates its "
+                "VLAN links. For a routed or point-to-point move, choose no VLAN and a target device.</p>")
 
     def row_html(self, row):
         escape = html.escape
@@ -562,7 +563,7 @@ class PlacementTab(QWidget):
         devices = self.network_map().devices if self.network_map() is not None else {}
 
         def end(domain_id, vlan, device):
-            text = f"VLAN {vlan} in {self.domain_name(domain_id)}" if vlan else "(not linked)"
+            text = f"VLAN {vlan} in {self.domain_name(domain_id)}" if vlan else "(no VLAN)"
             if device:
                 text += f" on {devices[device].label if device in devices else device}"
             return text
@@ -679,7 +680,8 @@ class PlacementTab(QWidget):
         if row is None or row.move is None:
             return
         done, why = move_check(row, row.move, self.network_map())
-        question = f"Complete moving {row.cidr} {self.move_text(row.move)}? It's relinked on the VLANs page."
+        result = "relinked on the VLANs page" if row.move.to_vlan else "kept without a destination VLAN link"
+        question = f"Complete moving {row.cidr} {self.move_text(row.move)}? It's {result}."
         if not done:
             question = f"The map doesn't show the move done ({why}).\n\n{question}"
         if QMessageBox.question(self, "Complete Move", question) != QMessageBox.Yes:
@@ -689,7 +691,7 @@ class PlacementTab(QWidget):
         except IpamError as error:
             self.report(error, "Completing the move")
             return
-        self.changed(f"Moved {row.cidr}: {MOVE_STATUSES[DONE].lower()}, and relinked on the VLANs page.")
+        self.changed(f"Moved {row.cidr}: {MOVE_STATUSES[DONE].lower()}, and {result}.")
 
     def read_routes_again(self):
         page = getattr(self.window, "netmap_tab", None)

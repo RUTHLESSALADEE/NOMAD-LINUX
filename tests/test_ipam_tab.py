@@ -1,14 +1,20 @@
 """The IP Addresses page: selecting each kind of subnet shows it without errors, and SSH/SCP to an address."""
 import os
+from unittest.mock import Mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
-from PyQt5.QtWidgets import QApplication, QMenu, QTreeWidgetItemIterator, QWidget  # noqa: E402
+from PyQt5.QtCore import Qt, QTimer  # noqa: E402
+from PyQt5.QtGui import QContextMenuEvent  # noqa: E402
+from PyQt5.QtTest import QTest  # noqa: E402
+from PyQt5.QtWidgets import QApplication, QMenu, QTreeWidgetItemIterator, QVBoxLayout, QWidget  # noqa: E402
 
 from nomad.ipam.store import USED, IpamStore  # noqa: E402
 from nomad.terminal.sessions import Session  # noqa: E402
 from nomad.ui.ipam_tab import LOCAL, IpamTab  # noqa: E402
+from nomad.ui.host_menu import HostActions  # noqa: E402
+from nomad.ui.ip_menu import IpContextMenus  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -126,3 +132,95 @@ def test_ssh_and_scp_use_the_saved_session(app, tmp_path):
     assert window.terminal_tab.opened == [("10.0.0.5", ["core-sw1"], "core-sw1", "Lab/Core - Mgmt", True)]
     assert window.scp_tab.opened == [("10.0.0.5", ["core-sw1"], "core-sw1", "Lab/Core - Mgmt", True)]
     store.close()
+
+
+@pytest.fixture
+def address_page(app, tmp_path):
+    store = IpamStore(str(tmp_path / "menus.db"), user="tester")
+    network = store.add_network("Lab")
+    store.add_subnet(network.id, "10.0.0.0/24", "LAN")
+    store.set_address(network.id, "10.0.0.5", USED, "core-sw1")
+    window = Window()
+    window.terminal_tab = SessionPage([])
+    window.scp_tab = SessionPage([])
+    layout = QVBoxLayout(window)
+    tab = IpamTab(window)
+    layout.addWidget(tab)
+    tab.local_store, tab.source, tab.network_id = store, LOCAL, network.id
+    tab.fill_tree()
+    tab.tree.setCurrentItem(tab.tree.topLevelItem(0))
+    tab.show_subnet()
+    window.resize(1400, 700)
+    window.show()
+    app.processEvents()
+    yield window, tab
+    window.close()
+    window.deleteLater()
+    store.close()
+
+
+def assert_address_actions(menu):
+    labels = [action.text() for action in menu.actions()]
+    assert {"Edit...", "Mark Used", "Copy", "SSH", "SCP", "History...", "SSH with PuTTY",
+            "Open http://10.0.0.5", "Open https://10.0.0.5", "Show in IPAM", "Show on Map",
+            "Open Telnet Session", "SNMP Details", "Monitor Latency", "Capture Traffic..."}.issubset(labels)
+    for label in ("Ping", "Traceroute", "Scan Ports"):
+        assert labels.count(label) == 1
+    assert not any(label.startswith("IP:") for label in labels)
+
+
+@pytest.mark.parametrize("column", [0, 3])
+@pytest.mark.parametrize("choice,method", [("SSH with PuTTY", "open_ssh"),
+                                          ("Open http://10.0.0.5", "open_web"),
+                                          ("Show on Map", "show_map"), ("Edit...", "edit_address")])
+def test_native_address_menu_has_all_actions_and_targets_clicked_row(address_page, monkeypatch, column,
+                                                                    choice, method):
+    window, tab = address_page
+    callback = Mock()
+    if method == "edit_address":
+        monkeypatch.setattr(tab, method, lambda: callback())
+    else:
+        monkeypatch.setattr(HostActions, method, callback)
+    tab.table.selectRow(6)  # Previously selected address must not be used for a right-click on another row.
+    point = tab.table.visualRect(tab.model.index(5, column)).center()
+    def choose(menu, position):
+        assert_address_actions(menu)
+        action = next(action for action in menu.actions() if action.text() == choice)
+        if method == "edit_address":
+            action.trigger()  # exec_() normally emits triggered for the existing directly wired actions.
+        return action
+    monkeypatch.setattr(QMenu, "exec_", choose)
+    tab.address_menu(point)
+    assert list(map(str, tab.selected_addresses())) == ["10.0.0.5"]
+    if method == "edit_address":
+        callback.assert_called_once_with()
+    elif method == "open_ssh":
+        callback.assert_called_once_with("10.0.0.5", ["core-sw1"])
+    elif method == "open_web":
+        callback.assert_called_once_with("10.0.0.5", "http")
+    else:
+        callback.assert_called_once_with("10.0.0.5")
+
+
+def test_real_ipam_context_event_preserves_menu_and_runs_added_action(app, address_page, monkeypatch):
+    window, tab = address_page
+    menus = IpContextMenus(window)
+    callback = Mock()
+    monkeypatch.setattr(HostActions, "show_map", callback)
+    captured = []
+    def choose():
+        menu = app.activePopupWidget()
+        captured.append(menu)
+        action = next(action for action in menu.actions() if action.text() == "Show on Map")
+        menu.setActiveAction(action)
+        QTest.keyClick(menu, Qt.Key_Return)
+    point = tab.table.visualRect(tab.model.index(5, 0)).center()
+    QTimer.singleShot(0, choose)
+    try:
+        QApplication.sendEvent(tab.table.viewport(), QContextMenuEvent(
+            QContextMenuEvent.Mouse, point, tab.table.viewport().mapToGlobal(point)))
+        assert len(captured) == 1
+        assert_address_actions(captured[0])
+        callback.assert_called_once_with("10.0.0.5")
+    finally:
+        app.removeEventFilter(menus)

@@ -3,7 +3,7 @@ VLANs are set up (a native VLAN that differs at the two ends of a trunk, say). A
 physical view: the switches and links that carry it stay bright, the rest fade."""
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor
-from PyQt5.QtWidgets import QHBoxLayout, QLabel, QPushButton, QSplitter, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QHeaderView, QHBoxLayout, QLabel, QMenu, QPushButton, QSplitter, QVBoxLayout, QWidget
 
 from ..netmap import vlans
 from .common import SortableTableItem, read_only_table
@@ -58,12 +58,19 @@ class VlanPanel(QWidget):
         layout.addLayout(buttons)
         self.table = read_only_table(VLAN_COLUMNS)
         self.checks = read_only_table(CHECK_COLUMNS)
+        self.checks.setWordWrap(False)
         self.checks.setToolTip("Double-click one to show the switch on the map.")
         self.checks_label = QLabel()
+        self.expand_checks_button = QPushButton("Expand Notes and Warnings")
+        self.expand_checks_button.setCheckable(True)
+        self.expand_checks_button.toggled.connect(self.expand_checks)
+        checks_heading = QHBoxLayout()
+        checks_heading.addWidget(self.checks_label, 1)
+        checks_heading.addWidget(self.expand_checks_button)
         lower = QWidget()
         lower_layout = QVBoxLayout(lower)
         lower_layout.setContentsMargins(0, 0, 0, 0)
-        lower_layout.addWidget(self.checks_label)
+        lower_layout.addLayout(checks_heading)
         lower_layout.addWidget(self.checks, 1)
         splitter = QSplitter(Qt.Vertical)
         splitter.addWidget(self.table)
@@ -77,7 +84,11 @@ class VlanPanel(QWidget):
         self.vlans_page_button.clicked.connect(self.show_on_vlans_page)
         self.table.itemDoubleClicked.connect(self.highlight_selected)
         self.table.itemSelectionChanged.connect(self.update_buttons)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.show_vlan_menu)
         self.checks.itemDoubleClicked.connect(self.show_finding)
+        self.checks.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.checks.customContextMenuRequested.connect(self.show_checks_menu)
         self.set_map(None)
 
     def set_map(self, network_map):
@@ -112,6 +123,7 @@ class VlanPanel(QWidget):
                      SortableTableItem(str(finding.vlan) if finding.vlan else "", finding.vlan),
                      SortableTableItem(where), SortableTableItem(finding.text)]
             cells[0].setForeground(QColor(COLORS[SEVERITY_COLORS[finding.severity]]))
+            cells[3].setToolTip(finding.text)
             for column, cell in enumerate(cells):
                 self.checks.setItem(row, column, cell)
         self.checks.setSortingEnabled(True)
@@ -140,6 +152,15 @@ class VlanPanel(QWidget):
         cell = self.table.item(rows.pop(), 0)
         return cell.data_object if cell is not None else None
 
+    def expand_checks(self, expanded):
+        self.checks.setWordWrap(expanded)
+        header = self.checks.verticalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeToContents if expanded else QHeaderView.Fixed)
+        if not expanded:
+            for row in range(self.checks.rowCount()):
+                self.checks.setRowHeight(row, header.defaultSectionSize())
+        self.expand_checks_button.setText("Collapse Notes and Warnings" if expanded else "Expand Notes and Warnings")
+
     def update_buttons(self):
         self.highlight_button.setEnabled(self.selected_item() is not None)
         self.vlans_page_button.setEnabled(self.selected_item() is not None)
@@ -150,6 +171,37 @@ class VlanPanel(QWidget):
         item = self.selected_item()
         if item is not None:
             self.highlight_requested.emit(item.vlan, item.domain)
+
+    def show_vlan_menu(self, position):
+        cell = self.table.itemAt(position)
+        if cell is None:
+            return
+        self.table.selectRow(cell.row())
+        menu = QMenu(self)
+        actions = {}
+        for button in (self.highlight_button, self.vlans_page_button, self.database_button):
+            action = menu.addAction(button.text())
+            action.setEnabled(button.isEnabled())
+            actions[action] = button.click
+        chosen = menu.exec_(self.table.viewport().mapToGlobal(position))
+        if chosen in actions:
+            actions[chosen]()
+
+    def show_checks_menu(self, position):
+        cell = self.checks.itemAt(position)
+        if cell is None:
+            return
+        self.checks.selectRow(cell.row())
+        finding = self.checks.item(cell.row(), 0).data_object
+        menu = QMenu(self)
+        show = menu.addAction("Show on Map")
+        show.setEnabled(finding is not None and bool(finding.device))
+        expand = menu.addAction(self.expand_checks_button.text())
+        chosen = menu.exec_(self.checks.viewport().mapToGlobal(position))
+        if chosen is show and show.isEnabled():
+            self.show_finding(cell)
+        elif chosen is expand:
+            self.expand_checks_button.click()
 
     def show_on_vlans_page(self):
         item = self.selected_item()
