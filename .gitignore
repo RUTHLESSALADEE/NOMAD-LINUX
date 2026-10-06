@@ -9,3 +9,5 @@ dist/
 
 /Sanitized LDIF.xlsx
 /28SEPExport.xml
+/.claude/settings.local.json
+/sweep-results.csv

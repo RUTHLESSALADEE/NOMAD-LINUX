@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "PowerShell(cmd /c \"netsh interface ipv4 set address name=11 source=dhcp 2>&1\"; \"exit $LASTEXITCODE\"; cmd /c \"netsh interface ipv4 set subinterface interface=11 mtu=1500 store=persistent 2>&1\"; \"exit $LASTEXITCODE\"; cmd /c \"ipconfig /flushdns 2>&1\"; \"exit $LASTEXITCODE\")"
-    ]
-  }
-}
