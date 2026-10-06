@@ -1,5 +1,5 @@
 """Command buttons under the terminal sessions: saved commands (or blocks of configuration) sent with one click."""
-from PyQt5.QtCore import QMimeData, Qt, QTimer
+from PyQt5.QtCore import QEvent, QMimeData, QPoint, Qt, QTimer
 from PyQt5.QtGui import QDrag
 from PyQt5.QtWidgets import QApplication, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout, \
     QLabel, QLineEdit, QMenu, QMessageBox, QPlainTextEdit, QScrollArea, QToolButton, QVBoxLayout, QWidget
@@ -14,10 +14,19 @@ BUTTON_MIME = "application/x-nomad-command-button"
 class DraggableButton(QToolButton):
     """A command button that can be dragged along the bar to change the order (and so its Ctrl+number)."""
 
-    def __init__(self, button_id):
+    def __init__(self, button_id, number=None, hint_parent=None):
         super().__init__()
         self.button_id = button_id
         self.press_position = None
+        # A sibling overlay in the terminal area, outside the button and the bar's layout.
+        self.shortcut_hint = QLabel(str(number) if number is not None else "", hint_parent or self)
+        self.shortcut_hint.setAlignment(Qt.AlignCenter)
+        self.shortcut_hint.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.shortcut_hint.setStyleSheet(f"color: {COLORS['accent']}; background: {COLORS['background']}; "
+                                        f"border: 1px solid {COLORS['border']}; border-radius: 3px; "
+                                        "padding: 1px 4px; font-weight: bold;")
+        self.shortcut_hint.hide()
+        self.destroyed.connect(self.shortcut_hint.deleteLater)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -152,6 +161,7 @@ class CommandBar(QFrame):
         self.page = page
         self.tabs = tabs
         self.store = page.commands
+        self.hints_shown = False
         self.setObjectName("commandBar")
         self.setStyleSheet(f"#commandBar {{ border-top: 1px solid {COLORS['border']}; }}")
         layout = QHBoxLayout(self)
@@ -167,6 +177,7 @@ class CommandBar(QFrame):
         self.row_layout.setContentsMargins(0, 0, 0, 0)
         self.row_layout.setSpacing(4)
         self.scroll.setWidget(self.row)
+        self.scroll.horizontalScrollBar().valueChanged.connect(self.position_hints)
         layout.addWidget(self.scroll, 1)
         self.status_label = QLabel()
         self.status_label.setStyleSheet(f"color: {COLORS['muted']};")
@@ -182,6 +193,7 @@ class CommandBar(QFrame):
                                else None)
         self.fill()
         self.setVisible(False)
+        QApplication.instance().installEventFilter(self)
 
     def fit_height(self):
         """Just one row of buttons tall (a scroll area's own size is far taller), with room for the scrollbar only
@@ -192,22 +204,75 @@ class CommandBar(QFrame):
         self.scroll.setFixedHeight(row_height + bar)
         margins = self.layout().contentsMargins()
         self.setFixedHeight(row_height + bar + margins.top() + margins.bottom() + 1)  # 1: the border on top
+        self.position_hints()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.fit_height()
 
+    def show_hints(self, visible):
+        shown = visible and self.isVisible()
+        if shown == self.hints_shown:
+            return
+        self.hints_shown = shown
+        self.position_hints()
+
+    def position_hints(self):
+        if not self.hints_shown:
+            for button in self.row.buttons():
+                button.shortcut_hint.hide()
+            return
+        viewport = self.scroll.viewport()
+        left = viewport.mapTo(self.tabs, QPoint(0, 0)).x()
+        right = left + viewport.width()
+        top = self.mapTo(self.tabs, QPoint(0, 0)).y()
+        for button in self.row.buttons():
+            hint = button.shortcut_hint
+            center = button.mapTo(self.tabs, button.rect().center()).x()
+            shown = self.hints_shown and bool(hint.text()) and left <= center < right
+            if shown:
+                hint.adjustSize()
+                hint.move(center - hint.width() // 2, max(0, top - hint.height() - 2))
+                hint.raise_()
+            hint.setVisible(shown)
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.ApplicationDeactivate or \
+                event.type() == QEvent.WindowDeactivate and watched is self.window():
+            self.show_hints(False)
+        elif event.type() == QEvent.KeyRelease and event.key() == Qt.Key_Control and not event.isAutoRepeat():
+            self.show_hints(False)
+        elif event.type() == QEvent.KeyPress and isinstance(watched, QWidget) and \
+                QWidget.window(watched) is self.window() and \
+                (event.key() == Qt.Key_Control or event.modifiers() & Qt.ControlModifier):
+            self.show_hints(True)
+        elif self.hints_shown and event.type() in (QEvent.Move, QEvent.Resize, QEvent.LayoutRequest) and \
+                (watched in (self.tabs, self.row, self.scroll.viewport()) or
+                 isinstance(watched, DraggableButton) and watched.parentWidget() is self.row):
+            self.position_hints()
+        return super().eventFilter(watched, event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.show_hints(bool(QApplication.keyboardModifiers() & Qt.ControlModifier))
+
+    def hideEvent(self, event):
+        self.show_hints(False)
+        super().hideEvent(event)
+
     def fill(self):
         while self.row_layout.count():
             item = self.row_layout.takeAt(0)
             if item.widget() is not None:
+                if isinstance(item.widget(), DraggableButton):
+                    item.widget().shortcut_hint.hide()
                 item.widget().deleteLater()
         if not self.store.buttons:
             hint = QLabel("No command buttons yet: + Add makes one (a command, or a block of configuration).")
             hint.setStyleSheet(f"color: {COLORS['muted']};")
             self.row_layout.addWidget(hint)
         for number, button in enumerate(self.store.buttons, 1):
-            widget = DraggableButton(button.id)
+            widget = DraggableButton(button.id, number if number <= 9 else None, self.tabs)
             widget.setText(button.name)
             hotkey = f"Ctrl+{number} in a session. Drag to change the order.\n\n" if number <= 9 else \
                 "Drag to change the order.\n\n"

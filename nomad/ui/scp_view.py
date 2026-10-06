@@ -163,7 +163,7 @@ class FileSessionView(PromptAnswers, QWidget):
         if not problems:
             return True
         reply = QMessageBox.question(self, "Close", f"{self.session.name} has " + " and ".join(problems) +
-                                     ". Close it anyway?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                                     ". Close it anyway?", QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
         return reply == QMessageBox.Yes
 
     # ----------------------------------------------------------------- Status

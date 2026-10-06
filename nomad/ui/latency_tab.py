@@ -238,6 +238,10 @@ class LatencyTab(QWidget):
 
     # ----------------------------------------------------------------- Tab interface
 
+    def focus_find(self):
+        self.name_input.setFocus()
+        self.name_input.selectAll()
+
     def save_settings(self, settings):
         settings.setValue("latency/targets", json.dumps([target.to_dict() for target in self.targets]))
         settings.setValue("latency/interval", self.interval_input.value())

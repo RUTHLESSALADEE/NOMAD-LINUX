@@ -2,7 +2,7 @@
 
 **Network Operations, Monitoring And Diagnostics**: one Windows app to set up network adapters, troubleshoot networks, talk to devices and keep track of IP addresses. (Formerly NIC Manager, with the RADAR subnet sweep and the Latenct latency monitor built in.)
 
-**Version 1.19.0** adds encrypted terminal backups, SecureCRT password exports, IP address context actions and subnet moves without a VLAN, with improvements to navigation, workbook imports and network mapping. See the [changelog](CHANGELOG.md#1190---2026-10-05).
+**Version 1.20.0** adds an RDP session manager, full device config saving and session logging buttons in the terminal, and a searchable keyboard guide with shortcuts for tools, saved sessions and file panes. RDP folders are separate from Terminal/SCP folders, and encrypted NOMAD backups include RDP sessions and preferences. See the [changelog](CHANGELOG.md#1200---2026-10-05) and [keyboard guide](docs/keyboard-shortcuts.md).
 
 ![The Interfaces page](docs/screenshots/interfaces.png)
 
@@ -55,8 +55,22 @@ Screenshots use made-up demo data; some show the earlier navigation layout.
 | --- | --- |
 | **Terminal** | SSH, Telnet, serial and raw TCP sessions in tabs, tiles and pop-out windows. [More below.](#terminal-and-scp) |
 | **SCP** | A WinSCP-style file manager for SSH servers. [More below.](#terminal-and-scp) |
+| **RDP** | Saved Remote Desktop sessions in folders, with remembered credentials and display settings. Launches Windows' built-in Remote Desktop Connection. |
 | **TFTP** | A TFTP server and client for firmware and config transfers. |
 | **Wake-on-LAN** | Wake a computer by its MAC, and save the ones you wake often. |
+
+The **RDP** page has its own session folders, separate from Terminal and SCP, and uses NOMAD's shared password vault.
+Create a session with a
+computer name or IP address, port and username (`DOMAIN\user` or `user@domain`), and optionally remember its password.
+The full-width session list shows addresses, usernames, password status, display mode and last launch. Search and
+Quick connect are above the list, with launch/edit actions in the toolbar and a compact summary below it.
+Double-click a session or click **Launch** to open Windows Remote Desktop Connection. Quick connect accepts
+`host`, `host:3390` or `[IPv6]:3389`; recent launches can be saved as sessions. Display options include full screen,
+window size and all monitors, plus clipboard, audio and administrative sessions. Windows policies may still require
+interactive sign-in. NOMAD hands passwords to the client in an encrypted temporary `.rdp` file, normally deleted
+after one minute; files left by an interrupted launch expire after 24 hours and are cleaned up next time the RDP
+page starts or launches a connection. Closing NOMAD leaves Remote Desktop windows running. Encrypted NOMAD session
+backups include RDP sessions, credentials and page preferences.
 
 ### Discover
 
@@ -168,12 +182,14 @@ The **SNMP Config** page (under SNMP) builds the Cisco IOS / IOS-XE configuratio
 - **Send to All** sends a command (or Ctrl+C, Ctrl+Z, Ctrl+Shift+6...) to every session, and **Type in All** mirrors your typing.
 - **Command buttons** send saved commands or blocks of configuration with one click, or with Ctrl+1 to Ctrl+9 (even with the Buttons bar hidden). Drag a button, or right-click it > Move to Position, to change the order and so its hotkey.
 - **Keyword highlighting** colours down, err-disabled, % Invalid, up, and IP and MAC addresses. Change the rules in View > Terminal Keyword Highlighting.
+- **Save Config…** in each terminal session saves the complete running configuration to your workstation as a timestamped `.cfg` file (or a filename you choose). Start at the device's operational / exec prompt with permission to read the full config, select Cisco IOS / IOS XE / NX-OS / Arista EOS, Cisco ASA, Juniper Junos, or a custom command, then choose where to save. Cisco profiles disable paging for the current terminal session; Junos uses `no-more`. Disable paging yourself before using a custom command. Capture is independent of scrollback and finishes when the device prompt returns. **Cancel Save** interrupts the command; a disconnect, command error, or five-minute timeout leaves the destination unchanged. The same action is available by right-clicking the session tab. Config capture stays in that session even with Send to All enabled.
 
 **Staying connected**
 
 - A per-session **line delay** keeps slow consoles from dropping pasted text.
 - **Reconnect automatically** when a device reloads.
 - **Anti-idle** keystrokes keep exec-timeout from logging you out.
+- **Log Session…**, beside Save Config…, asks where to save a plain-text session log on your workstation. The button changes to **Stop Logging** while recording. The saved-session **Logging** option still starts logging automatically in its configured folder when you connect.
 
 **Security**
 
@@ -329,17 +345,24 @@ An advertised subnet (one other routers have a route to) can be in only one plac
 
 **Shortcuts**
 
-| Keys | Does |
+Press **F1** for the searchable, grouped keyboard guide, or read the [full keyboard guide](docs/keyboard-shortcuts.md).
+
+| Goal | Shortcut |
 | --- | --- |
-| F5 | Refresh |
-| Ctrl+Tab / Ctrl+Shift+Tab | Next / previous page |
-| Ctrl+K | Open tool search |
-| Ctrl+B | Keep the tool drawer open or close it |
-| F11 | Focus mode |
-| Ctrl+R | Diagnostics report |
-| Ctrl+F | Search or filter on the page showing (routes, ARP, connections, syslog, IP addresses, network map) |
-| Ctrl+1 to Ctrl+9 | The first nine command buttons (in a Terminal session) |
-| Ctrl+= / Ctrl+- / Ctrl+0 | Text size |
+| Choose a tool | Ctrl+K |
+| Choose an adapter | Alt+A |
+| Focus the tool's main input or filter | Ctrl+F |
+| Start a diagnostic/discovery tool | Shift+Enter |
+| Stop the current tool | Shift+Esc |
+| Next / previous tool | Ctrl+Tab / Ctrl+Shift+Tab |
+| New saved session / saved-session folder | Ctrl+N / Ctrl+Shift+N |
+| Previous / next Terminal or SCP session | Alt+Left / Alt+Right |
+| Close the current Terminal or SCP session | Ctrl+W (Enter confirms Yes) |
+| Pop out a session / move it back | Ctrl+Shift+Enter |
+| Focus the current SCP pane's folder path | Ctrl+L |
+| See command-button numbers | Hold Ctrl in the terminal window |
+
+SCP folder-back is now **Alt+Up**; **Alt+Left** switches sessions. Terminal **Ctrl+W** now closes the session, while **Ctrl+L**, **Ctrl+C** and **Ctrl+R** retain their shell behavior.
 
 **Where things are kept**
 

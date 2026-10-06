@@ -107,6 +107,11 @@ class SessionTree(QTreeWidget):
 class SessionManager(QWidget):
     """The session sidebar. The page it's on opens sessions (page.open_session(session, saved, window)) and lists the
     open ones (page.all_views()). protocols limits which saved sessions are shown (None for all)."""
+    dialog_class = SessionDialog
+    launch_only = False
+
+    def make_session(self, folder):
+        return Session(name="", folder=folder)
 
     def __init__(self, page, store, protocols=None, settings_prefix="terminal"):
         super().__init__(page)
@@ -132,6 +137,8 @@ class SessionManager(QWidget):
         self.quick_input.setToolTip("admin@10.0.0.1, telnet 10.0.0.5, raw 10.0.0.9:9100 or COM3:115200, then Enter"
                                     if self.quick_protocol.count() > 1 else
                                     "admin@10.0.0.1 or admin@host:2222, then Enter")
+        if self.launch_only:
+            self.quick_input.setToolTip("Computer name, host:3389 or [IPv6]:3389, then Enter")
         quick_row.addWidget(self.quick_protocol)
         quick_row.addWidget(self.quick_input, 1)
         manager_layout.addLayout(quick_row)
@@ -156,7 +163,7 @@ class SessionManager(QWidget):
         self.new_button = QToolButton()
         self.new_button.setText("New")
         self.new_button.setPopupMode(QToolButton.MenuButtonPopup)
-        self.new_button.setToolTip("New session (the arrow also offers a new folder)")
+        self.new_button.setToolTip("New saved session (Ctrl+N; the arrow also offers a new folder)")
         new_menu = QMenu(self.new_button)
         new_menu.addAction("New Session...", lambda: self.new_session(self.selected_folder()))
         new_menu.addAction("New Folder...", lambda: self.new_folder(self.selected_folder()))
@@ -184,6 +191,10 @@ class SessionManager(QWidget):
         self.tree.itemExpanded.connect(lambda item: self.collapsed.discard(self.group_key(item)))
         self.tree.itemCollapsed.connect(lambda item: self.collapsed.add(self.group_key(item)))
         self.new_button.clicked.connect(lambda: self.new_session(self.selected_folder()))
+        QShortcut(QKeySequence("Ctrl+N"), self.page, context=Qt.WidgetWithChildrenShortcut).activated.connect(
+            lambda: self.new_session(self.selected_folder()))
+        QShortcut(QKeySequence("Ctrl+Shift+N"), self.page, context=Qt.WidgetWithChildrenShortcut).activated.connect(
+            lambda: self.new_folder(self.selected_folder()))
         store.listeners.append(self.schedule_refresh)
         delete_shortcut = QShortcut(QKeySequence.Delete, self.tree)
         delete_shortcut.setContext(Qt.WidgetShortcut)
@@ -379,7 +390,8 @@ class SessionManager(QWidget):
             item.setSelected(True)
         if not self.visible_sessions() and not words:
             hint = QTreeWidgetItem(["No saved sessions yet"])
-            hint.setToolTip(0, "New creates one; File > Import Sessions brings in your PuTTY or SecureCRT sessions.")
+            hint.setToolTip(0, "New creates a Remote Desktop session." if self.launch_only else
+                            "New creates one; File > Import Sessions brings in your PuTTY or SecureCRT sessions.")
             hint.setFlags(Qt.NoItemFlags)
             self.tree.addTopLevelItem(hint)
 
@@ -462,8 +474,9 @@ class SessionManager(QWidget):
         actions = {}
         if entry is not None:
             saved = self.store.get(entry.saved_id)
-            actions[menu.addAction("Connect")] = lambda: self.open_recent(entry)
-            actions[menu.addAction("Connect in New Window")] = lambda: self.open_recent(entry, window=True)
+            actions[menu.addAction("Launch" if self.launch_only else "Connect")] = lambda: self.open_recent(entry)
+            if not self.launch_only:
+                actions[menu.addAction("Connect in New Window")] = lambda: self.open_recent(entry, window=True)
             self.add_companion_actions(menu, actions, self.store.recent_session(entry))
             menu.addSeparator()
             if saved is None:
@@ -480,8 +493,9 @@ class SessionManager(QWidget):
                 actions[chosen]()
             return
         if session is not None:
-            actions[menu.addAction("Connect")] = lambda: self.page.open_session(session)
-            actions[menu.addAction("Connect in New Window")] = lambda: self.page.open_session(session, window=True)
+            actions[menu.addAction("Launch" if self.launch_only else "Connect")] = lambda: self.page.open_session(session)
+            if not self.launch_only:
+                actions[menu.addAction("Connect in New Window")] = lambda: self.page.open_session(session, window=True)
             self.add_companion_actions(menu, actions, session)
             menu.addSeparator()
             actions[menu.addAction("Edit...")] = lambda: self.edit_session(session)
@@ -498,22 +512,23 @@ class SessionManager(QWidget):
                 grandparent = folder.rpartition("/")[0].rpartition("/")[0]
                 actions[menu.addAction("Move Up a Level")] = lambda: self.move_items([], [folder], grandparent)
             actions[menu.addAction("Delete Folder")] = lambda: self.delete_folder(folder)
-        menu.addSeparator()
-        actions[menu.addAction("Import from PuTTY")] = self.import_from_putty
-        actions[menu.addAction("Import from SecureCRT...")] = self.import_from_securecrt
+        if not self.launch_only:
+            menu.addSeparator()
+            actions[menu.addAction("Import from PuTTY")] = self.import_from_putty
+            actions[menu.addAction("Import from SecureCRT...")] = self.import_from_securecrt
         chosen = menu.exec_(self.tree.viewport().mapToGlobal(position))
         if chosen in actions:
             actions[chosen]()
 
     def new_session(self, folder=""):
-        session = Session(name="", folder=folder)
-        dialog = SessionDialog(self, session, self.store.all_folders(), "New Session", self.store)
+        session = self.make_session(folder)
+        dialog = self.dialog_class(self, session, self.store.all_folders(), "New Session", self.store)
         if dialog.exec_():
             self.store.put(dialog.session)
             self.fill_tree(select=dialog.session.id)
 
     def edit_session(self, session):
-        dialog = SessionDialog(self, session.copy(id=session.id), self.store.all_folders(), "Edit Session", self.store)
+        dialog = self.dialog_class(self, session.copy(id=session.id), self.store.all_folders(), "Edit Session", self.store)
         if dialog.exec_():
             self.store.put(dialog.session)
             for view in self.page.all_views():
@@ -674,7 +689,7 @@ class SessionManager(QWidget):
 
     def save_recent(self, entry):
         session = entry.session.copy(name=self.store.unique_name(entry.session.name, entry.session.folder))
-        dialog = SessionDialog(self, session, self.store.all_folders(), "Save Session", self.store)
+        dialog = self.dialog_class(self, session, self.store.all_folders(), "Save Session", self.store)
         if dialog.exec_():
             self.store.put(dialog.session)
             self.store.link_recent(dialog.session)
@@ -685,13 +700,15 @@ class SessionManager(QWidget):
         self.fill_tree()
 
     def clear_recent(self):
-        if not self.store.recent:
+        entries = self.visible_recent()
+        if not entries:
             return
         reply = QMessageBox.question(self, "Clear Recent Connections", "Clear the list of recent connections? "
                                      "Saved sessions aren't affected.", QMessageBox.Yes | QMessageBox.No,
                                      QMessageBox.No)
         if reply == QMessageBox.Yes:
-            self.store.forget_recent()
+            for entry, session in entries:
+                self.store.forget_recent(entry.id)
             self.fill_tree()
 
     # ----------------------------------------------------------------- Moving sessions and folders
@@ -721,7 +738,7 @@ class SessionManager(QWidget):
         menu = QMenu(self)
         actions = {}
         if sessions:
-            label = f"Connect {len(sessions)} Session{'' if len(sessions) == 1 else 's'}"
+            label = f"{'Launch' if self.launch_only else 'Connect'} {len(sessions)} Session{'' if len(sessions) == 1 else 's'}"
             actions[menu.addAction(label)] = lambda: [self.page.open_session(session) for session in sessions]
             menu.addSeparator()
         actions[menu.addAction("Move to...")] = lambda: self.move_to_dialog(sessions, folders)

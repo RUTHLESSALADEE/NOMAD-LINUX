@@ -487,7 +487,8 @@ class Navigator(SidebarNavigator):
 
     def fill_drawer(self):
         query = self.search.text().strip().casefold()
-        aliases = {"iperf": "bandwidth throughput", "SCP": "file transfer ssh", "TFTP": "file transfer firmware",
+        aliases = {"iperf": "bandwidth throughput", "SCP": "file transfer ssh", "RDP": "remote desktop mstsc windows",
+                   "TFTP": "file transfer firmware",
                    "Network Map": "topology snmp", "Interfaces": "adapter nic ip configuration",
                    "ARP": "neighbors mac", "Ports": "scan tcp", "DNS Servers": "dns benchmark"}
         self.drawer_list.clear()

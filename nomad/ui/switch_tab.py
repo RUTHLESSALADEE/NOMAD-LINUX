@@ -2,7 +2,7 @@
 import logging
 
 from PyQt5.QtCore import pyqtSignal
-from PyQt5.QtWidgets import QApplication, QFormLayout, QHBoxLayout, QLabel, QProgressBar, QPushButton, QSpinBox, \
+from PyQt5.QtWidgets import QApplication, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QProgressBar, QPushButton, QSpinBox, \
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
 
 from ..lldp import discover
@@ -87,6 +87,11 @@ class SwitchTab(QWidget):
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
+        self.filter_input = QLineEdit()
+        self.filter_input.setPlaceholderText("Filter switch details: name, port, VLAN, address... (Ctrl+F)")
+        self.filter_input.setClearButtonEnabled(True)
+        self.filter_input.textChanged.connect(self.apply_filter)
+        layout.addWidget(self.filter_input)
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Switch", "Details"])
         self.tree.setAlternatingRowColors(True)
@@ -98,6 +103,19 @@ class SwitchTab(QWidget):
         self.copy_button.clicked.connect(self.copy_results)
 
     # ----------------------------------------------------------------- Tab interface
+
+    def focus_find(self):
+        self.filter_input.setFocus()
+        self.filter_input.selectAll()
+
+    def apply_filter(self):
+        words = self.filter_input.text().lower().split()
+        for index in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(index)
+            rows = [item] + [item.child(child) for child in range(item.childCount())]
+            text = " ".join(row.text(column) + " " + row.toolTip(column)
+                            for row in rows for column in range(self.tree.columnCount())).lower()
+            item.setHidden(not all(word in text for word in words))
 
     def save_settings(self, settings):
         settings.setValue("switch/seconds", self.seconds_input.value())
@@ -183,6 +201,7 @@ class SwitchTab(QWidget):
             top.addChild(child)
         self.tree.addTopLevelItem(top)
         top.setExpanded(True)
+        self.apply_filter()
         self.update_buttons()
 
     def copy_results(self):

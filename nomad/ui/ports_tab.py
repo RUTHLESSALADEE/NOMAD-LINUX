@@ -164,6 +164,10 @@ class PortsTab(QWidget):
 
     # ----------------------------------------------------------------- Tab interface
 
+    def focus_find(self):
+        self.host_input.setFocus()
+        self.host_input.selectAll()
+
     def save_settings(self, settings):
         settings.setValue("ports/host", self.host_input.text())
         settings.setValue("ports/ports", self.ports_input.text())

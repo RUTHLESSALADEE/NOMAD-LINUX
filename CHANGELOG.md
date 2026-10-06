@@ -6,6 +6,26 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.20.0] - 2026-10-05
+
+### Added
+
+- RDP session manager under Connect & Transfer, with saved addresses and encrypted credentials, folders, quick
+  connect, recent launches, display and resource settings, and host context actions. Launches Windows Remote Desktop
+  Connection in its own windows; encrypted NOMAD backups include RDP sessions and preferences.
+- RDP folders are independent of Terminal/SCP folders, including rename, move and delete operations.
+- RDP uses a full-width session list with connection settings in columns, a compact action toolbar, search and
+  quick launch, and a selected-session summary below the list.
+- **Save Config…** in each terminal session captures a device's full running configuration to a local file, independently of scrollback. Includes Cisco, Arista and Juniper profiles and custom commands; failed or cancelled captures preserve the destination.
+- **Log Session…**, next to Save Config…, asks where to save a plain-text log and changes to **Stop Logging** while recording. Saved-session automatic logging remains available.
+- A searchable **Keyboard Guide** opens with F1, with a companion guide in `docs/keyboard-shortcuts.md`. **Shift+Enter / Shift+Esc** start and stop supported tools, **Alt+A** focuses the adapter picker, and **Ctrl+F** focuses each page's input, search or filter.
+- Terminal command buttons show numbered hotkey hints while Ctrl is held. Session shortcuts create sessions and folders, switch sessions, close sessions with confirmation, and move sessions into or out of pop-out windows.
+
+### Changed
+
+- **Ctrl+W** closes the active Terminal/SCP session with confirmation. **Alt+Left / Alt+Right** switch sessions; SCP folder-back uses **Alt+Up**. **Ctrl+L** focuses an SCP file pane's path and retains its shell behavior in Terminal.
+- Interface, Network Reset, DHCP Servers and Switch Port pages provide focused search or filtering for their main content.
+
 ## [1.19.0] - 2026-10-05
 
 ### Added

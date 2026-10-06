@@ -12,7 +12,7 @@ from ..ipconfig import flush_dns
 from ..profiles import ProfileStore
 from ..snapshot import NetworkSnapshot, load_snapshot
 from ..system import APP_FULL_NAME, APP_NAME, is_admin, relaunch_as_admin
-from ..terminal.sessions import SessionStore
+from ..terminal.sessions import SessionFolderStore, SessionStore, TERMINAL_PROTOCOLS
 from .adapter_tab import AdapterTab
 from .capture_tab import CaptureTab
 from .common import run_in_background
@@ -49,10 +49,13 @@ from .tftp_tab import TftpTab
 from .theme import COLORS, DEFAULT_TEXT_SCALE, TEXT_SCALES, set_text_scale
 from .traceroute_tab import TracerouteTab
 from .terminal_tab import TerminalTab
+from .rdp_tab import RdpTab
 from .terminal_transfer import export_securecrt, export_terminal, import_terminal
 from .vlan_tab import VlanTab
 from .wake_tab import WakeTab
 from .web_check_tab import WebCheckTab
+from .workflow_shortcuts import install_workflow_shortcuts
+from .shortcut_guide import ShortcutGuide
 
 log = logging.getLogger(__name__)
 
@@ -165,9 +168,11 @@ class MainWindow(QMainWindow):
         self.subnet_tab = SubnetTab(self)
         self.snmp_config_tab = SnmpConfigTab(self)
         self.wake_tab = WakeTab(self)
-        self.session_store = SessionStore()  # Shared by the Terminal and SCP pages
-        self.terminal_tab = TerminalTab(self, self.session_store)
-        self.scp_tab = ScpTab(self, self.session_store)
+        self.session_store = SessionStore()  # Shared by Terminal, SCP and RDP
+        terminal_store = SessionFolderStore(self.session_store, TERMINAL_PROTOCOLS)
+        self.terminal_tab = TerminalTab(self, terminal_store)
+        self.scp_tab = ScpTab(self, terminal_store)
+        self.rdp_tab = RdpTab(self, self.session_store)
         self.integration = Integration(self)  # The Manage pages and the map, as one
         self.ipam_tab = IpamTab(self)
         self.vlan_tab = VlanTab(self)  # Uses the IP Addresses page's databases and sync
@@ -177,7 +182,7 @@ class MainWindow(QMainWindow):
             ("This Computer", [(self.adapter_tab, "Interfaces"), (self.routing_tab, "Routing Table"),
                                (self.neighbors_tab, "ARP"), (self.connections_tab, "Connections"),
                                (self.netreset_tab, "Network Reset")]),
-            ("Connect & Transfer", [(self.terminal_tab, "Terminal"), (self.scp_tab, "SCP"),
+            ("Connect & Transfer", [(self.terminal_tab, "Terminal"), (self.scp_tab, "SCP"), (self.rdp_tab, "RDP"),
                                     (self.tftp_tab, "TFTP"), (self.wake_tab, "Wake-on-LAN")]),
             ("Discover", [(self.sweep_tab, "Sweep"), (self.switch_tab, "Switch Port"),
                           (self.dhcp_tab, "DHCP Servers"), (self.snmp_tab, "SNMP Walk")]),
@@ -315,10 +320,10 @@ class MainWindow(QMainWindow):
         tools_menu.addAction(refresh_action)
         find_action = QAction("&Find on This Page", self)
         find_action.setShortcut("Ctrl+F")
-        find_action.setToolTip("The page's search or filter box: routes, ARP, connections, syslog, IP addresses "
-                               "or the network map")
+        find_action.setToolTip("Focus the current page's main input, search or filter")
         find_action.triggered.connect(self.focus_find)
         tools_menu.addAction(find_action)
+        install_workflow_shortcuts(self)
         tools_menu.addSeparator()
         tools_menu.addAction("&Flush DNS Cache", self.flush_dns)
         tools_menu.addAction("Saved Password &Protection...", lambda: self.terminal_tab.manager.show_protection())
@@ -668,7 +673,7 @@ class MainWindow(QMainWindow):
         self.wake_tab.wake_device(mac, name)
 
     def focus_find(self):
-        """Ctrl+F: the search or filter box of the page showing, where it has one."""
+        """Ctrl+F: the current page's search, filter or primary input."""
         page = self.navigator.currentWidget()
         if hasattr(page, "focus_find"):
             page.focus_find()
@@ -689,23 +694,12 @@ class MainWindow(QMainWindow):
         except OSError as error:
             QMessageBox.critical(self, "Default Apps", f"Couldn't open Windows Default Apps settings:\n\n{error}")
 
-    def show_shortcuts(self):
-        QMessageBox.information(self, "Keyboard Shortcuts",
-                                "F5\tRefresh network settings\n"
-                                "Ctrl+R\tRun a diagnostics report on the selected adapter\n"
-                                "Ctrl+Tab / Ctrl+Shift+Tab\tNext / previous page\n"
-                                "Ctrl+K\tFind a tool\n"
-                                "Ctrl+B\tKeep the tool drawer open or close it\n"
-                                "F11\tFocus mode: give the page (such as a terminal) the whole window\n"
-                                "Ctrl+= / Ctrl+-\tLarger / smaller text (Ctrl+0 for the default size)\n"
-                                "Ctrl+F\tSearch or filter on the page showing (routes, ARP, connections, syslog, "
-                                "IP addresses, network map)\n"
-                                "Delete\tDelete the selected route (Routing Table tab)\n"
-                                "SCP page (in a file list): F5 copy to the other side, F4 edit, F2 rename, "
-                                "F7 new folder, F8/Delete delete, Alt+Enter properties, Ctrl+R refresh, "
-                                "Ctrl+Alt+H hidden files, Ctrl+F filter, Backspace up a folder\n"
-                                "Enter\tStart ping / traceroute / port scan / iperf / lookup / sweep from their "
-                                "input fields")
+    def show_shortcuts(self, page_title=None):
+        if getattr(self, "shortcut_guide", None) is None:
+            self.shortcut_guide = ShortcutGuide(self)
+        if not isinstance(page_title, str):
+            page_title = self.navigator.title(self.navigator.currentWidget())
+        self.shortcut_guide.show_for_page(page_title)
 
     def show_about(self):
         AboutDialog(self).exec_()

@@ -3,8 +3,10 @@ import logging
 import os
 import time
 
-from PyQt5.QtWidgets import QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit, \
-    QPushButton, QVBoxLayout, QWidget
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QKeySequence, QTextCursor, QTextDocument
+from PyQt5.QtWidgets import QApplication, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, \
+    QPushButton, QShortcut, QVBoxLayout, QWidget
 
 from ..neighbors import clear_neighbor_cache
 from ..netreset import RESET_ACTIONS, ResetAction, cancel_restart, read_proxy, read_winhttp_proxy, \
@@ -110,11 +112,33 @@ class NetworkResetTab(QWidget):
         self.status_label = QLabel()
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
+        self.find_bar = QWidget()
+        find_layout = QHBoxLayout(self.find_bar)
+        find_layout.setContentsMargins(0, 0, 0, 0)
+        self.find_input = QLineEdit()
+        self.find_input.setPlaceholderText("Find in command output (Enter: next, Shift+Enter: previous)")
+        self.find_input.setClearButtonEnabled(True)
+        self.find_status = QLabel()
+        previous_button = QPushButton("Previous")
+        next_button = QPushButton("Next")
+        close_button = QPushButton("Close")
+        find_layout.addWidget(self.find_input, 1)
+        for widget in (self.find_status, previous_button, next_button, close_button):
+            find_layout.addWidget(widget)
+        layout.addWidget(self.find_bar)
+        self.find_bar.hide()
         self.output = QPlainTextEdit()
         self.output.setReadOnly(True)
         self.output.setFont(monospace_font())
         self.output.setPlaceholderText("Output from the commands appears here.")
         layout.addWidget(self.output, 1)
+        self.find_input.textChanged.connect(self.restart_find)
+        self.find_input.returnPressed.connect(
+            lambda: self.find_output(bool(QApplication.keyboardModifiers() & Qt.ShiftModifier)))
+        next_button.clicked.connect(lambda: self.find_output())
+        previous_button.clicked.connect(lambda: self.find_output(True))
+        close_button.clicked.connect(self.hide_find)
+        QShortcut(QKeySequence("Esc"), self.find_bar, context=Qt.WidgetWithChildrenShortcut).activated.connect(self.hide_find)
 
         self.proxy_off_button.clicked.connect(self.turn_off_proxy)
         self.proxy_undo_button.clicked.connect(self.undo_proxy)
@@ -127,6 +151,32 @@ class NetworkResetTab(QWidget):
         self.update_proxy_buttons()
 
     # ----------------------------------------------------------------- Page interface
+
+    def focus_find(self):
+        self.find_bar.show()
+        self.find_input.setFocus()
+        self.find_input.selectAll()
+
+    def hide_find(self):
+        self.find_bar.hide()
+        self.output.setFocus()
+
+    def restart_find(self):
+        self.output.moveCursor(QTextCursor.Start)
+        self.find_output()
+
+    def find_output(self, backward=False):
+        text = self.find_input.text()
+        self.find_status.clear()
+        if not text:
+            return
+        flags = QTextDocument.FindBackward if backward else QTextDocument.FindFlags()
+        original = self.output.textCursor()
+        if not self.output.find(text, flags):
+            self.output.moveCursor(QTextCursor.End if backward else QTextCursor.Start)
+            if not self.output.find(text, flags):
+                self.output.setTextCursor(original)
+                self.find_status.setText("No matches")
 
     def save_settings(self, settings):
         pass

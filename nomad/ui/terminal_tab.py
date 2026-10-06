@@ -2,12 +2,13 @@
 can be popped out into their own windows."""
 from ..terminal.commands import CommandStore
 from ..terminal.highlight import HighlightStore
-from ..terminal.sessions import SSH
+from ..terminal.sessions import SSH, TERMINAL_PROTOCOLS
 from .session_page import SessionPage
 from .terminal_view import SessionView
 
 
 class TerminalTab(SessionPage):
+    protocols = set(TERMINAL_PROTOCOLS)
     tiling = True
     placeholder_text = ("Double-click a saved session to open it, or type an address in Quick connect.\n\n"
                         "Select text to copy it; right-click to paste. Ctrl+Shift+F finds text, Shift+PgUp "

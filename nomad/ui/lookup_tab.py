@@ -68,6 +68,10 @@ class LookupTab(QWidget):
 
     # ----------------------------------------------------------------- Tab interface
 
+    def focus_find(self):
+        self.name_input.setFocus()
+        self.name_input.selectAll()
+
     def save_settings(self, settings):
         settings.setValue("lookup/name", self.name_input.text())
         settings.setValue("lookup/type", self.type_combo.currentText())

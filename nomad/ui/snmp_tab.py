@@ -201,6 +201,10 @@ class SnmpTab(QWidget):
 
     # ----------------------------------------------------------------- Page interface
 
+    def focus_find(self):
+        self.host_input.setFocus()
+        self.host_input.selectAll()
+
     def save_settings(self, settings):
         settings.setValue("snmp/host", self.host_input.text())
         settings.setValue("snmp/community", self.community_input.text())

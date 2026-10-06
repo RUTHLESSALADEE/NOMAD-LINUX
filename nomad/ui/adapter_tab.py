@@ -4,8 +4,8 @@ import logging
 from dataclasses import replace
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, \
-    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QRadioButton, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, \
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton, QRadioButton, QVBoxLayout, QWidget
 
 from ..ipconfig import ApplyError, apply_ip_config, build_apply_commands, config_from_adapter, release_dhcp, \
     renew_dhcp, reset_adapter, set_adapter_enabled, set_mtu, validate_ip_config, validate_mtu
@@ -15,6 +15,58 @@ from .dialogs import KeepChangesDialog, SaveProfileDialog
 from .theme import COLORS, accent_button
 
 log = logging.getLogger(__name__)
+
+
+class AdapterSearchDialog(QDialog):
+    """Type to narrow the adapter picker; Enter chooses the first matching adapter."""
+
+    def __init__(self, window):
+        super().__init__(window)
+        self.setWindowTitle("Find an Adapter")
+        self.resize(560, 360)
+        layout = QVBoxLayout(self)
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Name, description, IP or MAC address")
+        self.search_input.setClearButtonEnabled(True)
+        layout.addWidget(self.search_input)
+        self.results = QListWidget()
+        layout.addWidget(self.results)
+        combo = window.adapter_combo
+        for index in range(combo.count()):
+            adapter_id = combo.itemData(index)
+            adapter = window.snapshot.adapters.get(adapter_id)
+            item = QListWidgetItem(combo.itemText(index))
+            item.setData(Qt.UserRole, adapter_id)
+            details = " ".join([adapter.description, adapter.mac,
+                                *(str(address) for address in adapter.ipv4 + adapter.ipv6)]) if adapter else ""
+            item.setData(Qt.UserRole + 1, (item.text() + " " + details).lower())
+            item.setToolTip(details)
+            self.results.addItem(item)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+        self.choose_button = buttons.button(QDialogButtonBox.Ok)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        self.results.itemDoubleClicked.connect(self.accept)
+        self.search_input.textChanged.connect(self.apply_filter)
+        self.apply_filter()
+        self.search_input.setFocus()
+
+    def apply_filter(self):
+        words = self.search_input.text().lower().split()
+        first = None
+        for index in range(self.results.count()):
+            item = self.results.item(index)
+            item.setHidden(not all(word in item.data(Qt.UserRole + 1) for word in words))
+            if first is None and not item.isHidden():
+                first = item
+        self.results.setCurrentItem(first)
+        self.choose_button.setEnabled(first is not None)
+
+    def accept(self):
+        item = self.results.currentItem()
+        if item is not None and not item.isHidden():
+            super().accept()
 
 
 class AdapterTab(QWidget):
@@ -198,6 +250,13 @@ class AdapterTab(QWidget):
         return [self.ip_input, self.subnet_input, self.gateway_input, self.primary_dns_input, self.backup_dns_input]
 
     # ----------------------------------------------------------------- Tab interface
+
+    def focus_find(self):
+        dialog = AdapterSearchDialog(self.window)
+        if dialog.exec_():
+            index = self.window.adapter_combo.findData(dialog.results.currentItem().data(Qt.UserRole))
+            if index >= 0:
+                self.window.adapter_combo.setCurrentIndex(index)
 
     def save_settings(self, settings):
         settings.setValue("adapter/profile", self.profile_combo.currentText())

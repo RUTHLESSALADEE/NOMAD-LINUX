@@ -646,6 +646,15 @@ class SnmpConfigTab(QWidget):
 
     # ----------------------------------------------------------------- Page interface
 
+    def focus_find(self):
+        # Leave configuration choices alone; Space on the toggle enables the field when needed.
+        target = (self.community_input if self.community_input.isEnabled() else
+                  self.community_check if self.community_check.isEnabled() else self.access_group)
+        self.form_scroll.ensureWidgetVisible(target)
+        target.setFocus()
+        if target is self.community_input:
+            target.selectAll()
+
     def save_settings(self, settings):
         options = self.options()
         settings.setValue("snmpconfig/form", json.dumps({

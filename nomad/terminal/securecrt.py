@@ -227,7 +227,7 @@ def import_securecrt(store, export, protect=None):
         if item.password and protect is not None:
             session.saved_password = protect(item.password)
             saved += 1
-        store.sessions.append(session)
+        store.sessions = [*store.sessions, session]
         existing.add(key)
         added += 1
     if added:

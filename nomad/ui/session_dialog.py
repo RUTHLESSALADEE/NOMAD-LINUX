@@ -4,7 +4,7 @@ from PyQt5.QtWidgets import QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFi
 
 from ..terminal.credentials import CredentialError, protect
 from ..terminal.sessions import AUTH_AGENT, AUTH_KEY, AUTH_PASSWORD, BAUD_RATES, DEFAULT_PORTS, ENCODINGS, \
-    FLOW_CONTROLS, LINE_ENDINGS, PARITIES, PROTOCOLS, RAW, SERIAL, SSH, TELNET, validate_session
+    FLOW_CONTROLS, LINE_ENDINGS, PARITIES, TERMINAL_PROTOCOLS, RAW, SERIAL, SSH, TELNET, validate_session
 from ..terminal.transports import serial_ports
 from .common import set_hint
 from .vault_dialog import protect_secret
@@ -32,7 +32,7 @@ class SessionDialog(QDialog):
         self.folder_combo.setCurrentText(session.folder)
         self.folder_combo.lineEdit().setPlaceholderText("Top level, or a folder such as Site A/Core")
         self.protocol_combo = QComboBox()
-        self.protocol_combo.addItems(PROTOCOLS)
+        self.protocol_combo.addItems(TERMINAL_PROTOCOLS)
         self.protocol_combo.setCurrentText(session.protocol)
         general.addRow("Name:", self.name_input)
         general.addRow("Folder:", self.folder_combo)

@@ -152,6 +152,10 @@ class WakeTab(QWidget):
 
     # ----------------------------------------------------------------- Tab interface
 
+    def focus_find(self):
+        self.wake_mac_input.setFocus()
+        self.wake_mac_input.selectAll()
+
     def save_settings(self, settings):
         # The key is kept from the old Utilities tab, so saved devices carry over
         settings.setValue("utilities/wake_targets", targets_to_json(self.wake_targets))

@@ -87,6 +87,11 @@ class SessionPage(QWidget):
         self.splitter.splitterMoved.connect(self.on_splitter_moved)
         self.set_manager_visible(True)
 
+    def focus_find(self):
+        self.set_manager_visible(True)
+        self.manager.filter_input.setFocus()
+        self.manager.filter_input.selectAll()
+
     def make_view(self, session):
         raise NotImplementedError
 

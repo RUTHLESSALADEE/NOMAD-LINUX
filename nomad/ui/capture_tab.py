@@ -126,6 +126,10 @@ class CaptureTab(QWidget):
 
     # ----------------------------------------------------------------- Page interface
 
+    def focus_find(self):
+        self.address_input.setFocus()
+        self.address_input.selectAll()
+
     def save_settings(self, settings):
         settings.setValue("capture/address", self.address_input.text())
         settings.setValue("capture/port", self.port_input.text())

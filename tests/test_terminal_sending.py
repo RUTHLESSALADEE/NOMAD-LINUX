@@ -5,15 +5,16 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
-from PyQt5.QtCore import Qt  # noqa: E402
+from PyQt5.QtCore import QEvent, QPoint, Qt  # noqa: E402
 from PyQt5.QtTest import QTest  # noqa: E402
-from PyQt5.QtWidgets import QApplication, QWidget  # noqa: E402
+from PyQt5.QtWidgets import QApplication, QMessageBox, QToolButton, QWidget  # noqa: E402
 
 from nomad.terminal.commands import CommandButton, CommandStore  # noqa: E402
 from nomad.terminal.highlight import HighlightStore  # noqa: E402
 from nomad.terminal.sessions import TELNET, Session, SessionStore  # noqa: E402
 from nomad.ui.terminal_tab import TerminalTab  # noqa: E402
 from nomad.ui.terminal_view import CONNECTED, DISCONNECTED  # noqa: E402
+from nomad.ui.scp_view import FileSessionView  # noqa: E402
 
 
 class FakeTransport:
@@ -198,6 +199,196 @@ def test_ctrl_number_goes_to_the_device_without_a_button(page):
     assert one.transport.sent == b"\x1e"
 
 
+def test_holding_ctrl_shows_numbers_without_moving_buttons_or_sending(page, tmp_path):
+    one = connect(page, "one")
+    for name in ("Clock", "Brief", "Run"):
+        page.commands.put(CommandButton(name, f"show {name.lower()}"))
+    page.tabs.show_command_bar(True)
+    bar = page.tabs.command_bar
+    page.window.activateWindow()
+    one.view.setFocus()
+    QTest.keyRelease(one.view, Qt.Key_Control)
+    QApplication.processEvents()
+    before = [button.geometry() for button in bar.row.buttons()]
+    height = one.view.height()
+    assert all(not button.shortcut_hint.isVisible() for button in bar.row.buttons())
+    QTest.keyPress(one.view, Qt.Key_Control)
+    QApplication.processEvents()
+    assert [button.shortcut_hint.text() for button in bar.row.buttons()] == ["1", "2", "3"]
+    assert all(button.shortcut_hint.isVisible() for button in bar.row.buttons())
+    assert all(button.shortcut_hint.width() > 0 and button.shortcut_hint.height() > 0
+               for button in bar.row.buttons())
+    top = bar.mapTo(page.tabs, QPoint(0, 0)).y()
+    for button in bar.row.buttons():
+        assert button.sizeHint() == QToolButton.sizeHint(button)
+        assert button.shortcut_hint.parentWidget() is page.tabs
+        assert button.shortcut_hint.geometry().bottom() < top
+        assert button.shortcut_hint.testAttribute(Qt.WA_TransparentForMouseEvents)
+    assert [button.geometry() for button in bar.row.buttons()] == before
+    assert one.view.height() == height
+    assert one.transport.sent == b""
+    screenshot = page.tabs.grab()
+    screenshot.copy(0, max(0, top - 70), screenshot.width(), bar.height() + 70).save(
+        str(tmp_path / "command-hints.png"))
+    QTest.keyRelease(one.view, Qt.Key_Control)
+    assert all(not button.shortcut_hint.isVisible() for button in bar.row.buttons())
+
+
+def test_ctrl_hints_only_label_existing_hotkeys_and_follow_reordering(page):
+    one = connect(page, "one")
+    for number in range(10):
+        page.commands.put(CommandButton(f"Command {number + 1}", "show clock"))
+    page.tabs.show_command_bar(True)
+    QTest.keyPress(one.view, Qt.Key_Control)
+    bar = page.tabs.command_bar
+    assert [button.shortcut_hint.text() for button in bar.row.buttons()] == [*map(str, range(1, 10)), ""]
+    assert not bar.row.buttons()[-1].shortcut_hint.isVisible()
+    last = page.commands.buttons[-1]
+    page.commands.move_to(last.id, 0)
+    QApplication.processEvents()
+    first = bar.row.buttons()[0]
+    assert first.button_id == last.id
+    assert first.shortcut_hint.text() == "1" and first.shortcut_hint.isVisible()
+    QTest.keyClick(one.view, Qt.Key_1, Qt.ControlModifier)
+    assert one.transport.sent == b"show clock\r"
+    QTest.keyRelease(one.view, Qt.Key_Control)
+    assert all(not button.shortcut_hint.isVisible() for button in bar.row.buttons())
+
+
+def test_ctrl_hints_clear_when_hidden_or_window_deactivates(page):
+    one = connect(page, "one")
+    page.commands.put(CommandButton("Clock", "show clock"))
+    bar = page.tabs.command_bar
+    QTest.keyPress(one.view, Qt.Key_Control)
+    assert not bar.hints_shown
+    QTest.keyRelease(one.view, Qt.Key_Control)
+    page.tabs.show_command_bar(True)
+    QTest.keyPress(one.view, Qt.Key_Control)
+    assert bar.hints_shown
+    QApplication.sendEvent(page.window, QEvent(QEvent.WindowDeactivate))
+    assert not bar.hints_shown
+    QTest.keyPress(one.view, Qt.Key_Control)
+    page.tabs.show_command_bar(False)
+    assert not bar.hints_shown
+    QTest.keyRelease(one.view, Qt.Key_Control)
+
+
+def test_ctrl_hints_work_in_popped_out_terminal(page):
+    one = connect(page, "one")
+    page.commands.put(CommandButton("Clock", "show clock"))
+    page.tabs.show_command_bar(True)
+    page.pop_out(one)
+    window = page.windows[-1]
+    window.activateWindow()
+    one.view.setFocus()
+    QApplication.processEvents()
+    QTest.keyPress(one.view, Qt.Key_Control)
+    assert window.tabs.command_bar.row.buttons()[0].shortcut_hint.isVisible()
+    assert not page.tabs.command_bar.hints_shown
+    QTest.keyRelease(one.view, Qt.Key_Control)
+    assert not window.tabs.command_bar.hints_shown
+    one.state = DISCONNECTED
+    window.close()
+
+
+def test_ctrl_overlay_tracks_scrolling_and_hides_offscreen_numbers(page):
+    one = connect(page, "one")
+    for number in range(9):
+        page.commands.put(CommandButton(f"Command {number + 1}", "show clock"))
+    page.tabs.show_command_bar(True)
+    bar = page.tabs.command_bar
+    for button in bar.row.buttons():
+        button.setFixedWidth(150)
+    QApplication.processEvents()
+    bar.fit_height()
+    scrollbar = bar.scroll.horizontalScrollBar()
+    assert scrollbar.maximum() > 0
+    QTest.keyPress(one.view, Qt.Key_Control)
+    assert bar.row.buttons()[0].shortcut_hint.isVisible()
+    assert not bar.row.buttons()[-1].shortcut_hint.isVisible()
+    scrollbar.setValue(scrollbar.maximum())
+    assert not bar.row.buttons()[0].shortcut_hint.isVisible()
+    last = bar.row.buttons()[-1]
+    assert last.shortcut_hint.isVisible()
+    assert abs(last.shortcut_hint.geometry().center().x() - last.mapTo(page.tabs, last.rect().center()).x()) <= 1
+    QTest.keyRelease(one.view, Qt.Key_Control)
+
+
+def test_alt_arrows_switch_sessions_without_sending_to_remote(page):
+    one, two = connect(page, "one"), connect(page, "two")
+    page.window.activateWindow()
+    two.view.setFocus()
+    QApplication.processEvents()
+    QTest.keyClick(two.view, Qt.Key_Left, Qt.AltModifier)
+    assert page.tabs.currentWidget() is one
+    QTest.keyClick(one.view, Qt.Key_Right, Qt.AltModifier)
+    assert page.tabs.currentWidget() is two
+    QTest.keyClick(two.view, Qt.Key_Right, Qt.AltModifier)
+    assert page.tabs.currentWidget() is one
+    assert one.transport.sent == two.transport.sent == b""
+
+
+def test_ctrl_w_confirms_connected_session_and_can_cancel(page, monkeypatch):
+    one = connect(page, "one")
+    page.window.activateWindow()
+    one.view.setFocus()
+    QApplication.processEvents()
+    sent = []
+    one.view.key_input.connect(sent.append)
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.No)
+    QTest.keyClick(one.view, Qt.Key_W, Qt.ControlModifier)
+    assert page.tabs.currentWidget() is one
+    assert sent == []
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.Yes)
+    QTest.keyClick(one.view, Qt.Key_W, Qt.ControlModifier)
+    assert page.tabs.count() == 0
+
+
+def test_ctrl_w_confirmation_defaults_to_yes(page, monkeypatch):
+    one = connect(page, "one")
+    page.window.activateWindow()
+    one.view.setFocus()
+    QApplication.processEvents()
+    defaults = []
+    def confirm(*args):
+        defaults.append(args[-1])
+        return args[-1]
+    monkeypatch.setattr(QMessageBox, "question", confirm)
+    QTest.keyClick(one.view, Qt.Key_W, Qt.ControlModifier)
+    assert defaults == [QMessageBox.Yes]
+    assert page.tabs.count() == 0
+
+
+def test_scp_close_warning_defaults_to_yes(page, monkeypatch):
+    warning_view = QWidget(page)
+    warning_view.session = Session("files", host="localhost")
+    warning_view.problems = lambda: ["a running transfer"]
+    defaults = []
+    def confirm(*args):
+        defaults.append(args[-1])
+        return args[-1]
+    monkeypatch.setattr(QMessageBox, "question", confirm)
+    assert FileSessionView.confirm_close(warning_view)
+    assert defaults == [QMessageBox.Yes]
+
+
+def test_ctrl_shift_enter_moves_session_out_and_back(page):
+    one = connect(page, "one")
+    page.window.activateWindow()
+    one.view.setFocus()
+    QApplication.processEvents()
+    QTest.keyClick(one.view, Qt.Key_Return, Qt.ControlModifier | Qt.ShiftModifier)
+    window = page.windows[-1]
+    assert window.tabs.currentWidget() is one
+    assert page.tabs.count() == 0
+    window.activateWindow()
+    one.view.setFocus()
+    QApplication.processEvents()
+    QTest.keyClick(one.view, Qt.Key_Enter, Qt.ControlModifier | Qt.ShiftModifier)
+    assert page.tabs.currentWidget() is one
+    assert window.tabs.count() == 0
+
+
 def test_reordering_buttons_moves_their_hotkeys_too(page):
     one = connect(page, "one")
     for name in ("Clock", "Brief", "Run"):
@@ -250,7 +441,10 @@ def test_with_a_line_delay_lines_go_one_at_a_time(page):
     one.send_block("a\nb\nc", final_enter=False)
     assert one.transport.sent == b"a\r"
     assert "Sending line 2 of 3" in one.status_label.text()
-    QTest.qWait(300)
+    for _ in range(50):
+        if one.transport.sent == b"a\rb\rc":
+            break
+        QTest.qWait(20)
     assert one.transport.sent == b"a\rb\rc"
     assert "Sending" not in one.status_label.text()
 

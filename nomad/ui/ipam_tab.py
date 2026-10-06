@@ -2051,7 +2051,7 @@ class IpamTab(QWidget):
             record = self.model.recorded.get(selected[0])
             name = record.name.strip() if record is not None else ""
             host_actions = HostActions(self.window, self).add_to(
-                menu, host, aliases=[name] if name else (), name=name, sessions=("Telnet",))
+                menu, host, aliases=[name] if name else (), name=name, sessions=("Telnet", "RDP"))
             menu.addSeparator()
             menu.addAction("History...", lambda: self.show_history("address", host)).setEnabled(self.as_of is None)
         links = self.other_page_actions(menu, address=host) if len(selected) == 1 else {}

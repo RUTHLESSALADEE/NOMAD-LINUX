@@ -3,7 +3,7 @@ import logging
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor
-from PyQt5.QtWidgets import QAbstractItemView, QApplication, QFormLayout, QHBoxLayout, QLabel, QProgressBar, \
+from PyQt5.QtWidgets import QAbstractItemView, QApplication, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QProgressBar, \
     QPushButton, QSpinBox, QSplitter, QTableWidget, QVBoxLayout, QWidget
 
 from ..dhcp import CLIENT_PORT, assess, current_dhcp_server, discover_servers
@@ -94,6 +94,11 @@ class DhcpTab(QWidget):
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
+        self.filter_input = QLineEdit()
+        self.filter_input.setPlaceholderText("Filter servers by address (Ctrl+F)")
+        self.filter_input.setClearButtonEnabled(True)
+        self.filter_input.textChanged.connect(self.apply_filter)
+        layout.addWidget(self.filter_input)
         self.table = QTableWidget(0, len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -136,6 +141,23 @@ class DhcpTab(QWidget):
         self.firewall_button.clicked.connect(self.open_firewall)
 
     # ----------------------------------------------------------------- Page interface
+
+    def focus_find(self):
+        self.filter_input.setFocus()
+        self.filter_input.selectAll()
+
+    def apply_filter(self):
+        words = self.filter_input.text().lower().split()
+        for row in range(self.table.rowCount()):
+            address = self.table.item(row, COL_SERVER).text().lower()
+            self.table.setRowHidden(row, not all(word in address for word in words))
+        selected = self.table.selectionModel().selectedRows()
+        if selected and self.table.isRowHidden(selected[0].row()):
+            self.table.clearSelection()
+        if not self.table.selectionModel().selectedRows():
+            first = next((row for row in range(self.table.rowCount()) if not self.table.isRowHidden(row)), None)
+            if first is not None:
+                self.table.selectRow(first)
 
     def save_settings(self, settings):
         settings.setValue("dhcp/seconds", self.seconds_input.value())
@@ -213,8 +235,7 @@ class DhcpTab(QWidget):
         for column, value in enumerate(values):
             self.table.setItem(row, column, SortableTableItem(value, data=offer))
         self.style_row(row)
-        if row == 0:
-            self.table.selectRow(0)  # Show the first server's options straight away
+        self.apply_filter()  # Include offers arriving while a filter is active.
 
     def selected_offer(self):
         rows = self.table.selectionModel().selectedRows()
