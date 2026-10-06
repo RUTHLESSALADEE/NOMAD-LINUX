@@ -16,6 +16,11 @@ def password_field(placeholder=""):
     return field
 
 
+def vault_sessions(store):
+    """Folder views share one vault; password changes must include every namespace."""
+    return getattr(store, "credential_sessions", store.sessions)
+
+
 def busy(function):
     """Run a slow step (deriving the key takes a moment) with the wait cursor showing."""
     QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
@@ -74,7 +79,7 @@ def forget_everything(parent, store):
         "NOMAD will ask for passwords when you connect.", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
     if reply != QMessageBox.Yes:
         return False
-    count = store.vault.forget_everything(store.sessions)
+    count = store.vault.forget_everything(vault_sessions(store))
     store.save()
     QMessageBox.information(parent, "Forget Saved Passwords",
                             f"Forgot {count} saved password{'' if count == 1 else 's'}. The master password is off.")
@@ -145,7 +150,7 @@ class NewPasswordDialog(QDialog):
             set_hint(self.error, "The two new passwords don't match.", "error")
             return
         try:
-            cleared = busy(lambda: self.store.vault.set_password(self.store.sessions, new,
+            cleared = busy(lambda: self.store.vault.set_password(vault_sessions(self.store), new,
                                                                  self.current.text() if self.changing else None))
         except VaultError as error:
             set_hint(self.error, str(error), "error")
@@ -206,7 +211,7 @@ class SecurityDialog(QDialog):
         self.refresh()
 
     def saved_count(self):
-        return sum(1 for session in self.store.sessions for field in (session.saved_password,
+        return sum(1 for session in vault_sessions(self.store) for field in (session.saved_password,
                                                                       session.saved_passphrase) if field)
 
     def refresh(self):
@@ -260,7 +265,7 @@ class SecurityDialog(QDialog):
 
         def remove():
             try:
-                busy(lambda: self.store.vault.remove_password(self.store.sessions, field.text()))
+                busy(lambda: self.store.vault.remove_password(vault_sessions(self.store), field.text()))
             except VaultError as problem:
                 set_hint(error, str(problem), "error")
                 return

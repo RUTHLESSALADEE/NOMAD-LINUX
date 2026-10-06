@@ -12,7 +12,7 @@ from PyQt5.QtCore import QByteArray
 
 from .commands import CommandButton
 from .highlight import HighlightRule, Highlighter
-from .sessions import Session, RecentEntry, validate_session
+from .sessions import RDP, TERMINAL_PROTOCOLS, Session, SessionFolderStore, RecentEntry, validate_session
 from .vault import derive_key
 
 MAGIC = b"NOMAD-TERMINAL-BACKUP\x01"
@@ -24,10 +24,11 @@ class BackupError(Exception):
 
 
 def terminal_key(key):
-    return key.startswith(("terminal/", "scp/")) or key == "view/text_scale"
+    return key.startswith(("terminal/", "scp/", "rdp/")) or key == "view/text_scale"
 
 
 def write_backup(path, password, store, commands, highlights, settings):
+    store = getattr(store, "source", store)
     if len(password) < 8:
         raise BackupError("Use at least 8 characters for the backup password.")
     sessions = []
@@ -42,7 +43,8 @@ def write_backup(path, password, store, commands, highlights, settings):
             value = settings.value(key)
             preferences[key] = ({"bytes": base64.b64encode(bytes(value)).decode("ascii")}
                                 if isinstance(value, QByteArray) else value)
-    data = {"sessions": sessions, "folders": sorted(store.all_folders()),
+    data = {"sessions": sessions, "folders": sorted(SessionFolderStore(store, TERMINAL_PROTOCOLS).all_folders()),
+            "rdp_folders": sorted(SessionFolderStore(store, {RDP}, "rdp_folders").all_folders()),
             "recent": [entry.to_dict() for entry in store.recent],
             "commands": [dataclasses.asdict(button) for button in commands.buttons],
             "highlights": [dataclasses.asdict(rule) for rule in highlights.rules],
@@ -111,6 +113,9 @@ def read_backup(path, password):
         data["recent"] = [RecentEntry.from_dict(item) for item in data["recent"]][:10]
         if not isinstance(data["folders"], list) or any(type(x) is not str for x in data["folders"]):
             raise ValueError("Invalid folders")
+        data.setdefault("rdp_folders", [])
+        if not isinstance(data["rdp_folders"], list) or any(type(x) is not str for x in data["rdp_folders"]):
+            raise ValueError("Invalid RDP folders")
         if type(data["highlight_enabled"]) is not bool or type(data["lock_after"]) is not int:
             raise ValueError("Invalid preferences")
         if data["lock_after"] < 0:
@@ -132,6 +137,7 @@ def read_backup(path, password):
 
 
 def restore_backup(data, store, commands, highlights, settings):
+    store = getattr(store, "source", store)
     # Prepare every credential before mutating stores: cancellation/unreadable credentials are never partial.
     sessions = []
     for original in data["sessions"]:
@@ -147,11 +153,12 @@ def restore_backup(data, store, commands, highlights, settings):
                 originals[owner.path] = file.read()
         else:
             originals[owner.path] = None
-    previous = (store.sessions, store.folders, store.recent, dict(store.vault_settings), commands.buttons,
+    previous = (store.sessions, store.folders, store.rdp_folders, store.recent, dict(store.vault_settings), commands.buttons,
                 highlights.rules, highlights.enabled, highlights.highlighter)
     preferences = {key: settings.value(key) for key in settings.allKeys() if terminal_key(key)}
     try:
         store.sessions, store.folders, store.recent = sessions, set(data["folders"]), data["recent"]
+        store.rdp_folders = set(data.get("rdp_folders", []))
         store.vault_settings["lock_after"] = data["lock_after"]
         commands.buttons = data["commands"]
         highlights.rules, highlights.enabled = data["highlights"], data["highlight_enabled"]
@@ -168,7 +175,7 @@ def restore_backup(data, store, commands, highlights, settings):
         if settings.status() != settings.NoError:
             raise OSError("Couldn't save terminal preferences.")
     except Exception:
-        (store.sessions, store.folders, store.recent, vault_settings, commands.buttons,
+        (store.sessions, store.folders, store.rdp_folders, store.recent, vault_settings, commands.buttons,
          highlights.rules, highlights.enabled, highlights.highlighter) = previous
         store.vault_settings.clear()
         store.vault_settings.update(vault_settings)

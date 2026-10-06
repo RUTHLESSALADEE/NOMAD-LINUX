@@ -26,6 +26,8 @@ TOOL_ART = {
                      '<path d="M11 18h4m-2-3v3"/>',
     "Terminal": '<rect x="2" y="4" width="20" height="16" rx="2"/>'
                 '<path d="m6 9 4 3-4 3m7 0h5"/>',
+    "RDP": '<rect x="2" y="3" width="20" height="14" rx="2"/>'
+           '<path d="M8 21h8m-4-4v4 M6 10h12m-3-3 3 3-3 3"/>',
     "SCP": '<path d="M3 8V3h10l4 4v2 M13 3v4h4 M21 16v5H11l-4-4v-2'
            ' M11 21v-4H7 M3 12h16m-3-3 3 3-3 3"/>',
     "TFTP": '<path d="M4 3h11l4 4v5 M15 3v4h4 M4 3v18h6'

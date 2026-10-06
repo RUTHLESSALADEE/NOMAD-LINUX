@@ -5,10 +5,11 @@ import time
 
 from PyQt5.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPen
-from PyQt5.QtWidgets import QApplication, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollBar, \
+from PyQt5.QtWidgets import QApplication, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollBar, \
     QSizePolicy, QVBoxLayout, QWidget
 
 from ..terminal.model import LogCleaner, Position, TerminalModel, encode_key, encode_paste
+from ..terminal.config_capture import CONFIG_PROFILES, ConfigCapture, write_config
 from ..terminal.highlight import COLORS as KEYWORD_COLORS
 from ..terminal.sessions import SERIAL, decode_escapes
 from ..terminal.transports import ConnectionFailed, make_transport
@@ -41,7 +42,15 @@ CTRL_CHARACTERS = {Qt.Key_Space: " ", Qt.Key_At: "@", Qt.Key_2: "2", Qt.Key_Brac
                    Qt.Key_Minus: "-", Qt.Key_Slash: "/", Qt.Key_Question: "?"}
 APP_SHORTCUTS = {(Qt.Key_Tab, Qt.ControlModifier), (Qt.Key_Backtab, Qt.ControlModifier | Qt.ShiftModifier),
                  (Qt.Key_Tab, Qt.ControlModifier | Qt.ShiftModifier),
-                 (Qt.Key_F11, Qt.NoModifier)}  # Left to the window: switching tabs/pages, and focus mode
+                 (Qt.Key_F, Qt.ControlModifier),
+                 (Qt.Key_N, Qt.ControlModifier),
+                 (Qt.Key_N, Qt.ControlModifier | Qt.ShiftModifier),
+                 (Qt.Key_W, Qt.ControlModifier),
+                 (Qt.Key_Left, Qt.AltModifier), (Qt.Key_Right, Qt.AltModifier),
+                 (Qt.Key_Return, Qt.ControlModifier | Qt.ShiftModifier),
+                 (Qt.Key_Enter, Qt.ControlModifier | Qt.ShiftModifier),
+                 (Qt.Key_A, Qt.AltModifier), (Qt.Key_F1, Qt.NoModifier),
+                 (Qt.Key_F11, Qt.NoModifier)}  # Left to the window: switching tabs/pages, session filter, focus mode
 REPAINT_MILLISECONDS = 15
 RECONNECT_SECONDS = 10
 RECONNECT_LIMIT = 180  # Tries (half an hour) before giving up: long enough for a big chassis to reload
@@ -369,7 +378,7 @@ class TerminalView(QWidget):
         if event.type() == QEvent.ShortcutOverride:
             # Keys belong to the remote side (Ctrl+B for tmux, Ctrl+R for shell history, F5...), not NOMAD's
             # shortcuts, except the few that switch tabs and pages
-            if (event.key(), int(event.modifiers()) & int(Qt.ControlModifier | Qt.ShiftModifier)) not in \
+            if (event.key(), int(event.modifiers()) & ~int(Qt.KeypadModifier)) not in \
                     {(key, int(modifiers)) for key, modifiers in APP_SHORTCUTS}:
                 event.accept()
                 return True
@@ -498,6 +507,16 @@ class SessionView(PromptAnswers, QWidget):
         self.prompter = UiPrompter(self)
         self.log_file = None
         self.log_cleaner = LogCleaner()
+        self.config_capture = None
+        self.config_commands = []
+        self.config_profile = next(iter(CONFIG_PROFILES))
+        self.config_timer = QTimer(self)
+        self.config_timer.setSingleShot(True)
+        self.config_timer.timeout.connect(self.advance_config_capture)
+        self.config_timeout = QTimer(self)
+        self.config_timeout.setSingleShot(True)
+        self.config_timeout.timeout.connect(lambda: self.stop_config_capture(
+            "Timed out waiting for the device prompt. No configuration file was saved."))
         self.last_history = 0
         self.last_scrolled_out = 0
         self.model = TerminalModel(80, 24, session.scrollback, session.encoding, respond=self.respond)
@@ -560,6 +579,15 @@ class SessionView(PromptAnswers, QWidget):
         self.log_label.setStyleSheet(f"color: {COLORS['accent']};")
         status.addWidget(self.status_label, 1)
         status.addWidget(self.log_label)
+        self.config_button = QPushButton("Save Config…")
+        self.config_button.setToolTip("Save the full running configuration to a file on this workstation")
+        self.config_button.setEnabled(False)
+        self.config_button.clicked.connect(self.save_running_config)
+        status.addWidget(self.config_button)
+        self.logging_button = QPushButton("Log Session…")
+        self.logging_button.setToolTip("Choose a file on this workstation and start logging this session")
+        self.logging_button.clicked.connect(self.toggle_logging)
+        status.addWidget(self.logging_button)
         layout.addLayout(status)
 
         self.view.key_input.connect(self.type_text)
@@ -670,6 +698,7 @@ class SessionView(PromptAnswers, QWidget):
         self.set_state(DISCONNECTED, "Disconnected.")
 
     def close_transport(self):
+        self.stop_config_capture("Connection closed. No configuration file was saved.")
         self.prompter.cancel_all()
         if self.thread is not None:
             self.thread.stop()
@@ -698,6 +727,9 @@ class SessionView(PromptAnswers, QWidget):
         return True
 
     def add_tab_actions(self, menu, actions):
+        config_action = menu.addAction("Cancel Config Save" if self.config_capture else "Save Running Config…")
+        config_action.setEnabled(self.state == CONNECTED)
+        actions[config_action] = self.cancel_config_capture if self.config_capture else self.save_running_config
         if self.session.protocol == SERIAL:
             break_action = menu.addAction("Send Break")
             break_action.setToolTip("What Cisco devices watch for at boot to enter ROMMON (password recovery).")
@@ -727,6 +759,7 @@ class SessionView(PromptAnswers, QWidget):
 
     def set_state(self, state, detail=""):
         self.state = state
+        self.config_button.setEnabled(state == CONNECTED)
         self.status_text = {CONNECTING: "Connecting...", CONNECTED: detail,
                             DISCONNECTED: detail or "Not connected."}[state]
         if state != CONNECTED:
@@ -751,6 +784,11 @@ class SessionView(PromptAnswers, QWidget):
 
     def on_data(self, data):
         text = self.model.feed(data)
+        if self.config_capture is not None:
+            self.config_capture.feed(text)
+            self.config_timer.stop()
+            if self.config_capture.complete:
+                self.config_timer.start(500)
         self.after_output(text)
 
     def after_output(self, text=""):
@@ -787,7 +825,7 @@ class SessionView(PromptAnswers, QWidget):
 
     def send_text(self, text):
         """Send text as if typed here (without mirroring it). Returns whether it was sent."""
-        if self.state != CONNECTED or self.transport is None:
+        if self.state != CONNECTED or self.transport is None or self.config_capture is not None:
             return False
         data = text.encode(self.session.encoding, "replace")
         self.transport.send(data)
@@ -819,7 +857,7 @@ class SessionView(PromptAnswers, QWidget):
         last one too if final_enter (or the text ends with a line break). With a line delay set (the session's, or
         min_delay ms for a block that needs one, such as switch configuration), one line at a time, so slow
         consoles don't drop characters. Returns whether it's being sent."""
-        if self.state != CONNECTED or self.transport is None:
+        if self.state != CONNECTED or self.transport is None or self.config_capture is not None:
             return False
         normalized = text.replace("\r\n", "\n").replace("\r", "\n")
         lines = normalized.split("\n")
@@ -860,7 +898,8 @@ class SessionView(PromptAnswers, QWidget):
 
     def restart_idle_timer(self):
         """Anti-idle: after this long without sending anything, send the anti-idle text."""
-        if self.session.anti_idle > 0 and self.state == CONNECTED and decode_escapes(self.session.anti_idle_text):
+        if (self.config_capture is None and self.session.anti_idle > 0 and self.state == CONNECTED
+                and decode_escapes(self.session.anti_idle_text)):
             self.idle_timer.start(self.session.anti_idle * 1000)
         else:
             self.idle_timer.stop()
@@ -912,27 +951,142 @@ class SessionView(PromptAnswers, QWidget):
         self.view.set_offset(0)
         self.after_output()  # Counts the cleared lines as gone, which drops a selection on them
 
+    # ----------------------------------------------------------------- Running configuration
+
+    def save_running_config(self):
+        if self.config_capture is not None:
+            self.cancel_config_capture()
+            return
+        if self.state != CONNECTED or self.transport is None:
+            return
+        if self.outbox or self.typed_line:
+            QMessageBox.information(self, "Save Running Config", "Finish the current command before saving a config.")
+            return
+        cursor = self.model.cursor_position()
+        prompt = "".join(self.model.line(cursor.line)[column].data or " "
+                         for column in range(self.model.columns)).strip()
+        if not prompt or prompt[-1] not in "#>$%" or "(config" in prompt.lower():
+            QMessageBox.information(self, "Save Running Config",
+                                    "Return to the device's operational / exec prompt first. "
+                                    "For Cisco devices, use a privileged (#) prompt.")
+            return
+        profiles = list(CONFIG_PROFILES)
+        profile, accepted = QInputDialog.getItem(
+            self, "Save Running Config", "Device type (use a prompt with permission to view the full config):",
+            profiles, profiles.index(self.config_profile), False)
+        if not accepted:
+            return
+        commands = list(CONFIG_PROFILES[profile])
+        if not commands:
+            command, accepted = QInputDialog.getText(
+                self, "Config Command", "Command to display the entire config (disable paging first):",
+                text="show running-config")
+            if not accepted or not command.strip():
+                return
+            if any(char in command for char in "\r\n\x00"):
+                return
+            commands = [command.strip()]
+        safe_name = "".join(char if char.isalnum() or char in " -_.@" else "_" for char in self.session.name)
+        suggested = os.path.join(self.default_log_folder(),
+                                 f"{safe_name} running-config {time.strftime('%Y-%m-%d %H%M%S')}.cfg")
+        path, _ = QFileDialog.getSaveFileName(self, "Save Running Config", suggested,
+                                            "Configuration (*.cfg);;Text files (*.txt);;All files (*)")
+        if not path or self.state != CONNECTED:
+            return
+        self.config_profile = profile
+        self.config_path = path
+        self.config_prompt = prompt
+        self.config_commands = commands
+        self.config_button.setText("Cancel Save")
+        self.config_timeout.start(300000)
+        self.start_config_command()
+
+    def start_config_command(self):
+        command = self.config_commands.pop(0)
+        self.config_capture = ConfigCapture(self.config_prompt, command)
+        self.idle_timer.stop()
+        # Send only to this device; never mirror a capture into other sessions.
+        try:
+            self.transport.send((command + self.view.enter).encode(self.session.encoding, "replace"))
+        except Exception as error:
+            self.stop_config_capture(f"Couldn't request the configuration: {error}. No file was saved.")
+
+    def advance_config_capture(self):
+        capture = self.config_capture
+        if capture is None or not capture.complete:
+            return
+        try:
+            text = capture.output()
+            if self.config_commands:
+                self.start_config_command()
+                return
+            if not text.strip():
+                raise ValueError("The device returned no configuration.")
+            write_config(self.config_path, text)
+        except (ValueError, OSError) as error:
+            self.stop_config_capture(f"Config save failed: {error}. No configuration file was saved.")
+            return
+        path = self.config_path
+        self.stop_config_capture()
+        self.note(f"Saved running configuration to {path}", NOTE_COLOR)
+        self.config_button.setToolTip(f"Last saved configuration: {path}")
+
+    def stop_config_capture(self, message=""):
+        if self.config_capture is None:
+            return
+        self.config_timer.stop()
+        self.config_timeout.stop()
+        self.config_capture = None
+        self.config_commands = []
+        self.config_button.setText("Save Config…")
+        self.restart_idle_timer()
+        if message:
+            self.note(message, ERROR_COLOR)
+
+    def cancel_config_capture(self):
+        if self.config_capture is None:
+            return
+        try:
+            if self.transport is not None:
+                self.transport.send(b"\x03")
+        except Exception as error:
+            log.warning("Couldn't interrupt config capture: %s", error)
+        finally:
+            self.stop_config_capture("Config save cancelled. No configuration file was saved.")
+
     # ----------------------------------------------------------------- Logging
 
     def default_log_folder(self):
         return self.session.log_folder or os.path.join(os.path.expanduser("~"), "Documents", "NOMAD Logs")
 
-    def start_logging(self):
+    def suggested_log_path(self):
         folder = self.default_log_folder()
         safe_name = "".join(character if character.isalnum() or character in " -_.@" else "_"
                             for character in self.session.name)
-        path = os.path.join(folder, f"{safe_name} {time.strftime('%Y-%m-%d %H%M%S')}.log")
-        try:
-            os.makedirs(folder, exist_ok=True)
-            self.log_file = open(path, "a", encoding="utf-8", buffering=1)
-            self.log_file.write(f"--- {self.session.name} ({self.session.target()}), {time.strftime('%c')} ---\n")
-        except OSError as error:
-            self.note(f"Couldn't start logging to {path}: {error}", ERROR_COLOR)
-            self.log_file = None
+        return os.path.join(folder, f"{safe_name} {time.strftime('%Y-%m-%d %H%M%S')}.log")
+
+    def start_logging(self, path=None):
+        if self.log_file is not None:
             return
+        automatic = path is None
+        path = self.suggested_log_path() if automatic else path
+        file = None
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            file = open(path, "a" if automatic else "w", encoding="utf-8", buffering=1)
+            file.write(f"--- {self.session.name} ({self.session.target()}), {time.strftime('%c')} ---\n")
+        except OSError as error:
+            if file is not None:
+                file.close()
+            self.note(f"Couldn't start logging to {path}: {error}", ERROR_COLOR)
+            return
+        self.log_file = file
+        self.log_cleaner = LogCleaner()
         self.log_path = path
         self.log_label.setText("● Logging")
         self.log_label.setToolTip(path)
+        self.logging_button.setText("Stop Logging")
+        self.logging_button.setToolTip(f"Stop logging to {path}")
         self.note(f"Logging to {path}", NOTE_COLOR)
 
     def stop_logging(self):
@@ -943,10 +1097,16 @@ class SessionView(PromptAnswers, QWidget):
                 pass
             self.log_file = None
             self.log_label.clear()
+            self.log_label.setToolTip("")
+            self.logging_button.setText("Log Session…")
+            self.logging_button.setToolTip("Choose a file on this workstation and start logging this session")
 
     def toggle_logging(self):
         if self.log_file is None:
-            self.start_logging()
+            path, _ = QFileDialog.getSaveFileName(self, "Log Session", self.suggested_log_path(),
+                                                "Log files (*.log);;Text files (*.txt);;All files (*)")
+            if path:
+                self.start_logging(path)
         else:
             self.stop_logging()
             self.note("Stopped logging.", NOTE_COLOR)

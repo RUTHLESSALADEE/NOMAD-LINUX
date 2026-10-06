@@ -132,6 +132,10 @@ class PingTab(QWidget):
 
     # ----------------------------------------------------------------- Tab interface
 
+    def focus_find(self):
+        self.host_input.setFocus()
+        self.host_input.selectAll()
+
     def save_settings(self, settings):
         settings.setValue("ping/host", self.host_input.text())
         settings.setValue("ping/count", self.count_input.text())

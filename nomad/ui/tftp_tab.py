@@ -5,7 +5,7 @@ import time
 
 from PyQt5.QtCore import QObject, Qt, pyqtSignal
 from PyQt5.QtGui import QColor
-from PyQt5.QtWidgets import QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, \
+from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, \
     QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QSpinBox, QSplitter, QTableWidget, QVBoxLayout, QWidget
 
 from ..system import allow_inbound_port
@@ -77,7 +77,8 @@ class TftpTab(QWidget):
     def init_ui(self):
         layout = QVBoxLayout(self)
         splitter = QSplitter(Qt.Vertical)
-        splitter.addWidget(self.build_server_group())
+        self.server_group = self.build_server_group()
+        splitter.addWidget(self.server_group)
         splitter.addWidget(self.build_client_group())
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
@@ -402,6 +403,13 @@ class TftpTab(QWidget):
             self.client_stop.setEnabled(False)
 
     # ----------------------------------------------------------------- Page interface
+
+    def focus_find(self):
+        # Both sections are visible: keep the shortcut in the section the user is working in.
+        focus = QApplication.focusWidget()
+        target = self.folder_input if focus is not None and self.server_group.isAncestorOf(focus) else self.client_host
+        target.setFocus()
+        target.selectAll()
 
     def save_settings(self, settings):
         settings.setValue("tftp/folder", self.folder_input.text())

@@ -16,8 +16,10 @@ from .vault import Vault
 log = logging.getLogger(__name__)
 
 SSH, TELNET, SERIAL, RAW = "SSH", "Telnet", "Serial", "Raw TCP"
-PROTOCOLS = [SSH, TELNET, SERIAL, RAW]
-DEFAULT_PORTS = {SSH: 22, TELNET: 23, RAW: 23}
+RDP = "RDP"
+TERMINAL_PROTOCOLS = [SSH, TELNET, SERIAL, RAW]
+PROTOCOLS = [*TERMINAL_PROTOCOLS, RDP]
+DEFAULT_PORTS = {SSH: 22, TELNET: 23, RAW: 23, RDP: 3389}
 AUTH_PASSWORD, AUTH_KEY, AUTH_AGENT = "password", "key", "agent"
 FILE_PROTOCOLS = ["Auto", "SFTP", "SCP"]
 PARITIES = ["None", "Even", "Odd", "Mark", "Space"]
@@ -69,6 +71,13 @@ class Session:
     anti_idle_text: str = " \\b"  # Space, backspace: nothing to see at a prompt. See decode_escapes
     notes: str = ""
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    rdp_fullscreen: bool = True
+    rdp_multimon: bool = False
+    rdp_width: int = 1280
+    rdp_height: int = 800
+    rdp_clipboard: bool = True
+    rdp_audio: int = 0  # 0: this computer; 1: remote computer; 2: off
+    rdp_admin: bool = False
 
     @property
     def path(self):
@@ -81,8 +90,9 @@ class Session:
             stop = int(self.stop_bits) if float(self.stop_bits).is_integer() else self.stop_bits
             return f"{self.serial_port} {self.baud_rate} {self.data_bits}{parity}{stop}"
         default = DEFAULT_PORTS.get(self.protocol)
-        where = self.host if self.port == default else f"{self.host}:{self.port}"
-        return f"{self.username}@{where}" if self.protocol == SSH and self.username else where
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        where = host if self.port == default else f"{host}:{self.port}"
+        return f"{self.username}@{where}" if self.protocol in (SSH, RDP) and self.username else where
 
     def copy(self, **changes):
         """A copy with a new id (so it's a separate session), unless an id is given."""
@@ -106,6 +116,9 @@ def validate_session(session):
         return None
     if not session.host.strip():
         return "Enter the host name or IP address to connect to."
+    if session.protocol == RDP:
+        from ..rdp import validate_rdp
+        return validate_rdp(session)
     if not 1 <= int(session.port) <= 65535:
         return "The port must be between 1 and 65535."
     if session.protocol == SSH and session.auth == AUTH_KEY and not session.key_file.strip():
@@ -200,6 +213,7 @@ class SessionStore:
         self.path = path or os.path.join(app_data_dir(), FILE_NAME)
         self.sessions = []
         self.folders = set()  # Includes empty folders, which have no session to imply them
+        self.rdp_folders = set()  # RDP has its own folder namespace.
         self.recent = []  # RecentEntry, newest first
         self.vault_settings = {}  # Master password salt and check value (no secrets), kept by the Vault
         self.vault = Vault(self.vault_settings, self.save)
@@ -208,6 +222,7 @@ class SessionStore:
 
     def load(self):
         self.sessions, self.folders, self.recent = [], set(), []
+        self.rdp_folders = set()
         self.vault_settings.clear()
         if not os.path.exists(self.path):
             return
@@ -220,13 +235,18 @@ class SessionStore:
         self.sessions = [session_from_dict(item) for item in data.get("sessions", []) if isinstance(item, dict)]
         self.folders = {normalize_folder(folder) for folder in data.get("folders", []) if isinstance(folder, str)}
         self.folders.discard("")
+        self.rdp_folders = {normalize_folder(folder) for folder in data.get("rdp_folders", [])
+                            if isinstance(folder, str)}
+        self.rdp_folders.discard("")
         self.recent = [RecentEntry.from_dict(item) for item in data.get("recent", [])
                        if isinstance(item, dict)][:RECENT_LIMIT]
         if isinstance(data.get("vault"), dict):
             self.vault_settings.update(data["vault"])
 
     def save(self):
-        data = {"version": FORMAT_VERSION, "folders": sorted(self.all_folders()),
+        terminal_folders = SessionFolderStore(self, TERMINAL_PROTOCOLS).all_folders()
+        rdp_folders = SessionFolderStore(self, {RDP}, "rdp_folders").all_folders()
+        data = {"version": FORMAT_VERSION, "folders": sorted(terminal_folders), "rdp_folders": sorted(rdp_folders),
                 "sessions": [dataclasses.asdict(session) for session in self.sessions],
                 "recent": [entry.to_dict() for entry in self.recent]}
         if self.vault_settings:
@@ -247,6 +267,11 @@ class SessionStore:
             for depth in range(1, len(parts) + 1):
                 folders.add("/".join(parts[:depth]))
         return folders
+
+    @property
+    def credential_sessions(self):
+        """All sessions protected by this vault, across folder namespaces."""
+        return self.sessions
 
     def get(self, session_id):
         return next((session for session in self.sessions if session.id == session_id), None)
@@ -407,11 +432,73 @@ class SessionStore:
         return f"{name} ({number})"
 
 
+class SessionFolderStore(SessionStore):
+    """A protocol-scoped folder view over one store, sharing its vault and persistence.
+
+    All inherited mutations see only this view's sessions and folders, so identical
+    folder paths can be renamed or deleted independently on RDP and Terminal/SCP.
+    """
+
+    def __init__(self, source, protocols, folder_key="folders"):
+        self.source = getattr(source, "source", source)
+        self.protocols = set(protocols)
+        self.folder_key = folder_key
+
+    def __getattr__(self, name):
+        return getattr(self.source, name)
+
+    @property
+    def sessions(self):
+        return [session for session in self.source.sessions if session.protocol in self.protocols]
+
+    @sessions.setter
+    def sessions(self, sessions):
+        self.source.sessions = [session for session in self.source.sessions if session.protocol not in self.protocols] + \
+            list(sessions)
+
+    @property
+    def folders(self):
+        return getattr(self.source, self.folder_key)
+
+    @folders.setter
+    def folders(self, folders):
+        setattr(self.source, self.folder_key, folders)
+
+    @property
+    def recent(self):
+        return self.source.recent
+
+    @recent.setter
+    def recent(self, recent):
+        self.source.recent = recent
+
+    @property
+    def credential_sessions(self):
+        return self.source.sessions
+
+    def put(self, session):
+        if session.protocol not in self.protocols:
+            raise ValueError("This session belongs to a different page.")
+        session.folder = normalize_folder(session.folder)
+        sessions = self.sessions
+        for index, existing in enumerate(sessions):
+            if existing.id == session.id:
+                sessions[index] = session
+                break
+        else:
+            sessions.append(session)
+        self.sessions = sessions
+        self.save()
+
+    def save(self):
+        self.source.save()
+
+
 # ----------------------------------------------------------------- Quick connect
 
-QUICK_PATTERN = re.compile(r"^(?:(?P<scheme>ssh|telnet|raw|serial)(?:://|\s+))?(?:(?P<user>[^@\s]+)@)?"
+QUICK_PATTERN = re.compile(r"^(?:(?P<scheme>ssh|telnet|raw|serial|rdp)(?:://|\s+))?(?:(?P<user>[^@\s]+)@)?"
                            r"(?P<host>\[[^\]]+\]|[^\s:]+)(?::(?P<port>\d+))?$", re.IGNORECASE)
-SCHEMES = {"ssh": SSH, "telnet": TELNET, "raw": RAW, "serial": SERIAL}
+SCHEMES = {"ssh": SSH, "telnet": TELNET, "raw": RAW, "serial": SERIAL, "rdp": RDP}
 
 
 def parse_quick_connect(text, default_protocol=SSH):
@@ -516,7 +603,7 @@ def import_putty(store, putty_sessions=None):
         session = session_from_putty(name, values)
         if session is None or (session.name.lower(), session.host.lower(), session.protocol) in existing:
             continue
-        store.sessions.append(session)
+        store.sessions = [*store.sessions, session]
         existing.add((session.name.lower(), session.host.lower(), session.protocol))
         added += 1
     if added:

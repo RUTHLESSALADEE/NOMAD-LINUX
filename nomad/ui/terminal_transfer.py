@@ -122,7 +122,7 @@ def import_terminal(window):
     answer = QMessageBox.question(window, "Import NOMAD Terminal",
                                   f"Restore {len(data['sessions'])} saved sessions and all terminal settings?\n\n"
                                   "This replaces your saved sessions, recent connections, command buttons, "
-                                  "highlighting and Terminal/SCP preferences. Existing live connections stay open. "
+                                  "highlighting and Terminal/SCP/RDP preferences. Existing live connections stay open. "
                                   "Credentials will use this installation's master password protection.\n\n"
                                   "Export a backup first if you want to keep the current configuration.",
                                   QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
@@ -134,6 +134,8 @@ def import_terminal(window):
         restore_backup(data, tab.store, tab.commands, tab.highlights, window.settings)
         tab.restore_settings(window.settings)
         window.scp_tab.restore_settings(window.settings)
+        if hasattr(window, "rdp_tab"):
+            window.rdp_tab.restore_settings(window.settings)
         window.set_text_scale(window.settings.value("view/text_scale", 1.0, float))
     except (OSError, CredentialError, VaultLocked, ValueError, TypeError) as error:
         QMessageBox.critical(window, "Import NOMAD Terminal", f"Couldn't finish restoring the backup:\n\n{error}")

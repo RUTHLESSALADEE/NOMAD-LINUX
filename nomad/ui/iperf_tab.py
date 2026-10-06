@@ -183,6 +183,12 @@ class IperfTab(QWidget):
 
     # ----------------------------------------------------------------- Tab interface
 
+    def focus_find(self):
+        # Server mode has no remote host: focus its listening port without changing modes.
+        target = self.host_input if self.client_radio.isChecked() else self.server_port_input
+        target.setFocus()
+        target.selectAll()
+
     def save_settings(self, settings):
         settings.setValue("iperf/mode", "server" if self.server_radio.isChecked() else "client")
         settings.setValue("iperf/host", self.host_input.text())

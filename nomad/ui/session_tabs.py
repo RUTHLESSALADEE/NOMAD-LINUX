@@ -328,6 +328,16 @@ class SessionTabs(QWidget):
 
         QApplication.instance().focusChanged.connect(self.on_focus_changed)
         self.set_layout("tabs")
+        for keys, callback in (
+            ("Ctrl+W", self.close_current),
+            ("Alt+Left", lambda: self.step_session(-1)),
+            ("Alt+Right", lambda: self.step_session(1)),
+            ("Ctrl+Shift+Return", self.pop_out_current),
+            ("Ctrl+Shift+Enter", self.pop_out_current),
+        ):
+            shortcut = QShortcut(QKeySequence(keys), self, context=Qt.WindowShortcut)
+            shortcut.setAutoRepeat(False)
+            shortcut.activated.connect(callback)
 
     # ----------------------------------------------------------------- Tab-widget interface (all panes together)
 
@@ -398,6 +408,31 @@ class SessionTabs(QWidget):
         self.take_view(view)
         view.shutdown()
         view.deleteLater()
+
+    def close_current(self):
+        view = self.currentWidget()
+        if view is None:
+            return
+        # SCP's existing question includes running transfers and unsaved edits.
+        has_problems = hasattr(view, "problems") and bool(view.problems())
+        if view.state != DISCONNECTED and not has_problems:
+            reply = QMessageBox.question(self, "Close Session", f"Close {view.session.name} and disconnect?",
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if reply != QMessageBox.Yes:
+                return
+        self.close_view(view)
+
+    def step_session(self, step):
+        if self.count():
+            self.setCurrentIndex((self.currentIndex() + step) % self.count())
+
+    def pop_out_current(self):
+        view = self.currentWidget()
+        if view is not None:
+            if self.page.tabs is self:
+                self.page.pop_out(view)
+            else:
+                self.page.move_to_main(view, self)
 
     def move_view(self, view, pane, source_tabs=None):
         """Move a session to another pane (it stays connected), from these tabs or another window's."""
@@ -616,6 +651,15 @@ class SessionWindow(QMainWindow):
                                                                      max(1, self.tabs.count())))
         full_screen = QShortcut(QKeySequence("F11"), self)
         full_screen.activated.connect(self.toggle_full_screen)
+        for keys, callback in (
+            ("F1", lambda: self.page.window.show_shortcuts(
+                "Terminal" if self.page.settings_prefix == "terminal" else "SCP")),
+            ("Ctrl+N", lambda: self.page.manager.new_session(self.page.manager.selected_folder())),
+            ("Ctrl+Shift+N", lambda: self.page.manager.new_folder(self.page.manager.selected_folder())),
+        ):
+            shortcut = QShortcut(QKeySequence(keys), self)
+            shortcut.setAutoRepeat(False)
+            shortcut.activated.connect(callback)
 
     def toggle_full_screen(self):
         """F11 in a pop-out window: the whole screen for its sessions."""
@@ -632,7 +676,7 @@ class SessionWindow(QMainWindow):
             reply = QMessageBox.question(self, "Close Window",
                                          f"Close this window and disconnect {len(connected)} session"
                                          f"{'' if len(connected) == 1 else 's'}?",
-                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
             if reply != QMessageBox.Yes:
                 event.ignore()
                 return

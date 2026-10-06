@@ -145,6 +145,10 @@ class SubnetTab(QWidget):
 
     # ----------------------------------------------------------------- Tab interface
 
+    def focus_find(self):
+        self.subnet_input.setFocus()
+        self.subnet_input.selectAll()
+
     def save_settings(self, settings):
         # The key is kept from the old Utilities tab
         settings.setValue("utilities/subnet", self.subnet_input.text())

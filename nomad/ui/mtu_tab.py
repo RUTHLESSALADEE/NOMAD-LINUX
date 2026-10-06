@@ -119,6 +119,10 @@ class MtuTab(QWidget):
 
     # ----------------------------------------------------------------- Tab interface
 
+    def focus_find(self):
+        self.host_input.setFocus()
+        self.host_input.selectAll()
+
     def save_settings(self, settings):
         for key, line_edit in self.inputs().items():
             settings.setValue(f"mtu/{key}", line_edit.text())

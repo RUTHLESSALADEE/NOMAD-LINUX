@@ -74,6 +74,10 @@ class WebCheckTab(QWidget):
 
     # ----------------------------------------------------------------- Page interface
 
+    def focus_find(self):
+        self.url_input.setFocus()
+        self.url_input.selectAll()
+
     def save_settings(self, settings):
         settings.setValue("services/url", self.url_input.text())
         settings.setValue("services/web_timeout", self.web_timeout_input.value())

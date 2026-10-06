@@ -8,21 +8,25 @@ from PyQt5.QtGui import QCursor
 from PyQt5.QtWidgets import QApplication, QMenu, QMessageBox
 
 from ..sweep import find_putty
-from ..terminal.sessions import SSH, TELNET
+from ..terminal.sessions import RDP, SSH, TELNET
 
 
 class HostActions:
     def __init__(self, window, parent):
         self.window, self.parent = window, parent
 
-    def add_to(self, menu, host, aliases=(), name="", folder="", snmp=None, sessions=("SSH", "SCP", "Telnet")):
+    def add_to(self, menu, host, aliases=(), name="", folder="", snmp=None, sessions=("SSH", "SCP", "Telnet", "RDP")):
         """Add the actions for host to menu. Returns {QAction: callable} for running the chosen one. aliases: the
         host's other addresses and names, for finding its saved sessions; name and folder: what to call a new
         session to it, and the folder to suggest when it's saved; snmp: (community, version) for SNMP Details, when
         the page knows what the host answers to."""
         actions = {}
-        for label, page, protocol in (("SSH", self.window.terminal_tab, SSH), ("SCP", self.window.scp_tab, SSH),
-                                      ("Telnet", self.window.terminal_tab, TELNET)):
+        pages = [("SSH", self.window.terminal_tab, SSH), ("SCP", self.window.scp_tab, SSH),
+                 ("Telnet", self.window.terminal_tab, TELNET)]
+        rdp_page = getattr(self.window, "rdp_tab", None)
+        if callable(getattr(rdp_page, "saved_matches", None)):
+            pages.append(("RDP", rdp_page, RDP))
+        for label, page, protocol in pages:
             if label not in sessions:
                 continue
             matches = page.saved_matches(host, aliases, protocol)

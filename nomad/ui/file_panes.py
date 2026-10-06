@@ -10,9 +10,9 @@ import string
 import time
 
 from PyQt5.QtCore import QEvent, QMimeData, QUrl, Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QDrag, QFont
+from PyQt5.QtGui import QColor, QDrag, QFont, QKeySequence
 from PyQt5.QtWidgets import QAbstractItemView, QFileIconProvider, QHBoxLayout, QHeaderView, QLabel, QLineEdit, \
-    QPushButton, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
+    QPushButton, QShortcut, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
 
 from ..terminal.files import Entry, parent as remote_parent
 from .common import format_size, run_in_background
@@ -28,8 +28,10 @@ COMMANDS = {
     (Qt.Key_F7, Qt.NoModifier): "mkdir", (Qt.Key_F8, Qt.NoModifier): "delete",
     (Qt.Key_Delete, Qt.NoModifier): "delete", (Qt.Key_R, Qt.ControlModifier): "refresh",
     (Qt.Key_Return, Qt.AltModifier): "properties", (Qt.Key_Enter, Qt.AltModifier): "properties",
-    (Qt.Key_Backspace, Qt.NoModifier): "up", (Qt.Key_Left, Qt.AltModifier): "back",
-    (Qt.Key_H, Qt.ControlModifier | Qt.AltModifier): "hidden", (Qt.Key_F, Qt.ControlModifier): "filter",
+    (Qt.Key_Backspace, Qt.NoModifier): "up", (Qt.Key_Up, Qt.AltModifier): "back",
+    (Qt.Key_L, Qt.ControlModifier): "path",
+    (Qt.Key_H, Qt.ControlModifier | Qt.AltModifier): "hidden",
+    (Qt.Key_F, Qt.ControlModifier | Qt.ShiftModifier): "filter",
 }
 
 
@@ -228,7 +230,7 @@ class FilePane(QWidget):
         self.path_input = QLineEdit()
         self.path_input.setToolTip("The folder shown. Type a path and press Enter to go there.")
         self.up_button = self.tool_button("↑", "Up a folder (Backspace)")
-        self.back_button = self.tool_button("←", "Back (Alt+Left)")
+        self.back_button = self.tool_button("←", "Back (Alt+Up)")
         self.home_button = self.tool_button("⌂", "Home folder")
         self.refresh_button = self.tool_button("⟳", "Refresh (Ctrl+R)")
         bar.addWidget(label)
@@ -237,7 +239,7 @@ class FilePane(QWidget):
             bar.addWidget(button)
         layout.addLayout(bar)
         self.filter_input = QLineEdit()
-        self.filter_input.setPlaceholderText("Filter names (Ctrl+F)")
+        self.filter_input.setPlaceholderText("Filter names (Ctrl+Shift+F)")
         self.filter_input.setClearButtonEnabled(True)
         self.filter_input.setVisible(False)
         layout.addWidget(self.filter_input)
@@ -264,6 +266,8 @@ class FilePane(QWidget):
         self.list.itemActivated.connect(self.on_activated)
         self.list.itemSelectionChanged.connect(self.update_status)
         self.list.command.connect(self.on_command)
+        path_shortcut = QShortcut(QKeySequence("Ctrl+L"), self, context=Qt.WidgetWithChildrenShortcut)
+        path_shortcut.activated.connect(self.focus_path)
         self.filter_input.textChanged.connect(self.apply_filter)
 
     @staticmethod
@@ -361,8 +365,14 @@ class FilePane(QWidget):
         elif name == "filter":
             self.filter_input.setVisible(True)
             self.filter_input.setFocus()
+        elif name == "path":
+            self.focus_path()
         else:
             self.command_requested.emit(name)
+
+    def focus_path(self):
+        self.path_input.setFocus()
+        self.path_input.selectAll()
 
     # ----------------------------------------------------------------- Showing a folder
 

@@ -160,6 +160,10 @@ class DnsServersTab(QWidget):
 
     # ----------------------------------------------------------------- Page interface
 
+    def focus_find(self):
+        self.names_input.setFocus()
+        self.names_input.selectAll()
+
     def save_settings(self, settings):
         settings.setValue("services/names", self.names_input.text())
         settings.setValue("services/rounds", self.rounds_input.value())

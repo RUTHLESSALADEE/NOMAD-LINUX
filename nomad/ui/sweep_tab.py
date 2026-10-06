@@ -211,6 +211,10 @@ class SweepTab(QWidget):
 
     # ----------------------------------------------------------------- Tab interface
 
+    def focus_find(self):
+        self.subnet_input.setFocus()
+        self.subnet_input.selectAll()
+
     def save_settings(self, settings):
         settings.setValue("sweep/subnet", self.subnet_input.text())
         settings.setValue("sweep/workers", self.workers_input.value())
