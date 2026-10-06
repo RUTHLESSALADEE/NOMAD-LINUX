@@ -9,7 +9,7 @@ import ipaddress
 import re
 from dataclasses import dataclass, field
 
-from .model import port_key, port_sort_key
+from .model import normalize_vtp_domain, port_key, port_sort_key
 
 ACCESS, TRUNK = "access", "trunk"
 NATIVE, TAGGED, VOICE = "native", "tagged", "voice"
@@ -167,7 +167,7 @@ def gateways(device):
 
 
 def domain_of(device):
-    return device.vtp_domain or ""
+    return normalize_vtp_domain(device.vtp_domain)
 
 
 @dataclass
@@ -262,11 +262,23 @@ class Focus:
 def focus(network_map, vlan, domain=None):
     """Focus for a VLAN: the devices that have it, its gateways, and the links carrying it (a link carries it when
     either end's port does). domain None: in any domain."""
+    domain = normalize_vtp_domain(domain) if domain is not None else None
     result = Focus(vlan, domain or "")
     devices = network_map.devices
 
     def in_domain(device):
-        return domain is None or domain_of(device) == domain or (not device.vlans and not device.vtp_domain)
+        device_domain = domain_of(device)
+        if not device.vlans and not device_domain:
+            device_domain = linked_domain(network_map, device.key)
+        return domain is None or device_domain == domain
+
+    def port_carries(device, info):
+        if not in_domain(device):
+            return ""
+        # An allowed list (often 1-4094) permits a VLAN; it doesn't create it on the switch.
+        if info.get("mode") == TRUNK and vlan not in vlan_names(device):
+            return ""
+        return carries(info, vlan)
 
     for key, device in devices.items():
         if not in_domain(device):
@@ -286,15 +298,17 @@ def focus(network_map, vlan, domain=None):
         if a is None or b is None or not (in_domain(a) or in_domain(b)):
             continue
         infos = [port_info(device, port) for device, port in ((a, link.a_port), (b, link.b_port))]
-        ways = [carries(info, vlan) for info in infos if info]  # Ends whose ports are known
+        ends = [port_carries(device, info) for device, info in zip((a, b), infos)]
+        ways = [way for way, info in zip(ends, infos) if info]  # Ends whose ports are known
         if not any(ways):
             continue
         if not all(ways):
             result.links[id(link)] = ONE_END  # Known at both ends, and only one carries it
         else:
             result.links[id(link)] = TAGGED if TAGGED in ways else NATIVE if NATIVE in ways else ACCESS
-        for key in (link.a, link.b):
-            result.devices.setdefault(key, "carries it")
+        for key, way in zip((link.a, link.b), ends):
+            if way:
+                result.devices.setdefault(key, "carries it")
     return result
 
 

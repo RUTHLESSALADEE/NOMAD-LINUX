@@ -46,8 +46,6 @@ QListWidget#navigation::item:hover {{ background: {panel}; }}
 QListWidget#navigation::item:selected {{ background: {panel}; color: {accent}; border-left: 3px solid {accent}; }}
 QStackedWidget#pages {{ background: {panel}; border: 1px solid {border}; border-left: none; }}
 QWidget#toolDrawer {{ background: {background}; border-right: 1px solid {border}; }}
-QListWidget#navigationQuick {{ background: {background}; border: none; }}
-QListWidget#navigationQuick::item {{ padding: 4px 10px; }}
 QListWidget#favoriteRail {{ background: {background}; border: none; outline: none; }}
 QListWidget#favoriteRail::item {{ color: {muted}; border-left: 3px solid transparent; }}
 QListWidget#favoriteRail::item:selected {{ color: {accent}; background: {panel}; border-left: 3px solid {accent}; }}

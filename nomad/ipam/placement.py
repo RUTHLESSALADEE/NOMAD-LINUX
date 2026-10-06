@@ -3,8 +3,9 @@ network map finds it, and whether it's advertised, so a subnet that must be in o
 
 Kept in the IPAM database beside the VLANs: per subnet of a network, its scope when the map's routing tables
 don't say it right (Placement: advertised or local, or its places one L2 segment the map can't see), and moves
-(SubnetMove) from one VLAN, and device, to another. Finishing a move relinks the subnet from the old VLAN to the new
-one, in the same change. And what a subnet is for (its role, see roles.py) where someone set it. As with VLANs,
+(SubnetMove) between VLANs or devices, including routed destinations without a VLAN. Finishing a move removes the
+old VLAN link and adds the new one when specified, in the same change. And what a subnet is for (its role, see
+roles.py) where someone set it. As with VLANs,
 nothing is written to IPAM's networks, subnets or addresses.
 
 evaluate() puts the database and a map's netmap.placement.analyse() together into Rows, with what's wrong with each.
@@ -119,9 +120,12 @@ class PlacementStore:
     def plan_move(self, network_id, cidr, from_domain_id="", from_vlan=0, from_device="", to_domain_id="", to_vlan=0,
                   to_device="", planned_for="", note=""):
         cidr = str(parse_subnet(cidr))
-        if not to_domain_id or not to_vlan:
-            raise IpamError("Choose the VLAN it's moving to.")
-        to_vlan = check_number(to_vlan)
+        if bool(to_domain_id) != bool(to_vlan):
+            raise IpamError("Choose the VLAN and domain it's moving to, or neither for a move without a VLAN.")
+        from_device, to_device = from_device.strip(), to_device.strip()
+        if not to_vlan and not to_device:
+            raise IpamError("Choose the device it's moving to without a VLAN.")
+        to_vlan = check_number(to_vlan) if to_vlan else 0
         from_vlan = check_number(from_vlan) if from_vlan else 0
         if (from_domain_id, from_vlan, from_device) == (to_domain_id, to_vlan, to_device):
             raise IpamError("It's moving to where it is already.")
@@ -158,7 +162,7 @@ class PlacementStore:
 
     def complete_move(self, move_id):
         """Mark a move done and relink the subnet: out of the VLAN it moved from, into the one it moved to (added to
-        that domain if it isn't there yet), all at once."""
+        that domain if it isn't there yet), or without a new link for a routed move, all at once."""
         with self.store.transaction():
             move = self.move(move_id)
             if move.status not in OPEN:
@@ -169,16 +173,17 @@ class PlacementStore:
                                                   move.from_domain_id != move.to_domain_id):
                     vlans.set_vlan(vlan.domain_id, vlan.vlan, vlan.name, vlan.status,
                                    [cidr for cidr in vlan.subnets if cidr != move.cidr], vlan.description, vlan.fields)
-            for vlan in vlans.vlans(move.to_domain_id):  # Linked elsewhere in the domain it moves into: not now
+            for vlan in vlans.vlans(move.to_domain_id) if move.to_domain_id else []:
                 if move.cidr in vlan.subnets and vlan.vlan != move.to_vlan:
                     vlans.set_vlan(vlan.domain_id, vlan.vlan, vlan.name, vlan.status,
                                    [cidr for cidr in vlan.subnets if cidr != move.cidr], vlan.description, vlan.fields)
-            target = vlans.vlan(move.to_domain_id, move.to_vlan)
-            if target is None:
-                vlans.set_vlan(move.to_domain_id, move.to_vlan, "", ACTIVE, [move.cidr])
-            elif move.cidr not in target.subnets:
-                vlans.set_vlan(target.domain_id, target.vlan, target.name, target.status,
-                               target.subnets + [move.cidr], target.description, target.fields)
+            if move.to_domain_id and move.to_vlan:
+                target = vlans.vlan(move.to_domain_id, move.to_vlan)
+                if target is None:
+                    vlans.set_vlan(move.to_domain_id, move.to_vlan, "", ACTIVE, [move.cidr])
+                elif move.cidr not in target.subnets:
+                    vlans.set_vlan(target.domain_id, target.vlan, target.name, target.status,
+                                   target.subnets + [move.cidr], target.description, target.fields)
             return self.store._update("subnet_moves", move, {"status": DONE, "finished": now()})
 
 
@@ -436,7 +441,7 @@ def move_check(row, move, network_map):
         return False, "no device on the map has an address in it (read the routes again once it's up at the new place)"
 
     def at(place, vlan, device):
-        return (not vlan or place.vlan == vlan) and (not device or place.device == device)
+        return place.vlan == vlan and (not device or place.device == device)
 
     def label(place):
         device = network_map.devices.get(place.device)
@@ -449,8 +454,9 @@ def move_check(row, move, network_map):
                                                                                     move.from_device))]
     others = [place for place in places if place not in new and place not in old]
     if not new:
-        return False, f"not at the new place yet (VLAN {move.to_vlan}" + (f" on {move.to_device}" if move.to_device
-                                                                           else "") + ")"
+        destination = f"VLAN {move.to_vlan}" if move.to_vlan else "no VLAN"
+        return False, f"not at the new place yet ({destination}" + (f" on {move.to_device}" if move.to_device
+                                                                      else "") + ")"
     if old:
         return False, f"still at the old place too: {', '.join(label(place) for place in old[:3])}"
     if others and row.scope == ADVERTISED:

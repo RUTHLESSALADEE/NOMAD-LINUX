@@ -407,7 +407,7 @@ class NetworkMapTab(QWidget):
         self.vlan_label = QLabel()
         self.vlan_label.setWordWrap(True)
         self.vlan_clear_button = QPushButton("Show All")
-        self.vlan_clear_button.setToolTip("Stop highlighting the VLAN.")
+        self.vlan_clear_button.setToolTip("Stop highlighting the VLAN (Esc).")
         vlan_row.addWidget(self.vlan_label, 1)
         vlan_row.addWidget(self.vlan_clear_button)
         self.vlan_bar.hide()
@@ -441,6 +441,8 @@ class NetworkMapTab(QWidget):
         self.redo_button.clicked.connect(self.redo)
         for keys, handler in ((QKeySequence.Undo, self.undo), ("Ctrl+Y", self.redo), ("Ctrl+Shift+Z", self.redo)):
             QShortcut(QKeySequence(keys), self, context=Qt.WidgetWithChildrenShortcut).activated.connect(handler)
+        QShortcut(QKeySequence("Esc"), self, context=Qt.WidgetWithChildrenShortcut).activated.connect(
+            self.on_escape)
         self.arrange_button.clicked.connect(lambda: self.rearrange())
         self.hosts_check.toggled.connect(self.view.set_all_hosts_shown)
         self.monitor_check.toggled.connect(self.on_monitor_toggled)
@@ -1538,6 +1540,13 @@ class NetworkMapTab(QWidget):
     def clear_vlan(self):
         self.vlan_shown = None
         self.apply_vlan_focus()
+
+    def on_escape(self):
+        view = self.current_view()
+        if view.drawing is not None:
+            view.cancel_drawing()
+        else:
+            self.clear_vlan()
 
     # ----------------------------------------------------------------- The IPAM network, and the other pages
 

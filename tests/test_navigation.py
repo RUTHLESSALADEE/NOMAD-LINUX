@@ -2,9 +2,10 @@
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
-from PyQt5.QtCore import QSettings
+from PyQt5.QtCore import QSettings, Qt
+from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QWidget
-from nomad.ui.navigation import Navigator
+from nomad.ui.navigation import Navigator, NavigationDelegate, PAGE_ROLE, SECTION_ROLE
 
 @pytest.fixture
 def nav():
@@ -96,3 +97,125 @@ def test_outside_click_closes_drawer(nav):
     nav.open_drawer()
     QTest.mouseClick(nav.currentWidget(), Qt.LeftButton)
     assert not nav.panel.isVisible()
+
+
+@pytest.mark.parametrize("opening", ["shortcut", "mouse"])
+@pytest.mark.parametrize("key", [Qt.Key_Return, Qt.Key_Enter])
+def test_enter_opens_first_search_result(nav, opening, key):
+    nav.add_page(QWidget(), "Traceroute")
+    nav.add_page(QWidget(), "Trace Details")
+    nav.activateWindow()
+    QApplication.processEvents()
+    if opening == "shortcut":
+        QTest.keyClick(nav, Qt.Key_K, Qt.ControlModifier)
+    else:
+        QTest.mouseClick(nav.pages_button, Qt.LeftButton)
+    assert nav.panel.isVisible()
+    assert QApplication.focusWidget() is nav.search
+    QTest.keyClicks(nav.search, "trace")
+    QTest.keyClick(nav.search, key)
+    assert nav.title(nav.currentWidget()) == "Traceroute"
+    assert not nav.panel.isVisible()
+
+
+def test_enter_uses_first_visible_tool_in_drawer_order(nav):
+    nav.favorites = ["Ping", "Interfaces"]
+    nav.open_drawer()
+    QTest.keyClick(nav.search, Qt.Key_Return)
+    assert nav.title(nav.currentWidget()) == "Ping"
+    nav.open_drawer()
+    # Clicking a header focuses the list; Enter should still open its first tool.
+    QTest.mouseClick(nav.drawer_list.viewport(), Qt.LeftButton,
+                     pos=nav.drawer_list.visualItemRect(nav.drawer_list.item(0)).center())
+    QTest.keyClick(nav.drawer_list, Qt.Key_Return)
+    assert nav.title(nav.currentWidget()) == "Ping"  # First Recent item
+    assert not nav.panel.isVisible()
+
+
+@pytest.mark.parametrize("section", ["Favorites", "Recent"])
+def test_quick_headers_share_theme_and_collapse_independently(nav, section):
+    nav.open_drawer()
+    assert isinstance(nav.drawer_list.itemDelegate(), NavigationDelegate)
+    assert isinstance(nav.sidebar.itemDelegate(), NavigationDelegate)
+    original = nav.currentWidget()
+
+    def heading():
+        return next(nav.drawer_list.item(row) for row in range(nav.drawer_list.count())
+                    if nav.drawer_list.item(row).data(SECTION_ROLE) == section)
+
+    def section_pages():
+        pages, current = [], None
+        for row in range(nav.drawer_list.count()):
+            item = nav.drawer_list.item(row)
+            if item.data(PAGE_ROLE) is None:
+                current = item.data(SECTION_ROLE)
+            elif current == section:
+                pages.append(item.text())
+        return pages
+
+    expanded = section_pages()
+    assert expanded
+    QTest.mouseClick(nav.drawer_list.viewport(), Qt.LeftButton,
+                     pos=nav.drawer_list.visualItemRect(heading()).center())
+    assert not section_pages()
+    assert nav.currentWidget() is original
+    assert nav.panel.isVisible()
+    assert section in nav.collapsed_sections
+    assert ("Recent" if section == "Favorites" else "Favorites") not in nav.collapsed_sections
+    nav.search.setText("adapter")
+    assert not nav.sidebar.item(1).isHidden()
+    nav.search.clear()
+    assert not section_pages()
+    QTest.mouseClick(nav.drawer_list.viewport(), Qt.LeftButton,
+                     pos=nav.drawer_list.visualItemRect(heading()).center())
+    assert section_pages() == expanded
+
+
+def test_enter_with_no_search_results_keeps_drawer_open(nav):
+    original = nav.currentWidget()
+    nav.open_search()
+    nav.search.setText("no matching tool")
+    QTest.keyClick(nav.search, Qt.Key_Return)
+    assert nav.currentWidget() is original
+    assert nav.panel.isVisible()
+
+
+def test_drawer_sections_share_space_without_nested_scrolling(nav):
+    nav.favorites = ["Interfaces", "Ping", "iperf"]
+    nav.recent = ["iperf", "Ping", "Interfaces"]
+    nav.open_drawer()
+    QApplication.processEvents()
+    listing = nav.drawer_list
+    headers = [listing.item(row).data(SECTION_ROLE) for row in range(listing.count())
+               if listing.item(row).data(PAGE_ROLE) is None]
+    assert headers == ["Favorites", "Recent", "This Computer", "Diagnostics"]
+    assert listing.verticalScrollBar().maximum() == 0
+    last = listing.item(listing.count() - 1)
+    assert listing.viewport().rect().contains(listing.visualItemRect(last))
+
+    category = next(listing.item(row) for row in range(listing.count())
+                    if listing.item(row).data(SECTION_ROLE) == "This Computer")
+    expanded_top = listing.visualItemRect(category).top()
+    for section in ("Favorites", "Recent"):
+        heading = next(listing.item(row) for row in range(listing.count())
+                       if listing.item(row).data(SECTION_ROLE) == section)
+        QTest.mouseClick(listing.viewport(), Qt.LeftButton,
+                         pos=listing.visualItemRect(heading).center())
+    QApplication.processEvents()
+    category = next(listing.item(row) for row in range(listing.count())
+                    if listing.item(row).data(SECTION_ROLE) == "This Computer")
+    assert listing.visualItemRect(category).top() < expanded_top
+    assert listing.height() > nav.content.height() // 2
+    assert listing.verticalScrollBar().maximum() == 0
+
+
+def test_unified_drawer_category_click_preserves_page_and_cycle_order(nav):
+    nav.open_drawer()
+    item = next(nav.drawer_list.item(row) for row in range(nav.drawer_list.count())
+                if nav.drawer_list.item(row).text() == "iperf")
+    QTest.mouseClick(nav.drawer_list.viewport(), Qt.LeftButton,
+                     pos=nav.drawer_list.visualItemRect(item).center())
+    assert nav.title(nav.currentWidget()) == "iperf"
+    nav.step(1)
+    assert nav.title(nav.currentWidget()) == "Interfaces"
+    assert nav.count() == 3

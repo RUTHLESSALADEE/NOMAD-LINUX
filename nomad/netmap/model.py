@@ -608,3 +608,9 @@ def _build(cls, data):
 def port_sort_key(name):
     """Gi1/0/2 before Gi1/0/10."""
     return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", name or "")]
+
+
+def normalize_vtp_domain(domain):
+    """Treat IOS placeholders for an unset VTP domain as the empty domain."""
+    domain = (domain or "").strip()
+    return "" if domain.casefold() in {"(no vtp domain)", "null", "local-transparent"} else domain

@@ -273,6 +273,10 @@ class ImportDialog(QDialog):
                  compare_with=None):
         super().__init__(parent)
         self.store, self.sheets, self.compare_with = store, sheets, compare_with
+        for sheet in sheets:
+            for difference in sheet.differences:
+                if difference.choice is None and (difference.summary is None or difference.detail is None):
+                    difference.choice = SUMMARY if difference.summary is not None else DETAIL
         self.imported = []
         self.compare_plan = None
         self.gateway_errors = {}  # {id(GatewayFix): message} for gateways typed in that aren't usable
@@ -281,8 +285,10 @@ class ImportDialog(QDialog):
         self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint | Qt.WindowMinimizeButtonHint)
         self.resize(1280, 760)
         layout = QVBoxLayout(self)
-        intro = QLabel("Tick the pages to import. Where the summary at the top of a page and its Detailed Info "
-                       "disagree, choose which to keep. SNMP strings are never imported.")
+        intro = QLabel("Tick the pages to import. Where Summary and Detailed Info disagree, choose which to keep "
+                       "for each subnet or use the buttons to choose for the whole page. Subnets listed in only "
+                       "one section are imported from that section even if you prefer the other source. "
+                       "Choose Skip this subnet to exclude one. SNMP strings are never imported.")
         intro.setWordWrap(True)
         # Where the networks go, impossible to miss: only the IPAM server itself imports tribe networks
         destination = QLabel()
@@ -292,7 +298,9 @@ class ImportDialog(QDialog):
                                 "to compare it with, and settle its differences as you would to import it. Nothing "
                                 "changes until you choose what to bring in, next.")
             colors = (COLORS["success_background"], COLORS["link"])
-            intro.setText("Tick one page. Where its summary and Detailed Info disagree, choose which to compare with.")
+            intro.setText("Tick one page. Where Summary and Detailed Info disagree, choose which to compare with. "
+                          "Subnets listed in only one section are included from that section even if you prefer "
+                          "the other source. Choose Skip this subnet to exclude one.")
         elif to_server:
             destination.setText("<b>Importing to the tribe's IPAM server.</b> Every connected laptop gets these "
                                 "networks as soon as the import finishes.")
@@ -465,7 +473,8 @@ class ImportDialog(QDialog):
                 item.setToolTip(text)
                 table.setItem(row, column, item)
             combo = QComboBox()
-            combo.addItem("Choose...", None)
+            if difference.summary is not None and difference.detail is not None:
+                combo.addItem("Choose...", None)
             for choice, label in difference.options():
                 combo.addItem(label, choice)
             combo.setCurrentIndex(max(0, combo.findData(difference.choice)))
@@ -473,7 +482,8 @@ class ImportDialog(QDialog):
                 lambda _, difference=difference, combo=combo: self.set_choice(difference, combo.currentData()))
             table.setCellWidget(row, CHOICE_COLUMN, combo)
         table.resizeColumnsToContents()
-        table.setColumnWidth(CHOICE_COLUMN, table.fontMetrics().horizontalAdvance("Use the detailed info's") + 48)
+        table.setColumnWidth(CHOICE_COLUMN,
+                             table.fontMetrics().horizontalAdvance("Import subnet from Detailed Info") + 48)
         for column in (2, 3, 4):
             table.setColumnWidth(column, min(table.columnWidth(column), 320))
 
@@ -559,13 +569,12 @@ class ImportDialog(QDialog):
         if sheet is None:
             return
         for difference in sheet.differences:
-            if preference is None:
-                difference.choice = None
-            elif difference.summary and difference.detail:
+            if preference == SKIP:
+                difference.choice = SKIP
+            elif difference.summary is not None and difference.detail is not None:
                 difference.choice = preference
-            else:  # Only one side lists it: keep it if it's the preferred side's
-                difference.choice = preference if (difference.detail if preference == DETAIL else
-                                                   difference.summary) else SKIP
+            else:  # Import from the available source even when the other source is preferred.
+                difference.choice = SUMMARY if difference.summary is not None else DETAIL
         self.show_page()
         self.update_state()
 

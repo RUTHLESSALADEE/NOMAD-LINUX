@@ -33,6 +33,7 @@ from ..sweep import SWEEP_PASSES
 from ..system import log_dir
 from .common import SortableTableItem, run_in_background, set_hint
 from .integration import MAP_DEVICE, MAP_SUBNET, PLACEMENT, VLAN, hub, link
+from .host_menu import HostActions
 from .ipam_dialogs import AddressDialog, ImportDialog, NetworkDialog, SubnetDialog
 from .ipam_tools import BulkAddressDialog, BulkSubnetDialog, CheckDataDialog, CompareDialog, FreeBlocksDialog, \
     apply_to_addresses, apply_to_subnets
@@ -2005,10 +2006,16 @@ class IpamTab(QWidget):
             self.table.scrollTo(self.model.index(row, 0), QAbstractItemView.PositionAtCenter)
 
     def address_menu(self, position):
+        index = self.table.indexAt(position)
+        if not index.isValid():
+            return
+        if not self.table.selectionModel().isRowSelected(index.row(), index.parent()):
+            self.table.selectRow(index.row())
         selected = self.selected_addresses()
         if not selected:
             return
         menu = QMenu(self)
+        host_actions = {}
         host = str(selected[0])
         if len(selected) == 1:
             menu.addAction("Edit...", self.edit_address).setEnabled(self.can_edit_addresses())
@@ -2041,12 +2048,18 @@ class IpamTab(QWidget):
             menu.addAction("Traceroute", lambda: self.go_to(self.window.traceroute_tab, "trace_host", host))
             menu.addAction("Scan Ports", lambda: self.go_to(self.window.ports_tab, "scan_host", host))
             self.add_session_actions(menu, host)
+            record = self.model.recorded.get(selected[0])
+            name = record.name.strip() if record is not None else ""
+            host_actions = HostActions(self.window, self).add_to(
+                menu, host, aliases=[name] if name else (), name=name, sessions=("Telnet",))
             menu.addSeparator()
             menu.addAction("History...", lambda: self.show_history("address", host)).setEnabled(self.as_of is None)
         links = self.other_page_actions(menu, address=host) if len(selected) == 1 else {}
         chosen = menu.exec_(self.table.viewport().mapToGlobal(position))
         if chosen in links:
             self.open_link(links[chosen])
+        elif chosen in host_actions:
+            host_actions[chosen]()
 
     def add_session_actions(self, menu, host):
         """SSH and SCP to an address: with its saved session if there is one (found by the address or its recorded
