@@ -37,6 +37,23 @@ def test_crawl_finds_every_device_and_link():
     assert "10.10.0.1" in devices["core"].addresses
 
 
+def test_windows_lldp_neighbor_is_a_host_not_a_device():
+    """A Windows PC's LLDP agent announces no capabilities and its MAC as the port ID: it goes on its port as a
+    named host, not on the map as a device."""
+    network = build_network()
+    acc1 = network.devices["10.0.0.11"]
+    acc1.interface(15, "GigabitEthernet1/0/15", ACC1_MAC)
+    acc1.lldp(15, "Gi1/0/15", 1, "WAAAAANB3704Q2", "", capabilities=0, port_mac="64-4E-D7-1E-E9-8A")
+    acc1.learned("64-4E-D7-1E-E9-8A", 15, 15, vlan=10)
+    network_map = crawl(network)
+    assert "WAAAAANB3704Q2" not in network_map.devices
+    assert not any(device.name == "WAAAAANB3704Q2" for device in network_map.devices.values())
+    hosts = {host.mac: host for host in network_map.hosts}
+    host = hosts["64-4E-D7-1E-E9-8A"]
+    assert (host.device, host.port, host.name) == ("acc1", "Gi1/0/15", "WAAAAANB3704Q2")
+    assert [h for h in network_map.hosts if h.name == "WAAAAANB3704Q2"] == [host]  # Placed once
+
+
 def test_hosts_on_edge_ports_only():
     network_map = crawl(build_network())
     hosts = {host.mac: host for host in network_map.hosts}

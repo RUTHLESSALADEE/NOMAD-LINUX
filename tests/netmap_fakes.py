@@ -73,7 +73,7 @@ class Device:
         self.set(*entry, 9, if_index, device_index, string(capabilities.to_bytes(4, "big")))
 
     def lldp(self, local_port, local_name, remote_index, name, port, address="", chassis_mac="", capabilities=0x08,
-             descr=""):
+             descr="", port_mac=""):
         self.set(collect.LLDP_LOC_PORT_ENTRY, 2, local_port, number(5))
         self.set(collect.LLDP_LOC_PORT_ENTRY, 3, local_port, string(local_name))
         index = (0, local_port, remote_index)
@@ -81,8 +81,12 @@ class Device:
         if chassis_mac:
             self.set(entry, 4, index, number(4))
             self.set(entry, 5, index, string(mac_bytes(chassis_mac)))
-        self.set(entry, 6, index, number(5))
-        self.set(entry, 7, index, string(port))
+        if port_mac:  # Port ID subtype 3: a MAC address, as a computer's LLDP agent sends it
+            self.set(entry, 6, index, number(3))
+            self.set(entry, 7, index, string(mac_bytes(port_mac)))
+        else:
+            self.set(entry, 6, index, number(5))
+            self.set(entry, 7, index, string(port))
         self.set(entry, 9, index, string(name))
         self.set(entry, 10, index, string(descr))
         self.set(entry, 12, index, string(bytes([capabilities, 0])))
