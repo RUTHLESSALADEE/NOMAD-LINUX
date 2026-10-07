@@ -39,10 +39,11 @@ from .host_menu import HostActions
 from .map_ipam_dialog import RecordDialog
 from .integration import IPAM, PLACEMENT, VLAN, MapNetworkDialog, hub, split_key
 from .integration import link as page_link
+from .netmap_key import MapKeyDialog
 from .netmap_monitor import NetworkMonitor
 from .netmap_progress import CrawlProgress
 from .netmap_dialogs import CommunitiesDialog, CompareDialog, DeletedDevicesDialog, DeviceDialog, GroupDialog, \
-    HostDialog, LinkDialog, ScopeDialog, shown_value
+    HostDialog, LinkDialog, MapChoiceDialog, ScopeDialog, shown_value
 from .netmap_tribe import TribeSync
 from .netmap_view import GROUP_BOX, MapView
 from .netmap_vlans import VlanPanel, domain_text
@@ -64,6 +65,7 @@ GROUP_LINKS_SHOWN = 20
 VLANS_IN_MENU = 60  # A device's Highlight VLAN menu lists this many
 VLANS_LISTED = 40  # A device's details name this many of its VLANs
 CHECK_WORKERS = 8  # Devices added by hand asked over SNMP at once
+OPEN_MAP, FILE_MAP, TRIBE_MAP, NEW_MAP = "open", "file", "tribe", "new"  # Where Add Device to Map puts one
 
 
 def ip_sort_key(text):
@@ -165,6 +167,7 @@ class NetworkMapTab(QWidget):
         self.last_arranged = None  # ((view, keys, group keys), style, spacing) of the last Arrange Selected
         self.keep_groups = True  # Re-arrange lays out each site, building and room in its own box
         self.compare_dialog = None
+        self.key_dialog = None
         self.extending = False  # The crawl running adds to the map open (Crawl from Here)
         self.live_map = None  # The map so far, drawn while a crawl runs
         self.live_positions = {}
@@ -182,6 +185,7 @@ class NetworkMapTab(QWidget):
         self.check_threads = []  # Asking devices added by hand over SNMP
         self.checking = set()  # Keys of the devices being asked
         self.announce = set()  # Of those, the ones to say what was found for (one added or asked again)
+        self.show_added = False  # Add Device to Map (from other pages) shows the map afterwards
         self.check_device = check_device  # What asks one (tests swap in the fake network)
         self.read_vlans = read_vlans_of  # What reads one's VLANs (tests swap in the fake network)
         self.vlan_reading = None  # While Read VLANs Again runs: {"map", "read", "failed", "lines"}
@@ -295,6 +299,9 @@ class NetworkMapTab(QWidget):
         self.tribe_menu = QMenu(self.tribe_button)
         self.tribe_menu.aboutToShow.connect(self.fill_tribe_menu)
         self.tribe_button.setMenu(self.tribe_menu)
+        self.key_button = QPushButton("Key")
+        self.key_button.setToolTip("What the map's colours, outlines and line styles mean.")
+        self.key_button.clicked.connect(self.show_key)
         self.monitor_check = QCheckBox("Monitor")
         self.monitor_check.setToolTip("Ping the devices on the map every so often, show which are up or down, and "
                                       "log when one goes down or comes back (on the Monitor tab). Keeps going on "
@@ -508,7 +515,8 @@ class NetworkMapTab(QWidget):
             rows.append(widget)
 
         file_buttons = [self.new_button, self.open_button, self.recent_button, self.save_button, self.export_button,
-                        self.compare_button, self.ipam_network_button, self.ipam_record_button, self.tribe_button]
+                        self.compare_button, self.ipam_network_button, self.ipam_record_button, self.tribe_button,
+                        self.key_button]
         watching = [self.monitor_check, self.interval_combo, self.monitor_label, self.watch_check, self.watch_label]
         view_tools = [self.hosts_check, self.undo_button, self.redo_button, self.fit_button, self.arrange_button]
         if self.compact_top:
@@ -596,7 +604,8 @@ class NetworkMapTab(QWidget):
                                      (self.ipam_network_button, None, None), (self.ipam_record_button, None, None),
                                      (None, None, None), (self.communities_button, None, None),
                                      (self.scope_button, None, None), (None, None, None),
-                                     (self.tribe_button, self.tribe_menu, self.fill_tribe_menu)):
+                                     (self.tribe_button, self.tribe_menu, self.fill_tribe_menu), (None, None, None),
+                                     (self.key_button, None, None)):
             if button is None:
                 menu.addSeparator()
                 continue
@@ -611,6 +620,14 @@ class NetworkMapTab(QWidget):
                 entry.aboutToShow.connect(self.mirror_menu)  # A method, as a lambda or partial isn't safe here
             self.map_entries.append((entry, button))
         menu.aboutToShow.connect(self.update_map_menu)
+
+    def show_key(self):
+        """The map's key, in a window of its own beside the map."""
+        if self.key_dialog is None:
+            self.key_dialog = MapKeyDialog(self)
+        self.key_dialog.show()
+        self.key_dialog.raise_()
+        self.key_dialog.activateWindow()
 
     def show_crawl_row(self, shown):
         """The Map menu's Crawl: as the Crawl button does."""
@@ -2475,23 +2492,17 @@ class NetworkMapTab(QWidget):
         if rows:
             self.links_table.scrollToItem(self.links_table.item(rows[0], 0))
 
-    def add_device(self, place=None, linked_to=""):
+    def add_device(self, place=None, linked_to="", address="", name="", parent=None):
         """Add a device by hand (optionally linked to one on the map), and ask it over SNMP if it has an address.
-        With no map open, it starts one."""
+        With no map open, it starts one. address, name: filled in (Add Device to Map, from another page). Returns
+        the new device's key, or None."""
         if self.worker is not None:
-            return
+            return None
         network_map = self.network_map or NetworkMap(started=datetime.datetime.now().isoformat(timespec="seconds"))
-        dialog = DeviceDialog(network_map, linked_to=linked_to, parent=self)
+        dialog = DeviceDialog(network_map, linked_to=linked_to, parent=parent or self, address=address, name=name)
         if dialog.exec_() != QDialog.Accepted:
-            return
-        device, link = dialog.values()
-        device.key = network_map.new_device_key()
-        network_map.devices[device.key] = device
-        if link is not None:
-            link.b = device.key
-            network_map.add_link(link)
-            if link.a in network_map.group_of:  # Most likely in the same room as what it's plugged into
-                network_map.group_of[device.key] = network_map.group_of[link.a]
+            return None
+        device = put_device(network_map, *dialog.values())
         if self.network_map is None:
             self.show_map(network_map)
         self.map_changed(place={device.key: place} if place else None, select=device.key)
@@ -2502,6 +2513,142 @@ class NetworkMapTab(QWidget):
         else:
             message += " Give it an IP address (Edit Device) to ping it while monitoring and check it over SNMP."
         set_hint(self.status_label, message, "success")
+        return device.key
+
+    # ----------------------------------------------------------------- Add Device to Map (from other pages)
+
+    def map_choices(self):
+        """The maps Add Device to Map offers: [(text, kind, value)], the one open here first."""
+        if self.network_map is not None:
+            choices = [(f"Open map: {self.map_name()}", OPEN_MAP, None)]
+        else:
+            choices = [("A new map (opened on the Network Map page)", OPEN_MAP, None)]
+        open_file = Path(self.map_path).resolve() if self.map_path and self.tribe_map_id is None else None
+        try:
+            saved = store.recent()
+        except OSError:
+            saved = []
+        choices += [(f"Saved map: {path.stem}", FILE_MAP, path) for path in saved if path.resolve() != open_file]
+        maps = self.tribe.ensure() if self.tribe.available else None
+        if maps is not None:
+            choices += [(f"Tribe map: {item['name']}", TRIBE_MAP, item["id"]) for item in maps.maps()
+                        if item["id"] != self.tribe_map_id]
+        if self.network_map is not None:
+            choices.append(("A new map (saved, not opened)", NEW_MAP, None))
+        choices.append(("Another map file...", FILE_MAP, None))
+        return choices
+
+    def add_address(self, address, name="", parent=None):
+        """Add Device to Map, from an address's right-click menu on any page: choose the map (the one open here, a
+        saved one, a tribe map or a new one), then fill in the device as Add Device does. Returns the new device's
+        key, or None."""
+        parent = parent or self.window
+        address = address.partition("%")[0]  # An IPv6 scope means nothing to the map
+        dialog = MapChoiceDialog(address, self.map_choices(), parent)
+        dialog.show_check.setChecked(self.show_added)
+        if dialog.exec_() != QDialog.Accepted:
+            return None
+        kind, value = dialog.choice()
+        self.show_added = show = dialog.show_check.isChecked()
+        if kind == FILE_MAP and value is None:
+            path, _ = QFileDialog.getOpenFileName(parent, "Add Device to Map", str(store.maps_dir()), MAP_FILTER)
+            if not path:
+                return None
+            value = Path(path)
+            if self.tribe_map_id is None and self.map_path and value.resolve() == Path(self.map_path).resolve():
+                kind = OPEN_MAP
+        if kind == OPEN_MAP:
+            return self.add_to_open_map(address, name, show, parent)
+        settings = seen = None
+        try:
+            if kind == FILE_MAP:
+                network_map, title = store.load(value), value.stem
+            elif kind == TRIBE_MAP:
+                maps = self.tribe.ensure()
+                info = maps.map_info(value) if maps is not None else None
+                if info is None or info.get("deleted"):
+                    raise ValueError("That map isn't shared with the tribe any more.")
+                network_map, settings, seen = maps.snapshot(value)
+                title = info.get("name", "the tribe map")
+            else:
+                network_map = NetworkMap(started=datetime.datetime.now().isoformat(timespec="seconds"))
+                title = "a new map"
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(parent, "Add Device to Map", f"Couldn't open the map:\n\n{error}")
+            return None
+        there = self.device_with_address(network_map, address)
+        if there is not None:
+            QMessageBox.information(parent, "Add Device to Map", f"{address} is already on {title}: it's "
+                                    f"{there.label}.")
+            if show:
+                self.show_on_other_map(kind, value, there.key)
+            return None
+        dialog = DeviceDialog(network_map, parent=parent, address=address, name=name,
+                              title=f"Add Device to {title}")
+        if dialog.exec_() != QDialog.Accepted:
+            return None
+        device = put_device(network_map, *dialog.values())
+        try:
+            if kind == FILE_MAP:
+                store.save(network_map, value)
+            elif kind == TRIBE_MAP:
+                self.tribe.save(value, network_map, settings, seen)
+            else:
+                value = store.save(network_map)
+                title = value.stem
+        except OSError as error:
+            QMessageBox.warning(parent, "Add Device to Map", f"Couldn't save the map:\n\n{error}")
+            return None
+        if show:
+            self.show_on_other_map(kind, value, device.key)
+        else:
+            self.window.show_status(f"Added {device.label} to {title}. Open that map to see it.", "success")
+        return device.key
+
+    def add_to_open_map(self, address, name, show, parent):
+        """Add Device to Map, to the map open here (or a new one, with none open)."""
+        if self.worker is not None:
+            QMessageBox.information(parent, "Add Device to Map", "The map is being crawled. Add it once the crawl "
+                                    "has finished, or choose another map.")
+            return None
+        there = self.device_with_address(self.network_map, address) if self.network_map is not None else None
+        if there is not None:
+            QMessageBox.information(parent, "Add Device to Map", f"{address} is already on {self.map_name()}: it's "
+                                    f"{there.label}.")
+            key = None
+        else:
+            key = self.add_device(address=address, name=name, parent=parent)
+            if key is None:
+                return None
+            self.window.show_status(f"Added {self.network_map.devices[key].label} to {self.map_name()}.", "success")
+        if show:
+            self.window.navigator.setCurrentWidget(self)
+            self.show_in(self.view, [key or there.key])
+        return key
+
+    def show_on_other_map(self, kind, value, key):
+        """Open the map a device was just added to (or found on) here, with it selected."""
+        self.window.navigator.setCurrentWidget(self)
+        if self.worker is not None:
+            set_hint(self.status_label, "The map can't be changed while the crawl runs: open it once it's finished.",
+                     "info")
+            return
+        if kind == TRIBE_MAP:
+            if not self.open_tribe_map(value):
+                return
+        else:
+            self.open_path(Path(value))
+        if self.network_map is None or key not in self.network_map.devices:
+            return
+        self.show_in(self.view, [key])
+        device = self.network_map.devices[key]
+        if device.manual and device.source == UNCHECKED and device.mgmt_ip:
+            self.check_devices([key], announce=True)
+
+    @staticmethod
+    def device_with_address(network_map, address):
+        address = address.partition("%")[0]
+        return next((device for device in network_map.devices.values() if device.owns(address)), None)
 
     def edit_device(self, key):
         device = self.network_map.devices.get(key) if self.network_map else None
@@ -3469,6 +3616,19 @@ class NetworkMapTab(QWidget):
         here = self.tabs.currentWidget()
         self.find_input.setEnabled(has_map or running or here is self.crawl_progress.tab)
         self.update_crawl_row()
+
+
+def put_device(network_map, device, link):
+    """Put a device added by hand (and its link, if it's linked to one) on the map, in the same group as what it's
+    linked to. Returns the device, with its new key."""
+    device.key = network_map.new_device_key()
+    network_map.devices[device.key] = device
+    if link is not None:
+        link.b = device.key
+        network_map.add_link(link)
+        if link.a in network_map.group_of:  # Most likely in the same room as what it's plugged into
+            network_map.group_of[device.key] = network_map.group_of[link.a]
+    return device
 
 
 def fill_table(table, rows, ip_columns=(), keys=None):

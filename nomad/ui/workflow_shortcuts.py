@@ -18,6 +18,7 @@ DIAGNOSTIC_BUTTONS = {
     "CaptureTab": ("start_button", "stop_button"),
     "DhcpTab": ("start_button", "stop_button"),
     "SwitchTab": ("start_button", "stop_button"),
+    "MacFinderTab": ("locate_button", "stop_button"),
 }
 
 

@@ -520,12 +520,15 @@ class SessionManager(QWidget):
         if chosen in actions:
             actions[chosen]()
 
-    def new_session(self, folder=""):
-        session = self.make_session(folder)
+    def new_session(self, folder="", session=None):
+        """The New Session dialog, filled in from session if given. Returns the saved session, or None."""
+        session = session or self.make_session(folder)
         dialog = self.dialog_class(self, session, self.store.all_folders(), "New Session", self.store)
         if dialog.exec_():
             self.store.put(dialog.session)
             self.fill_tree(select=dialog.session.id)
+            return dialog.session
+        return None
 
     def edit_session(self, session):
         dialog = self.dialog_class(self, session.copy(id=session.id), self.store.all_folders(), "Edit Session", self.store)

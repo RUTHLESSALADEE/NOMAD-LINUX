@@ -4,7 +4,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMenu, \
     QMessageBox, QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget
 
-from ..terminal.sessions import SERIAL, SSH, normalize_folder, parse_quick_connect
+from ..terminal.sessions import DEFAULT_PORTS, SERIAL, SSH, normalize_folder, parse_quick_connect
 from .session_dialog import SessionDialog
 from .session_manager import SessionManager
 from .session_tabs import SessionTabs, SessionWindow
@@ -290,6 +290,17 @@ class SessionPage(QWidget):
             session.name = name.replace("/", "-")
         session.folder = normalize_folder(folder)
         return self.open_session(session, saved=True)
+
+    def create_session(self, host, protocol=SSH, name="", folder=""):
+        """From another page's "Create Terminal Session..." (or the RDP page's "Create RDP Session..."): the New
+        Session dialog with host filled in, named name (or the host) in folder. Returns the saved session, or None
+        if cancelled."""
+        folder = normalize_folder(folder)
+        session = self.manager.make_session(folder)
+        session.protocol, session.host = protocol, host
+        session.port = DEFAULT_PORTS.get(protocol, session.port)
+        session.name = self.store.unique_name((name or host).replace("/", "-"), folder)
+        return self.manager.new_session(folder, session)
 
     def new_window(self):
         new_window = SessionWindow(self)

@@ -44,6 +44,7 @@ from .snmp_tab import SnmpTab
 from .subnet_tab import SubnetTab
 from .sweep_tab import SweepTab
 from .switch_tab import SwitchTab
+from .mac_finder_tab import MacFinderTab
 from .syslog_tab import SyslogTab
 from .tftp_tab import TftpTab
 from .theme import COLORS, DEFAULT_TEXT_SCALE, TEXT_SCALES, set_text_scale
@@ -157,6 +158,7 @@ class MainWindow(QMainWindow):
         self.sweep_tab = SweepTab(self)
         self.netmap_tab = NetworkMapTab(self)
         self.switch_tab = SwitchTab(self)
+        self.mac_finder_tab = MacFinderTab(self)  # Searches the Network Map's crawls
         self.dhcp_tab = DhcpTab(self)
         self.snmp_tab = SnmpTab(self)
         self.lookup_tab = LookupTab(self)
@@ -185,6 +187,7 @@ class MainWindow(QMainWindow):
             ("Connect & Transfer", [(self.terminal_tab, "Terminal"), (self.scp_tab, "SCP"), (self.rdp_tab, "RDP"),
                                     (self.tftp_tab, "TFTP"), (self.wake_tab, "Wake-on-LAN")]),
             ("Discover", [(self.sweep_tab, "Sweep"), (self.switch_tab, "Switch Port"),
+                          (self.mac_finder_tab, "MAC Finder"),
                           (self.dhcp_tab, "DHCP Servers"), (self.snmp_tab, "SNMP Walk")]),
             ("Diagnostics: Connectivity & Performance", [(self.ping_tab, "Ping"), (self.latency_tab, "Latency"),
                 (self.traceroute_tab, "Traceroute"), (self.mtu_tab, "MTU"), (self.ports_tab, "Ports"),

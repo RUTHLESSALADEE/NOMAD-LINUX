@@ -10,6 +10,8 @@ from PyQt5.QtWidgets import QApplication, QMenu, QMessageBox
 from ..sweep import find_putty
 from ..terminal.sessions import RDP, SSH, TELNET
 
+ADD_TO_MAP = "Add Device to Map..."
+
 
 class HostActions:
     def __init__(self, window, parent):
@@ -41,6 +43,17 @@ class HostActions:
             if matches:
                 actions[menu.addAction(f"Open New {label} Session")] = lambda page=page, protocol=protocol: \
                     page.open_address(host, protocol, aliases, name, folder, use_saved=False)
+        # Saving a session, for a host that has none: SSH and Telnet share the Terminal page's (SCP uses its SSH
+        # ones), so one entry covers all three
+        terminal = self.window.terminal_tab
+        if {"SSH", "SCP", "Telnet"} & set(sessions) and not any(
+                terminal.saved_matches(host, aliases, protocol) for protocol in (SSH, TELNET)):
+            actions[menu.addAction("Create Terminal Session...")] = lambda: self.create_session(
+                terminal, SSH, host, name, folder)
+        if "RDP" in sessions and callable(getattr(rdp_page, "create_session", None)) and not \
+                rdp_page.saved_matches(host, aliases, RDP):
+            actions[menu.addAction("Create RDP Session...")] = lambda: self.create_session(
+                rdp_page, RDP, host, name, folder)
         actions.update(self.add_missing(menu, {
             "SSH with PuTTY": lambda: self.open_ssh(host, aliases),
             f"Open https://{host}": lambda: self.open_web(host),
@@ -52,7 +65,7 @@ class HostActions:
             "SNMP Details": lambda: self.snmp(host, *(snmp or ())),
             "Capture Traffic...": lambda: self.capture(host),
         }))
-        actions.update(self.navigation_actions(menu, host))
+        actions.update(self.navigation_actions(menu, host, name))
         menu.setProperty("nomadIpActions", list(dict.fromkeys((menu.property("nomadIpActions") or []) + [host])))
         return actions
 
@@ -61,7 +74,7 @@ class HostActions:
         existing = {action.text() for action in menu.actions()}
         return {menu.addAction(label): callback for label, callback in callbacks.items() if label not in existing}
 
-    def navigation_actions(self, menu, host):
+    def navigation_actions(self, menu, host, name=""):
         try:
             ipaddress.ip_address(host)
         except ValueError:
@@ -69,8 +82,14 @@ class HostActions:
         return self.add_missing(menu, {
             "Show in IPAM": lambda: self.show_ipam(host),
             "Show on Map": lambda: self.show_map(host),
+            ADD_TO_MAP: lambda: self.add_to_map(host, name),
             "Copy IP Address": lambda: QApplication.clipboard().setText(host),
         })
+
+    def add_to_map(self, host, name=""):
+        """Add the host to a network map (the user chooses which) as a device added by hand."""
+        if host:
+            self.window.netmap_tab.add_address(host, name)
 
     def show_ipam(self, host):
         page = self.window.ipam_tab
@@ -127,6 +146,14 @@ class HostActions:
                 page.show_in(page.l3_view, [key])
                 return
         self.window.show_status(f"{host} isn't on the open network map.", "info")
+
+    def create_session(self, page, protocol, host, name="", folder=""):
+        """Save a session to host: page's New Session dialog (the Terminal or RDP page's), with the address filled
+        in."""
+        if host:
+            session = page.create_session(host, protocol, name, folder)
+            if session is not None:
+                self.window.show_status(f"Saved the {session.protocol} session {session.path}.", "info")
 
     def open_terminal(self, host, protocol):
         """Open a session to host on the Terminal page (its saved session, if it has one)."""

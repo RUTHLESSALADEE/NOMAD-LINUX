@@ -131,6 +131,7 @@ def test_ssh_and_scp_use_the_saved_session(app, tmp_path):
     actions["SCP"].trigger()
     assert window.terminal_tab.opened == [("10.0.0.5", ["core-sw1"], "core-sw1", "Lab/Core - Mgmt", True)]
     assert window.scp_tab.opened == [("10.0.0.5", ["core-sw1"], "core-sw1", "Lab/Core - Mgmt", True)]
+
     store.close()
 
 
@@ -163,7 +164,7 @@ def assert_address_actions(menu):
     labels = [action.text() for action in menu.actions()]
     assert {"Edit...", "Mark Used", "Copy", "SSH", "SCP", "History...", "SSH with PuTTY",
             "Open http://10.0.0.5", "Open https://10.0.0.5", "Show in IPAM", "Show on Map",
-            "Open Telnet Session", "SNMP Details", "Monitor Latency", "Capture Traffic..."}.issubset(labels)
+            "Open Telnet Session", "Create Terminal Session...", "SNMP Details", "Monitor Latency", "Capture Traffic..."}.issubset(labels)
     for label in ("Ping", "Traceroute", "Scan Ports"):
         assert labels.count(label) == 1
     assert not any(label.startswith("IP:") for label in labels)
@@ -200,6 +201,17 @@ def test_native_address_menu_has_all_actions_and_targets_clicked_row(address_pag
         callback.assert_called_once_with("10.0.0.5", "http")
     else:
         callback.assert_called_once_with("10.0.0.5")
+
+
+def test_create_terminal_session_files_it_under_the_network_and_subnet(address_page, monkeypatch):
+    window, tab = address_page
+    created = []
+    window.terminal_tab.create_session = lambda *args: created.append(args)
+    point = tab.table.visualRect(tab.model.index(5, 0)).center()
+    monkeypatch.setattr(QMenu, "exec_", lambda menu, position: next(
+        action for action in menu.actions() if action.text() == "Create Terminal Session..."))
+    tab.address_menu(point)
+    assert created == [("10.0.0.5", "SSH", "core-sw1", "Lab/LAN")]
 
 
 def test_real_ipam_context_event_preserves_menu_and_runs_added_action(app, address_page, monkeypatch):

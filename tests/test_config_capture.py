@@ -119,3 +119,41 @@ def test_single_command_profiles(view, monkeypatch, profile):
     widget.on_data((command + "\r\nsystem { host-name edge; }\r\nedge#").encode())
     widget.advance_config_capture()
     assert path.read_text() == "system { host-name edge; }\n"
+
+
+def press(widget, keys):
+    """Type keys (a QKeySequence string) into the session's terminal, as the user would."""
+    from PyQt5.QtGui import QKeySequence
+    from PyQt5.QtTest import QTest
+    sequence = QKeySequence(keys)[0]
+    QTest.keyClick(widget.view, sequence & ~0xFE000000 & 0x01FFFFFF, terminal_view.Qt.KeyboardModifiers(
+        sequence & 0xFE000000))
+
+
+def test_ctrl_s_logs_and_ctrl_shift_s_saves_config(view, tmp_path, monkeypatch):
+    widget, sent, path = view
+    log_path = tmp_path / "edge.log"
+    monkeypatch.setattr(terminal_view.QFileDialog, "getSaveFileName", lambda *args: (
+        str(log_path) if args[1] == "Log Session" else str(path), ""))
+    widget.transport.resize = lambda columns, rows: None  # Shown, the terminal is sized
+    widget.show()
+    widget.activateWindow()
+    widget.view.setFocus()
+    QApplication.processEvents()
+    press(widget, "Ctrl+S")
+    assert widget.log_file is not None and widget.logging_button.text() == "Stop Logging"
+    assert b"\x13" not in b"".join(sent)  # Not sent to the device as XOFF
+    press(widget, "Ctrl+S")
+    assert widget.log_file is None and log_path.exists()
+    press(widget, "Ctrl+Shift+S")
+    assert sent == [b"terminal length 0\r"] and widget.config_button.text() == "Cancel Save"
+    press(widget, "Ctrl+Shift+S")  # Again while saving: cancels, as the button does
+    assert widget.config_capture is None and sent[-1] == b"\x03"
+    widget.hide()
+
+
+def test_ctrl_shift_s_needs_a_connection(view):
+    widget, sent, path = view
+    widget.set_state(terminal_view.DISCONNECTED)
+    widget.config_shortcut()
+    assert not sent and widget.config_capture is None

@@ -37,6 +37,9 @@ TOOL_ART = {
              '<path d="m12 12 6-7"/><circle cx="7" cy="14" r="1"/>',
     "Switch Port": '<rect x="2" y="5" width="20" height="12" rx="2"/>'
                    '<path d="M5 9h3v4H5z M11 9h3v4h-3z M17 9h2m-2 4h2 M6 17v4"/>',
+    "MAC Finder": '<rect x="2" y="3" width="14" height="9" rx="2"/>'
+                  '<path d="M5 6h2v3H5z M10 6h2v3h-2z M9 12v4"/>'
+                  '<circle cx="15" cy="17" r="4"/><path d="m18 20 3 3"/>',
     "DHCP Servers": '<rect x="7" y="2" width="10" height="7" rx="1"/>'
                     '<path d="M10 5h4 M12 9v5H4v3m8-3h8v3"/>'
                     '<rect x="1" y="17" width="6" height="5" rx="1"/>'

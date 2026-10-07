@@ -521,10 +521,12 @@ class DeviceDialog(QDialog):
     correct one the crawl found (an address CDP didn't give or got wrong, the wrong kind). Adding, it can be linked to
     a device already on the map."""
 
-    def __init__(self, network_map, device=None, linked_to="", parent=None):
+    def __init__(self, network_map, device=None, linked_to="", parent=None, address="", name="", title=""):
+        """address, name: filled in for a new device (one added from another page); title: the window's, for one
+        not added on the map page."""
         super().__init__(parent)
         self.network_map, self.device = network_map, device
-        self.setWindowTitle("Edit Device" if device else "Add Device")
+        self.setWindowTitle(title or ("Edit Device" if device else "Add Device"))
         self.resize(440, 0)
         layout = QVBoxLayout(self)
         if device is None:
@@ -544,9 +546,9 @@ class DeviceDialog(QDialog):
             note.setWordWrap(True)
             layout.addWidget(note)
         form = QFormLayout()
-        self.name_input = QLineEdit(device.name if device else "")
+        self.name_input = QLineEdit(device.name if device else name)
         self.name_input.setPlaceholderText("Such as closet-sw3")
-        self.ip_input = QLineEdit(device.mgmt_ip if device else "")
+        self.ip_input = QLineEdit(device.mgmt_ip if device else address)
         self.ip_input.setPlaceholderText("To ping and check over SNMP (optional)")
         self.kind_combo = QComboBox()
         for kind in (SWITCH, ROUTER, FIREWALL, AP, SERVER, UNKNOWN):
@@ -632,6 +634,38 @@ class DeviceDialog(QDialog):
             QMessageBox.warning(self, self.windowTitle(), str(error))
             return
         super().accept()
+
+
+class MapChoiceDialog(QDialog):
+    """Add Device to Map, from an address on another page: which map it goes on (the one open on the Network Map
+    page, a saved one, a tribe map, a new one or another file), and whether to go and see it there afterwards."""
+
+    def __init__(self, address, choices, parent=None):
+        """choices: [(text, kind, value)], the first chosen to start with."""
+        super().__init__(parent)
+        self.setWindowTitle("Add Device to Map")
+        self.resize(420, 0)
+        layout = QVBoxLayout(self)
+        note = QLabel(f"Add {address} to a network map as a device added by hand. Next you can name it, say what "
+                      "kind it is and link it to a device already on that map.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        form = QFormLayout()
+        self.map_combo = QComboBox()
+        for text, kind, value in choices:
+            self.map_combo.addItem(text, (kind, value))
+        form.addRow("Map:", self.map_combo)
+        layout.addLayout(form)
+        self.show_check = QCheckBox("Show it on the Network Map page afterwards")
+        layout.addWidget(self.show_check)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def choice(self):
+        """(kind, value) of the map chosen."""
+        return self.map_combo.currentData()
 
 
 class LinkDialog(QDialog):

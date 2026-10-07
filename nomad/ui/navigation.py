@@ -490,7 +490,8 @@ class Navigator(SidebarNavigator):
         aliases = {"iperf": "bandwidth throughput", "SCP": "file transfer ssh", "RDP": "remote desktop mstsc windows",
                    "TFTP": "file transfer firmware",
                    "Network Map": "topology snmp", "Interfaces": "adapter nic ip configuration",
-                   "ARP": "neighbors mac", "Ports": "scan tcp", "DNS Servers": "dns benchmark"}
+                   "ARP": "neighbors mac",
+                   "MAC Finder": "mac address table locate trace switch port find where plugged", "Ports": "scan tcp", "DNS Servers": "dns benchmark"}
         self.drawer_list.clear()
         if not query:
             for heading, titles in (("Favorites", self.favorites), ("Recent", self.recent)):
