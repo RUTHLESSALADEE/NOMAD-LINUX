@@ -114,3 +114,63 @@ def test_the_host_menu_names_the_saved_session(page):
                           "Open New SCP Session", "Open Telnet Session"]
     actions[next(action for action in actions if action.text() == "Open New SSH Session")]()
     assert page.opened[-1].username == ""
+
+
+def test_without_a_saved_session_the_host_menu_offers_to_create_one(page, monkeypatch):
+    window = Window()
+    window.terminal_tab = window.scp_tab = page
+    window.statuses = []
+    window.show_status = lambda text, kind: window.statuses.append(text)
+    page.store.put(Session("core-sw1", SSH, "10.9.9.9", folder="HQ/Core"))  # Same name, another host
+    shown = []
+
+    class Dialog:
+        def __init__(self, parent, session, folders, title, store):
+            shown.append((session, title))
+            self.session = session.copy(id=session.id, username="admin")
+
+        def exec_(self):
+            return True
+
+    monkeypatch.setattr(page.manager, "dialog_class", Dialog)
+    menu = QMenu()
+    actions = HostActions(window, window).add_to(menu, "10.0.0.1", name="core-sw1", folder="HQ / Core")
+    labels = [action.text() for action in actions]
+    assert labels[:4] == ["Open SSH Session", "Open SCP Session", "Open Telnet Session", "Create Terminal Session..."]
+    assert "Create RDP Session..." not in labels  # No RDP page here
+    actions[next(action for action in actions if action.text() == "Create Terminal Session...")]()
+    (session, title), = shown
+    assert title == "New Session"
+    assert (session.protocol, session.host, session.port, session.name, session.folder) ==         (SSH, "10.0.0.1", 22, "core-sw1 (2)", "HQ/Core")
+    saved = page.store.matching(["10.0.0.1"], SSH)
+    assert [item.username for item in saved] == ["admin"] and page.opened == []
+    assert window.statuses == ["Saved the SSH session HQ/Core/core-sw1 (2)."]
+
+    # Now it has one, the menu opens it instead
+    menu = QMenu()  # Kept: its actions go with it
+    labels = [action.text() for action in HostActions(window, window).add_to(menu, "10.0.0.1")]
+    assert "Create Terminal Session..." not in labels and labels[0] == "Open SSH Session (core-sw1 (2))"
+
+
+def test_a_saved_telnet_session_counts_as_a_terminal_session(page):
+    page.store.put(Session("Old Switch", TELNET, "10.0.0.1", port=23))
+    window = Window()
+    window.terminal_tab = window.scp_tab = page
+    menu = QMenu()
+    labels = [action.text() for action in HostActions(window, window).add_to(menu, "10.0.0.1")]
+    assert "Open Telnet Session (Old Switch)" in labels and "Create Terminal Session..." not in labels
+
+
+def test_a_new_session_from_another_page_is_named_after_the_host_and_can_be_cancelled(page, monkeypatch):
+    class Dialog:
+        def __init__(self, parent, session, folders, title, store):
+            self.session = session
+            page.dialog_session = session
+
+        def exec_(self):
+            return False
+
+    monkeypatch.setattr(page.manager, "dialog_class", Dialog)
+    assert page.create_session("fe80::1%eth0") is None
+    assert (page.dialog_session.name, page.dialog_session.folder) == ("fe80::1%eth0", "")
+    assert page.store.sessions == []

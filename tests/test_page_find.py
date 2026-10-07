@@ -37,6 +37,7 @@ from nomad.ui.snmp_config_tab import SnmpConfigTab
 from nomad.ui.snmp_tab import SnmpTab
 from nomad.ui.subnet_tab import SubnetTab
 from nomad.ui.switch_tab import SwitchTab
+from nomad.ui.mac_finder_tab import MacFinderTab
 from nomad.ui.tftp_tab import TftpTab
 from nomad.ui.traceroute_tab import TracerouteTab
 from nomad.ui.wake_tab import WakeTab
@@ -117,7 +118,8 @@ def press_find(window, page, source, target):
     (TracerouteTab, "host_input"), (LookupTab, "name_input"), (DnsServersTab, "names_input"),
     (WebCheckTab, "url_input"), (SnmpTab, "host_input"), (SubnetTab, "subnet_input"),
     (WakeTab, "wake_mac_input"), (CaptureTab, "address_input"), (SnmpConfigTab, "community_input"),
-    (SwitchTab, "filter_input"), (DhcpTab, "filter_input"), (NetworkResetTab, "find_input"),
+    (SwitchTab, "filter_input"), (MacFinderTab, "search_input"), (DhcpTab, "filter_input"),
+    (NetworkResetTab, "find_input"),
 ])
 def test_ctrl_f_focuses_diagnostic_input(window, page_type, field):
     page = page_type(window)
@@ -356,6 +358,7 @@ def test_ctrl_n_creates_saved_session_in_selected_folder(window, tmp_path, monke
     (DnsServersTab, "dns_start_button", "dns_stop_button"), (LookupTab, "lookup_button", None),
     (WebCheckTab, "web_button", None), (CaptureTab, "start_button", "stop_button"),
     (DhcpTab, "start_button", "stop_button"), (SwitchTab, "start_button", "stop_button"),
+    (MacFinderTab, "locate_button", "stop_button"),
 ])
 def test_run_and_stop_use_current_tools_enabled_buttons(window, page_type, start, stop):
     page = page_type(window)

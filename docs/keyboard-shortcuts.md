@@ -17,11 +17,12 @@ Press **F1** in NOMAD to open the searchable guide. Search by key, action or too
 - **Shift+Enter / Shift+Esc** run and stop only supported tool pages. Search fields on Network Map and Network Reset, multiline editors, and remote terminals retain their existing key behavior.
 - **Ctrl+W** closes the active Terminal/SCP session. NOMAD asks before disconnecting, with **Yes** selected so **Enter** confirms; SCP also keeps its warnings for transfers and unsaved edits. This replaces the remote shell's Ctrl+W word-deletion behavior.
 - **Alt+Left / Alt+Right** switches sessions on Terminal/SCP. In SCP file lists, folder-back has moved from Alt+Left to **Alt+Up**. **Backspace** still goes up one folder.
+- **Ctrl+S** starts (or stops) a terminal session log and **Ctrl+Shift+S** saves the running config, like the buttons below the session. Ctrl+S no longer reaches the remote host as XOFF (output freeze).
 - **Ctrl+L** focuses the path only inside an SCP file pane. Terminal Ctrl+L continues to go to the remote shell.
 - **Alt+A** leaves focus mode to reveal the adapter picker.
 - Shortcuts use the same enabled actions as buttons. They do not repeat while a key is held.
 
-Shift+Enter starts these tools: Ping, Traceroute, Sweep, Ports, MTU, Latency, iperf, SNMP Walk, DNS Lookup, DNS Servers, Web Check, Packet Capture, DHCP Servers, Switch Port. Stop is available where the tool has a Stop button; DNS Lookup and Web Check do not have cancellation actions.
+Shift+Enter starts these tools: Ping, Traceroute, Sweep, Ports, MTU, Latency, iperf, SNMP Walk, DNS Lookup, DNS Servers, Web Check, Packet Capture, DHCP Servers, Switch Port, MAC Finder (Locate Now; Enter in its search box is Find). Stop is available where the tool has a Stop button; DNS Lookup and Web Check do not have cancellation actions.
 
 ## Everyday actions
 
@@ -58,10 +59,12 @@ Shift+Enter starts these tools: Ping, Traceroute, Sweep, Ports, MTU, Latency, ip
 | Alt+Left / Alt+Right | Previous / next session (wraps around) | Terminal and SCP |
 | Ctrl+Shift+Enter | Pop out this session; move it back from a pop-out | Terminal and SCP |
 | Ctrl+1 through Ctrl+9 | Send the corresponding saved command | Terminal text, including when the Buttons bar is hidden |
-| Hold Ctrl | Show number overlays above visible command buttons | Terminal; release Ctrl to hide |
+| Hold Ctrl | Show number overlays above visible command buttons, and S / Shift+S above Log Session / Save Config | Terminal; release Ctrl to hide |
 | Ctrl+Shift+F | Find in terminal output | Terminal text |
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy selection / paste | Terminal text |
 | Shift+PageUp / Shift+PageDown | Scroll terminal output | Terminal text |
+| Ctrl+S | Log Session: start logging to a file, or stop logging | Terminal session; replaces the shell's Ctrl+S (XOFF) |
+| Ctrl+Shift+S | Save Config: save the running configuration (cancels one being saved) | Connected terminal session |
 
 ## SCP files
 
@@ -98,6 +101,7 @@ Shift+Enter starts these tools: Ping, Traceroute, Sweep, Ports, MTU, Latency, ip
 | Ctrl+F | Find an adapter by name, description, IP or MAC | Interfaces; Enter selects the match |
 | Ctrl+F | Search command output | Network Reset; Enter: next, Shift+Enter: previous, Esc: close search |
 | Ctrl+F | Filter discovered switch details | Switch Port |
+| Ctrl+F | MAC address, IP address or name to find; the list in List mode | MAC Finder |
 | Ctrl+F | Filter server addresses | DHCP Servers |
 | Ctrl+F | Page search / filter | Routing Table, ARP, Connections, Syslog, IP Addresses, Network Map, VLANs, Subnet Placement |
 

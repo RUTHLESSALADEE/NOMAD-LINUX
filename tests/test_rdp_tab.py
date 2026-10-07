@@ -139,6 +139,33 @@ def test_host_menu_launches_matching_rdp_session(page, monkeypatch):
     action = next(action for action in actions if action.text() == "Open RDP Session (Saved desktop)")
     actions[action]()
     assert calls == [item]
+    assert "Create RDP Session..." not in [action.text() for action in actions]
+
+
+def test_host_menu_creates_an_rdp_session_for_a_host_without_one(page, monkeypatch):
+    page.window.rdp_tab = page
+    page.window.terminal_tab = page.window.scp_tab = SimpleNamespace(saved_matches=lambda *args: [])
+    page.window.statuses = []
+    page.window.show_status = lambda text, kind: page.window.statuses.append(text)
+    shown = []
+
+    class Dialog:
+        def __init__(self, parent, session, folders, title, store):
+            shown.append(session)
+            self.session = session
+
+        def exec_(self):
+            return True
+
+    monkeypatch.setattr(page.manager, "dialog_class", Dialog)
+    menu = QMenu(page)
+    actions = HostActions(page.window, page).add_to(menu, "10.0.0.7", name="Desk 7", folder="Office")
+    action = next(action for action in actions if action.text() == "Create RDP Session...")
+    actions[action]()
+    session, = shown
+    assert (session.protocol, session.host, session.port, session.name, session.folder) ==         (RDP, "10.0.0.7", 3389, "Desk 7", "Office")
+    assert page.store.matching(["10.0.0.7"], RDP) == [session]
+    assert page.window.statuses == ["Saved the RDP session Office/Desk 7."]
 
 
 def test_full_width_session_list_shows_launch_settings_and_preserves_columns(page, tmp_path):

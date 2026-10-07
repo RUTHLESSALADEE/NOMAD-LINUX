@@ -5,7 +5,7 @@ from PyQt5.QtWidgets import QAbstractItemView, QDialog, QDialogButtonBox, QHeade
     QShortcut, QTreeWidget, QTreeWidgetItem, QVBoxLayout
 
 
-RUN_TOOLS = "Ping, Traceroute, Sweep, Ports, MTU, Latency, iperf, SNMP Walk, DNS Lookup, DNS Servers, Web Check, Packet Capture, DHCP Servers, Switch Port"
+RUN_TOOLS = "Ping, Traceroute, Sweep, Ports, MTU, Latency, iperf, SNMP Walk, DNS Lookup, DNS Servers, Web Check, Packet Capture, DHCP Servers, Switch Port, MAC Finder (Locate Now)"
 
 SHORTCUT_SECTIONS = [
     ("Everyday actions", [
@@ -34,10 +34,12 @@ SHORTCUT_SECTIONS = [
         ("Alt+Left / Alt+Right", "Previous / next session (wraps around)", "Terminal and SCP"),
         ("Ctrl+Shift+Enter", "Pop out this session; move it back from a pop-out", "Terminal and SCP"),
         ("Ctrl+1 through Ctrl+9", "Send the corresponding saved command", "Terminal text, including when the Buttons bar is hidden"),
-        ("Hold Ctrl", "Show number overlays above visible command buttons", "Terminal; release Ctrl to hide"),
+        ("Hold Ctrl", "Show number overlays above visible command buttons, and S / Shift+S above Log Session / Save Config", "Terminal; release Ctrl to hide"),
         ("Ctrl+Shift+F", "Find in terminal output", "Terminal text"),
         ("Ctrl+Shift+C / Ctrl+Shift+V", "Copy selection / paste", "Terminal text"),
         ("Shift+PageUp / Shift+PageDown", "Scroll terminal output", "Terminal text"),
+        ("Ctrl+S", "Log Session: start logging to a file, or stop logging", "Terminal session; replaces the shell's Ctrl+S (XOFF)"),
+        ("Ctrl+Shift+S", "Save Config: save the running configuration (cancels one being saved)", "Connected terminal session"),
     ]),
     ("SCP files", [
         ("Ctrl+L", "Focus and select this pane's folder path", "SCP file pane; Enter opens the typed folder"),
@@ -68,6 +70,7 @@ SHORTCUT_SECTIONS = [
         ("Ctrl+F", "Find an adapter by name, description, IP or MAC", "Interfaces; Enter selects the match"),
         ("Ctrl+F", "Search command output", "Network Reset; Enter: next, Shift+Enter: previous, Esc: close search"),
         ("Ctrl+F", "Filter discovered switch details", "Switch Port"),
+        ("Ctrl+F", "MAC address, IP address or name to find; the list in List mode", "MAC Finder"),
         ("Ctrl+F", "Filter server addresses", "DHCP Servers"),
         ("Ctrl+F", "Page search / filter", "Routing Table, ARP, Connections, Syslog, IP Addresses, Network Map, VLANs, Subnet Placement"),
     ]),

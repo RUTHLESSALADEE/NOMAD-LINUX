@@ -234,6 +234,27 @@ def test_holding_ctrl_shows_numbers_without_moving_buttons_or_sending(page, tmp_
     assert all(not button.shortcut_hint.isVisible() for button in bar.row.buttons())
 
 
+def test_holding_ctrl_shows_log_and_config_keys_over_their_buttons(page, tmp_path):
+    one = connect(page, "one")
+    page.window.activateWindow()
+    one.view.setFocus()
+    QApplication.processEvents()
+    assert not page.tabs.command_bar.isVisible()  # The session's own hints don't need the Buttons bar
+    hints = {button.text(): hint for button, hint in one.key_hints}
+    assert not any(hint.isVisible() for hint in hints.values())
+    QTest.keyPress(one.view, Qt.Key_Control)
+    QApplication.processEvents()
+    assert {text: hint.text() for text, hint in hints.items()} == {"Log Session…": "S", "Save Config…": "Shift+S"}
+    for button, hint in one.key_hints:
+        assert hint.isVisible() and hint.testAttribute(Qt.WA_TransparentForMouseEvents)
+        assert abs(hint.geometry().center().x() - button.mapTo(one, button.rect().center()).x()) <= 1
+        assert hint.geometry().bottom() < button.mapTo(one, QPoint(0, 0)).y()  # Over it, not on it
+    one.grab().save(str(tmp_path / "session-hints.png"))
+    QTest.keyRelease(one.view, Qt.Key_Control)
+    assert not any(hint.isVisible() for hint in hints.values())
+    assert one.transport.sent == b""
+
+
 def test_ctrl_hints_only_label_existing_hotkeys_and_follow_reordering(page):
     one = connect(page, "one")
     for number in range(10):

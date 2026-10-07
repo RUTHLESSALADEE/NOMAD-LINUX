@@ -5,7 +5,8 @@ from PyQt5.QtWidgets import QApplication, QCheckBox, QDialog, QDialogButtonBox, 
     QLabel, QLineEdit, QMenu, QMessageBox, QPlainTextEdit, QScrollArea, QToolButton, QVBoxLayout, QWidget
 
 from ..terminal.commands import CommandButton
-from .common import set_hint
+from .common import hotkey_hint, set_hint
+from .terminal_view import SessionView
 from .theme import COLORS, monospace_font
 
 BUTTON_MIME = "application/x-nomad-command-button"
@@ -19,13 +20,7 @@ class DraggableButton(QToolButton):
         self.button_id = button_id
         self.press_position = None
         # A sibling overlay in the terminal area, outside the button and the bar's layout.
-        self.shortcut_hint = QLabel(str(number) if number is not None else "", hint_parent or self)
-        self.shortcut_hint.setAlignment(Qt.AlignCenter)
-        self.shortcut_hint.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self.shortcut_hint.setStyleSheet(f"color: {COLORS['accent']}; background: {COLORS['background']}; "
-                                        f"border: 1px solid {COLORS['border']}; border-radius: 3px; "
-                                        "padding: 1px 4px; font-weight: bold;")
-        self.shortcut_hint.hide()
+        self.shortcut_hint = hotkey_hint(str(number) if number is not None else "", hint_parent or self)
         self.destroyed.connect(self.shortcut_hint.deleteLater)
 
     def mousePressEvent(self, event):
@@ -162,6 +157,7 @@ class CommandBar(QFrame):
         self.tabs = tabs
         self.store = page.commands
         self.hints_shown = False
+        self.ctrl_held = False  # The sessions' own hints (Log Session, Save Config) show while it is, bar or no bar
         self.setObjectName("commandBar")
         self.setStyleSheet(f"#commandBar {{ border-top: 1px solid {COLORS['border']}; }}")
         layout = QHBoxLayout(self)
@@ -211,6 +207,10 @@ class CommandBar(QFrame):
         self.fit_height()
 
     def show_hints(self, visible):
+        if visible != self.ctrl_held:
+            self.ctrl_held = visible
+            for view in self.tabs.findChildren(SessionView):
+                view.show_key_hints(visible)
         shown = visible and self.isVisible()
         if shown == self.hints_shown:
             return
@@ -257,7 +257,8 @@ class CommandBar(QFrame):
         self.show_hints(bool(QApplication.keyboardModifiers() & Qt.ControlModifier))
 
     def hideEvent(self, event):
-        self.show_hints(False)
+        self.hints_shown = False  # Its buttons' hints go; the sessions' stay while Ctrl is held
+        self.position_hints()
         super().hideEvent(event)
 
     def fill(self):

@@ -3,17 +3,17 @@ import logging
 import os
 import time
 
-from PyQt5.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPen
+from PyQt5.QtCore import QEvent, QPoint, QPointF, QRectF, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QFont, QFontMetricsF, QKeySequence, QPainter, QPen
 from PyQt5.QtWidgets import QApplication, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollBar, \
-    QSizePolicy, QVBoxLayout, QWidget
+    QShortcut, QSizePolicy, QVBoxLayout, QWidget
 
 from ..terminal.model import LogCleaner, Position, TerminalModel, encode_key, encode_paste
 from ..terminal.config_capture import CONFIG_PROFILES, ConfigCapture, write_config
 from ..terminal.highlight import COLORS as KEYWORD_COLORS
 from ..terminal.sessions import SERIAL, decode_escapes
 from ..terminal.transports import ConnectionFailed, make_transport
-from .common import StoppableThread, release_thread
+from .common import StoppableThread, hotkey_hint, release_thread, set_hint_enabled
 from .prompts import PromptAnswers, UiPrompter
 from .theme import COLORS
 
@@ -50,7 +50,13 @@ APP_SHORTCUTS = {(Qt.Key_Tab, Qt.ControlModifier), (Qt.Key_Backtab, Qt.ControlMo
                  (Qt.Key_Return, Qt.ControlModifier | Qt.ShiftModifier),
                  (Qt.Key_Enter, Qt.ControlModifier | Qt.ShiftModifier),
                  (Qt.Key_A, Qt.AltModifier), (Qt.Key_F1, Qt.NoModifier),
-                 (Qt.Key_F11, Qt.NoModifier)}  # Left to the window: switching tabs/pages, session filter, focus mode
+                 (Qt.Key_F11, Qt.NoModifier),
+                 (Qt.Key_S, Qt.ControlModifier), (Qt.Key_S, Qt.ControlModifier | Qt.ShiftModifier)}
+# Left to the window: switching tabs/pages, session filter, focus mode, and the session's Log Session and Save Config
+# (so Ctrl+S never sends the device an XOFF, which would freeze its output)
+LOG_KEYS, CONFIG_KEYS = "Ctrl+S", "Ctrl+Shift+S"
+LOG_TIP = f"Choose a file on this workstation and start logging this session ({LOG_KEYS})"
+CONFIG_TIP = f"Save the full running configuration to a file on this workstation ({CONFIG_KEYS})"
 REPAINT_MILLISECONDS = 15
 RECONNECT_SECONDS = 10
 RECONNECT_LIMIT = 180  # Tries (half an hour) before giving up: long enough for a big chassis to reload
@@ -580,15 +586,24 @@ class SessionView(PromptAnswers, QWidget):
         status.addWidget(self.status_label, 1)
         status.addWidget(self.log_label)
         self.config_button = QPushButton("Save Config…")
-        self.config_button.setToolTip("Save the full running configuration to a file on this workstation")
+        self.config_button.setToolTip(CONFIG_TIP)
         self.config_button.setEnabled(False)
         self.config_button.clicked.connect(self.save_running_config)
         status.addWidget(self.config_button)
         self.logging_button = QPushButton("Log Session…")
-        self.logging_button.setToolTip("Choose a file on this workstation and start logging this session")
+        self.logging_button.setToolTip(LOG_TIP)
         self.logging_button.clicked.connect(self.toggle_logging)
         status.addWidget(self.logging_button)
         layout.addLayout(status)
+        # The buttons' keys, wherever the focus is in this session (the terminal leaves them to these)
+        for keys, slot in ((LOG_KEYS, self.toggle_logging), (CONFIG_KEYS, self.config_shortcut)):
+            QShortcut(QKeySequence(keys), self, context=Qt.WidgetWithChildrenShortcut).activated.connect(slot)
+        # Over the buttons while Ctrl is held, as the command buttons' numbers are (the command bar says when)
+        self.key_hints = [(self.logging_button, hotkey_hint("S", self)),
+                          (self.config_button, hotkey_hint("Shift+S", self))]
+        self.key_hints_shown = False
+        for button, _ in self.key_hints:
+            button.installEventFilter(self)  # Its text changes its width (Stop Logging, Cancel Save)
 
         self.view.key_input.connect(self.type_text)
         self.view.paste_requested.connect(self.paste)
@@ -601,6 +616,44 @@ class SessionView(PromptAnswers, QWidget):
         find_previous.clicked.connect(self.find_previous)
         close_find.clicked.connect(self.hide_find)
         self.sync_scrollbar()
+
+    # ----------------------------------------------------------------- Ctrl's hotkey hints
+
+    def show_key_hints(self, shown):
+        """Show (or hide) S over Log Session and Shift+S over Save Config, while Ctrl is held."""
+        self.key_hints_shown = shown
+        self.position_key_hints()
+
+    def position_key_hints(self):
+        shown = self.key_hints_shown and self.isVisible()
+        for button, hint in self.key_hints:
+            if shown and button.isVisible():
+                set_hint_enabled(hint, button.isEnabled())
+                hint.adjustSize()
+                center = button.mapTo(self, button.rect().center()).x()
+                top = button.mapTo(self, QPoint(0, 0)).y()
+                hint.move(min(max(0, center - hint.width() // 2), self.width() - hint.width()),
+                          max(0, top - hint.height() - 2))
+                hint.raise_()
+                hint.show()
+            else:
+                hint.hide()
+
+    def eventFilter(self, watched, event):
+        if self.key_hints_shown and event.type() in (QEvent.Resize, QEvent.Move, QEvent.EnabledChange):
+            self.position_key_hints()
+        return super().eventFilter(watched, event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Shown while Ctrl is held (Alt+Right to another session, say): as the others are
+        self.key_hints_shown = bool(QApplication.keyboardModifiers() & Qt.ControlModifier) and self.key_hints_shown
+        self.position_key_hints()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.key_hints_shown:
+            self.position_key_hints()
 
     # ----------------------------------------------------------------- Connecting
 
@@ -727,7 +780,8 @@ class SessionView(PromptAnswers, QWidget):
         return True
 
     def add_tab_actions(self, menu, actions):
-        config_action = menu.addAction("Cancel Config Save" if self.config_capture else "Save Running Config…")
+        config_action = menu.addAction(("Cancel Config Save" if self.config_capture else "Save Running Config…")
+                                       + f"\t{CONFIG_KEYS}")
         config_action.setEnabled(self.state == CONNECTED)
         actions[config_action] = self.cancel_config_capture if self.config_capture else self.save_running_config
         if self.session.protocol == SERIAL:
@@ -735,7 +789,8 @@ class SessionView(PromptAnswers, QWidget):
             break_action.setToolTip("What Cisco devices watch for at boot to enter ROMMON (password recovery).")
             break_action.setEnabled(self.state == CONNECTED)
             actions[break_action] = self.send_break
-        actions[menu.addAction("Stop Logging" if self.log_file is not None else "Log to File")] = self.toggle_logging
+        actions[menu.addAction(("Stop Logging" if self.log_file is not None else "Log to File")
+                               + f"\t{LOG_KEYS}")] = self.toggle_logging
         actions[menu.addAction("Find...")] = self.show_find
         actions[menu.addAction("Clear Scrollback")] = self.clear_scrollback
         if self.outbox:
@@ -810,9 +865,14 @@ class SessionView(PromptAnswers, QWidget):
         self.sync_scrollbar()
 
     def note(self, message, color):
-        """Write one of NOMAD's own messages into the terminal."""
-        prefix = "\r\n" if self.model.screen.cursor.x else ""
-        self.model.feed_text(f"{prefix}{color}[{message}]{RESET}\r\n")
+        """Write one of NOMAD's own messages into the terminal, then the line it interrupted (the device's prompt and
+        anything typed after it) again, so the cursor is back where the device has it: what's typed next, or Save
+        Config looking for the prompt, carries on from there."""
+        column = self.model.screen.cursor.x
+        line = self.model.line(self.model.cursor_position().line)
+        interrupted = "".join(line[index].data for index in range(column))  # Spaces kept: "$ " stays "$ "
+        prefix = "\r\n" if column else ""
+        self.model.feed_text(f"{prefix}{color}[{message}]{RESET}\r\n{interrupted}")
         self.after_output()
 
     def type_text(self, text):
@@ -1001,6 +1061,13 @@ class SessionView(PromptAnswers, QWidget):
         self.config_timeout.start(300000)
         self.start_config_command()
 
+    def config_shortcut(self):
+        """Ctrl+Shift+S: what the Save Config button (Cancel Save, while saving) does, if it can be pressed."""
+        if self.config_button.isEnabled():
+            self.save_running_config()
+        else:
+            self.note("Save Config needs a connected session.", ERROR_COLOR)
+
     def start_config_command(self):
         command = self.config_commands.pop(0)
         self.config_capture = ConfigCapture(self.config_prompt, command)
@@ -1029,7 +1096,7 @@ class SessionView(PromptAnswers, QWidget):
         path = self.config_path
         self.stop_config_capture()
         self.note(f"Saved running configuration to {path}", NOTE_COLOR)
-        self.config_button.setToolTip(f"Last saved configuration: {path}")
+        self.config_button.setToolTip(f"Last saved configuration: {path} ({CONFIG_KEYS} saves it again)")
 
     def stop_config_capture(self, message=""):
         if self.config_capture is None:
@@ -1086,7 +1153,7 @@ class SessionView(PromptAnswers, QWidget):
         self.log_label.setText("● Logging")
         self.log_label.setToolTip(path)
         self.logging_button.setText("Stop Logging")
-        self.logging_button.setToolTip(f"Stop logging to {path}")
+        self.logging_button.setToolTip(f"Stop logging to {path} ({LOG_KEYS})")
         self.note(f"Logging to {path}", NOTE_COLOR)
 
     def stop_logging(self):
@@ -1099,7 +1166,7 @@ class SessionView(PromptAnswers, QWidget):
             self.log_label.clear()
             self.log_label.setToolTip("")
             self.logging_button.setText("Log Session…")
-            self.logging_button.setToolTip("Choose a file on this workstation and start logging this session")
+            self.logging_button.setToolTip(LOG_TIP)
 
     def toggle_logging(self):
         if self.log_file is None:

@@ -107,6 +107,7 @@ class RdpTab(QWidget):
     settings_prefix = "rdp"
     saved_matches = SessionPage.saved_matches
     open_address = SessionPage.open_address
+    create_session = SessionPage.create_session
 
     def __init__(self, window, store):
         super().__init__(window)

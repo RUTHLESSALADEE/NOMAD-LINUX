@@ -262,6 +262,24 @@ def release_thread(thread, wait_ms=3000):
         thread.deleteLater()
 
 
+def hotkey_hint(text, parent):
+    """A small badge naming a key, shown over a button while Ctrl is held (command buttons' numbers, a terminal
+    session's S and Shift+S). Hidden to start with; clicks go through it."""
+    hint = QLabel(text, parent)
+    hint.setAlignment(Qt.AlignCenter)
+    hint.setAttribute(Qt.WA_TransparentForMouseEvents)
+    set_hint_enabled(hint, True)
+    hint.hide()
+    return hint
+
+
+def set_hint_enabled(hint, enabled):
+    """A hotkey badge in the accent colour, or muted while its button can't be pressed."""
+    hint.setStyleSheet(f"color: {COLORS['accent' if enabled else 'muted']}; background: {COLORS['background']}; "
+                       f"border: 1px solid {COLORS['border']}; border-radius: 3px; padding: 1px 4px; "
+                       "font-weight: bold;")
+
+
 class OneLineLabel(QLabel):
     """A label that can be kept to one line (set_one_line): what doesn't fit is cut short with "...", the whole of
     it in the tooltip. text() is always the whole text. wraps: whether it wraps when it isn't kept to one line."""

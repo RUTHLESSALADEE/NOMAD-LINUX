@@ -186,7 +186,10 @@ class SweepTab(QWidget):
         self.trace_button = QPushButton("Traceroute")
         self.ports_button = QPushButton("Scan Ports")
         self.ports_button.setToolTip("Check the host's common TCP ports on the Ports tab.")
-        self.host_buttons = (self.ssh_button, self.web_button, self.ping_button, self.trace_button, self.ports_button)
+        self.map_button = QPushButton("Add to Map...")
+        self.map_button.setToolTip("Add the host to a network map (you choose which) as a device added by hand.")
+        self.host_buttons = (self.ssh_button, self.web_button, self.ping_button, self.trace_button, self.ports_button,
+                             self.map_button)
         host_buttons.addWidget(QLabel("Selected host:"))
         for button in self.host_buttons:
             host_buttons.addWidget(button)
@@ -208,6 +211,7 @@ class SweepTab(QWidget):
         self.ping_button.clicked.connect(lambda: self.host_actions.ping(self.selected_host()))
         self.trace_button.clicked.connect(lambda: self.host_actions.trace(self.selected_host()))
         self.ports_button.clicked.connect(lambda: self.host_actions.scan_ports(self.selected_host()))
+        self.map_button.clicked.connect(self.add_selected_to_map)
 
     # ----------------------------------------------------------------- Tab interface
 
@@ -452,6 +456,13 @@ class SweepTab(QWidget):
     def selected_host(self):
         rows = self.table.selectionModel().selectedRows()
         return self.table.item(rows[0].row(), 0).text() if rows else None
+
+    def add_selected_to_map(self):
+        rows = self.table.selectionModel().selectedRows()
+        if rows:
+            name = self.table.item(rows[0].row(), COL_NAME)
+            self.host_actions.add_to_map(self.selected_host(),
+                                         name.text().replace(" (this computer)", "") if name is not None else "")
 
     def show_context_menu(self, position):
         item = self.table.itemAt(position)

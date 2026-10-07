@@ -6,6 +6,26 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.21.0] - 2026-10-06
+
+### Added
+
+- **MAC Finder** page (Discover) shows which switch and port a device is plugged into. Type its MAC address in any format (`aa:bb:cc:dd:ee:ff`, `aabb.ccdd.eeff`, `AA-BB-CC-DD-EE-FF`, `aabbcc-ddeeff`, spaces, no separators, dropped leading zeros like `0:1a:2b:...`), part of one (3 or more hex digits), an IP address or a name. Separate several searches with commas, or switch on **List** to paste or load one per line (rows from a spreadsheet or CSV use their first MAC address).
+  - **Find** (Enter) searches the open Network Map's last crawl at once, without touching the network.
+  - **Locate Now** (Shift+Enter) asks the map's switches over SNMP, using the map's credentials. A whole MAC is asked for directly (a GET per VLAN rather than reading whole MAC tables), first at the switch the map last had it on. It is then followed along the uplink it was learned on until it reaches an edge port; if that fails, every switch is asked.
+  - Part of a MAC, or a long list, reads every switch's MAC table once instead. An IP address is turned into a MAC from this computer's ARP (on its own subnets) or the ARP table of the router holding its subnet; a name is looked up in DNS first.
+  - Each result shows the switch, port and port description, VLAN, access or trunk mode, IP address, name and vendor. Below it are the path from the map's top switch to the port and the uplinks the MAC was also learned on, with a note when the port is behind an access point or phone, or has more than 8 MACs (likely an unmanaged switch, hub or VM host).
+  - **Where it's been:** each map crawl and each Locate Now is recorded in a local history, so every MAC shows the switch ports it has been on and when. A MAC missing from the map shows where it was last seen. The history can be cleared for one MAC or all.
+  - The right-click menu offers Locate Now, Show on Network Map and the switch's session, ping and browse actions. Copy Results and Export CSV are also available.
+- **Ctrl+S** starts (or stops) a terminal session log and **Ctrl+Shift+S** saves the running config (or cancels one being saved), the same as the **Log Session…** and **Save Config…** buttons below the session. They work anywhere in the session; Ctrl+S is no longer sent to the device as XOFF. Holding Ctrl shows **S** over Log Session and **Shift+S** over Save Config (greyed while the session isn't connected), alongside the command buttons' numbers and even while the Buttons bar is hidden.
+- **Add Device to Map…** on every address's right-click menu (tables, logs, labels, map items) and an **Add to Map...** button for Sweep's selected host. Choose the map: the one open on the Network Map page, a saved map, a tribe map, a new map or another map file; then name the device, set its kind and optionally link it to a device on that map. Maps that aren't open are updated without switching to them, unless **Show it on the Network Map page afterwards** is ticked. Addresses already on the chosen map are reported instead of added twice.
+- **Create Terminal Session…** and **Create RDP Session…** on the right-click menu of any address that doesn't have a saved session of that kind yet (Sweep, Network Map, IPAM, and addresses in tables, logs and labels on every page): the Terminal or Remote Desktop page's New Session dialog opens with the address filled in, named after the device where the page knows its name and in the folder a quick connection would suggest. A terminal session starts as SSH (choose Telnet in the dialog if you need it), and SSH, SCP and Telnet share these saved sessions, so one entry covers all three. Once it's saved, the menu offers **Open … Session (its name)** instead.
+- **Key** in the Network Map's Map menu (and on the classic bar): a window explaining the map's device colours and tags, outlines, monitoring and Watch marks, Compare rings, link line styles, VLAN highlighting, site/building/room boxes, host port boxes and the logical view, each drawn as the map draws it.
+
+### Changed
+
+- NOMAD's own messages in a terminal (such as "Logging to …") redraw the prompt line they interrupted, so typing and Save Config continue from the device's prompt.
+
 ## [1.20.0] - 2026-10-05
 
 ### Added

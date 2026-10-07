@@ -814,7 +814,7 @@ def test_map_menu_does_what_the_map_buttons_do(tab, crawled, monkeypatch):
     tab.update_map_menu()
     entries = {action.text(): action for action in tab.map_menu.actions() if not action.isSeparator()}
     assert list(entries) == ["Crawl: Start From, Gateway, Start, Stop", "New Map", "Open...", "Recent", "Save As...", "Export", "Compare", "IPAM Network...",
-                             "Record in IPAM...", "Credentials...", "Scope...", "Tribe"]
+                             "Record in IPAM...", "Credentials...", "Scope...", "Tribe", "Key"]
     assert all(action.isEnabled() for action in entries.values())
     from PyQt5 import sip
     kept = [tab.crawl_action] + [entry for entry, _ in tab.map_entries]

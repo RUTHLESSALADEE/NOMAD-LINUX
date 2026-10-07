@@ -2051,7 +2051,8 @@ class IpamTab(QWidget):
             record = self.model.recorded.get(selected[0])
             name = record.name.strip() if record is not None else ""
             host_actions = HostActions(self.window, self).add_to(
-                menu, host, aliases=[name] if name else (), name=name, sessions=("Telnet", "RDP"))
+                menu, host, aliases=[name] if name else (), name=name, folder=self.session_folder(),
+                sessions=("Telnet", "RDP"))
             menu.addSeparator()
             menu.addAction("History...", lambda: self.show_history("address", host)).setEnabled(self.as_of is None)
         links = self.other_page_actions(menu, address=host) if len(selected) == 1 else {}
@@ -2066,9 +2067,7 @@ class IpamTab(QWidget):
         name). A new session is named after the address and suggests the network and subnet as its folder."""
         record = self.model.recorded.get(ipaddress.ip_address(host))
         name = record.name.strip() if record is not None else ""
-        network, subnet = self.network(), self.selected_subnet()
-        parts = [network.name if network is not None else "", subnet.name if subnet is not None else ""]
-        folder = "/".join(part.strip().replace("/", "-") for part in parts if part and part.strip())
+        folder = self.session_folder()
         aliases = [name] if name else []
         for label, page in (("SSH", self.window.terminal_tab), ("SCP", self.window.scp_tab)):
             matches = page.saved_matches(host, aliases)
@@ -2082,6 +2081,12 @@ class IpamTab(QWidget):
             if matches:
                 menu.addAction(f"{label} as a New Session", lambda page=page: page.open_address(
                     host, aliases=aliases, name=name, folder=folder, use_saved=False))
+
+    def session_folder(self):
+        """The folder to suggest for a new session to an address: the network and subnet, as Network/Subnet."""
+        network, subnet = self.network(), self.selected_subnet()
+        parts = [network.name if network is not None else "", subnet.name if subnet is not None else ""]
+        return "/".join(part.strip().replace("/", "-") for part in parts if part and part.strip())
 
     def go_to(self, page, method, host):
         self.window.navigator.setCurrentWidget(page)
