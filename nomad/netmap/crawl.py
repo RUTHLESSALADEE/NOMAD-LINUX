@@ -769,7 +769,7 @@ class Crawler:
 
         next_visits = []
         for neighbor in tables.neighbors:
-            kind = collect.classify(capabilities=neighbor.capabilities, platform=neighbor.platform)
+            kind = collect.neighbor_kind(neighbor)
             if kind in END_DEVICE_KINDS:
                 continue  # Placed on its port as a host at the end
             other = self.find(neighbor.address, neighbor.name) \
@@ -852,7 +852,7 @@ class Crawler:
             if devices[key].kind in NETWORK_KINDS:
                 network_macs |= tables.own_macs
             for neighbor in tables.neighbors:
-                kind = collect.classify(capabilities=neighbor.capabilities, platform=neighbor.platform)
+                kind = collect.neighbor_kind(neighbor)
                 if kind in END_DEVICE_KINDS:
                     end_devices[(key, port_key(neighbor.local_port))] = neighbor
                 elif neighbor.chassis_mac and kind in NETWORK_KINDS:
@@ -880,7 +880,7 @@ class Crawler:
             key, port, vlan, _ = min(places, key=lambda place: place[3])  # Nearest: the port with fewest MACs
             host = Host(mac=mac, device=key, port=port, ip=arp_table.get(mac, ""), vendor=vendor(mac), vlan=vlan)
             neighbor = end_devices.get((key, port_key(port)))
-            if neighbor is not None and end_device_mac(neighbor) == mac:
+            if neighbor is not None and mac in (end_device_mac(neighbor), neighbor.port_mac):
                 host.name, host.platform = neighbor.name, neighbor.platform
                 host.ip = host.ip or neighbor.address
                 named.add((key, port_key(port)))
@@ -1052,9 +1052,10 @@ def prefix_length(mask):
 
 
 def end_device_mac(neighbor):
-    """A phone's MAC: LLDP's chassis ID, or from a Cisco phone's CDP name (SEP followed by its MAC)."""
-    if neighbor.chassis_mac:
-        return neighbor.chassis_mac
+    """A phone's or computer's MAC: LLDP's chassis ID or port ID, or from a Cisco phone's CDP name (SEP followed by
+    its MAC)."""
+    if neighbor.chassis_mac or neighbor.port_mac:
+        return neighbor.chassis_mac or neighbor.port_mac
     match = re.match(r"SEP([0-9A-Fa-f]{12})", neighbor.name)
     return format_mac(match.group(1)) if match else ""
 

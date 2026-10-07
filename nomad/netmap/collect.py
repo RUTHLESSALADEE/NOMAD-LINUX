@@ -62,6 +62,8 @@ ROUTER_WORDS = ("isr", "asr1", "asr9", "csr1000", "c8200", "c8300", "c8500", "c8
                 "c1161", "router")
 SWITCH_WORDS = ("catalyst", "nexus", "nx-os", "switch", "c9200", "c9300", "c9400", "c9500", "c9600", "c2960",
                 "c3560", "c3650", "c3750", "c3850", "c4500", "c6500", "c6800", "ws-c", "ie-", "cat9k", "cat3k")
+# Operating systems a computer's LLDP agent names in its system description
+HOST_WORDS = ("windows", "microsoft", "mac os", "macos", "darwin", "ubuntu", "debian", "red hat", "linux")
 
 # CDP capability bits (cdpCacheCapabilities, a 4-byte bitmask)
 CDP_CAPABILITIES = {0x01: "router", 0x02: "bridge", 0x04: "bridge", 0x08: "switch", 0x10: "host", 0x80: "phone"}
@@ -79,6 +81,7 @@ class Neighbor:
     capabilities: frozenset = frozenset()
     protocol: str = "cdp"
     chassis_mac: str = ""  # LLDP chassis ID when it's a MAC address
+    port_mac: str = ""  # LLDP port ID when it's a MAC address, as a computer's LLDP agent sends it
 
 
 @dataclass
@@ -266,10 +269,11 @@ def lldp_neighbors(rows, local_ports, interfaces, management_addresses):
         if not name:
             continue
         port_id, port_subtype = row.get(7), (row[6].value if 6 in row else 0)
+        port_mac = mac_text(port_id.value) if port_id is not None and port_subtype == 3 else ""
         if port_id is not None and port_subtype in (5, 7) and is_printable(port_id.value):
             port = text(port_id)
         elif port_id is not None and port_subtype == 3:
-            port = text(row.get(8)) or mac_text(port_id.value)
+            port = text(row.get(8)) or port_mac
         else:
             port = text(row.get(8)) or (text(port_id) if port_id is not None and is_printable(port_id.value) else "")
         local_port = local_ports.get(local) or interfaces.get(local, f"port {local}")
@@ -278,7 +282,7 @@ def lldp_neighbors(rows, local_ports, interfaces, management_addresses):
             neighbors.append(Neighbor(local_port=local_port, name=name, port=port, address=address,
                                       platform=descr.splitlines()[0][:80] if descr else "",
                                       capabilities=lldp_capabilities(row.get(12)), protocol="lldp",
-                                      chassis_mac=chassis_mac))
+                                      chassis_mac=chassis_mac, port_mac=port_mac))
     return neighbors
 
 
@@ -570,6 +574,17 @@ def classify(object_id="", descr="", capabilities=frozenset(), platform=""):
     if object_id.startswith(CISCO + "."):
         return ROUTER  # A Cisco box that answers SNMP but said nothing clearer
     return UNKNOWN
+
+
+def neighbor_kind(neighbor):
+    """What a CDP/LLDP neighbor is. A computer's LLDP agent (Windows, lldpd) often announces no capabilities at all:
+    with its port ID a MAC address, or an operating system named in its description, it's a host, not a device."""
+    kind = classify(capabilities=neighbor.capabilities, platform=neighbor.platform)
+    if kind == UNKNOWN and neighbor.protocol == "lldp":
+        words = neighbor.platform.lower()
+        if neighbor.port_mac or any(word in words for word in HOST_WORDS):
+            return HOST
+    return kind
 
 
 def _dotted(numbers):

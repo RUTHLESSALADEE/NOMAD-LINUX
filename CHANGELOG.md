@@ -6,6 +6,12 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.21.1] - 2026-10-07
+
+### Fixed
+
+- **Network Map:** computers that announce themselves over LLDP without any capabilities, such as Windows' built-in LLDP agent, no longer appear on the map as network devices. An LLDP neighbor with no capabilities is treated as a host when its port ID is a MAC address or its description names a desktop or server operating system (Windows, macOS, Linux). It is shown as a named host on its switch port.
+
 ## [1.21.0] - 2026-10-06
 
 ### Added

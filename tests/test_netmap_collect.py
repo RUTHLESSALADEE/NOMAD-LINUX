@@ -1,7 +1,7 @@
 from netmap_fakes import CISCO_SWITCH, PALO_ALTO, Device, number, string
 
 from nomad.netmap import collect
-from nomad.netmap.model import AP, FIREWALL, PHONE, ROUTER, SWITCH, UNKNOWN, normalize_name, port_key, short_port
+from nomad.netmap.model import AP, FIREWALL, HOST, PHONE, ROUTER, SWITCH, UNKNOWN, normalize_name, port_key, short_port
 from nomad.snmp import oid_text
 
 
@@ -51,6 +51,33 @@ def test_lldp_neighbor_without_system_name_uses_chassis_mac():
     neighbor = collect.lldp_neighbors(table, collect.lldp_local_ports(table), {}, {})[0]
     assert neighbor.name == "52-54-00-12-34-56"
     assert "station" in neighbor.capabilities
+
+
+def test_lldp_computer_without_capabilities_is_a_host():
+    """Windows' LLDP agent announces no capabilities, and its NIC's MAC as the port ID."""
+    device = Device("core", "", CISCO_SWITCH)
+    device.lldp(15, "Gi1/0/15", 1, "WAAAAANB3704Q2", "", capabilities=0, port_mac="64-4E-D7-1E-E9-8A")
+    table = rows(device)
+    neighbor = collect.lldp_neighbors(table, collect.lldp_local_ports(table), {}, {})[0]
+    assert neighbor.port_mac == "64-4E-D7-1E-E9-8A" and neighbor.port == "64-4E-D7-1E-E9-8A"
+    assert not neighbor.capabilities
+    assert collect.neighbor_kind(neighbor) == HOST
+
+
+def test_lldp_neighbor_without_capabilities_named_by_its_os_is_a_host():
+    device = Device("core", "", CISCO_SWITCH)
+    device.lldp(15, "Gi1/0/15", 1, "build-01", "eth0", capabilities=0, descr="Ubuntu 24.04 LTS Linux 6.8.0")
+    table = rows(device)
+    neighbor = collect.lldp_neighbors(table, collect.lldp_local_ports(table), {}, {})[0]
+    assert collect.neighbor_kind(neighbor) == HOST
+
+
+def test_lldp_neighbor_without_capabilities_otherwise_stays_unknown():
+    device = Device("core", "", CISCO_SWITCH)
+    device.lldp(15, "Gi1/0/15", 1, "mystery", "port 1", capabilities=0)
+    table = rows(device)
+    neighbor = collect.lldp_neighbors(table, collect.lldp_local_ports(table), {}, {})[0]
+    assert collect.neighbor_kind(neighbor) == UNKNOWN
 
 
 def test_lldp_keeps_every_management_address():
