@@ -48,6 +48,7 @@ from .netmap_dialogs import CommunitiesDialog, CompareDialog, DeletedDevicesDial
 from .netmap_tribe import TribeSync
 from .netmap_view import GROUP_BOX, MapView
 from .netmap_vlans import VlanPanel, domain_text
+from .vlan_path_dialog import VlanPathDialog
 from .netmap_watch import MapWatcher
 from .table_filter import TableFilter
 from .theme import COLORS, accent_button
@@ -190,6 +191,7 @@ class NetworkMapTab(QWidget):
         self.check_device = check_device  # What asks one (tests swap in the fake network)
         self.read_vlans = read_vlans_of  # What reads one's VLANs (tests swap in the fake network)
         self.vlan_reading = None  # While Read VLANs Again runs: {"map", "read", "failed", "lines"}
+        self.carry_dialog = None  # Carry VLAN (made the first time it's used, then kept)
         self.save_timer = QTimer(self)
         self.save_timer.setSingleShot(True)
         self.save_timer.setInterval(SAVE_DELAY_MS)
@@ -428,6 +430,7 @@ class NetworkMapTab(QWidget):
         self.vlan_panel.add_to_database_requested.connect(self.add_vlans_to_database)
         self.vlan_panel.read_requested.connect(self.read_vlans_again)
         self.vlan_panel.vlans_page_requested.connect(self.show_vlans_page)
+        self.vlan_panel.carry_requested.connect(self.carry_vlan_from_panel)
 
         self.gateway_button.clicked.connect(self.use_gateway)
         self.communities_button.clicked.connect(self.edit_communities)
@@ -808,6 +811,8 @@ class NetworkMapTab(QWidget):
             settings.sync()
 
     def shutdown(self):
+        if self.carry_dialog is not None:
+            self.carry_dialog.session_sender.stop_waiting()
         self.monitor.shutdown()
         self.watcher.shutdown()
         for thread in list(self.check_threads):
@@ -1573,7 +1578,9 @@ class NetworkMapTab(QWidget):
 
     def on_escape(self):
         view = self.current_view()
-        if view.drawing is not None:
+        if view.picking:
+            view.stop_picking()
+        elif view.drawing is not None:
             view.cancel_drawing()
         else:
             self.clear_vlan()
@@ -1959,6 +1966,34 @@ class NetworkMapTab(QWidget):
         if len(numbers) > VLANS_IN_MENU:
             submenu.addAction(f"...and {len(numbers) - VLANS_IN_MENU} more (see the VLANs tab)").setEnabled(False)
 
+    def carry_vlan_menu(self, menu, actions, key, keys):
+        """Carry a VLAN Here... on a switch, and Carry a VLAN Between These... with two network devices selected (B
+        a switch: the one right-clicked, if it is)."""
+        network_map = self.network_map
+        if self.worker is not None or network_map is None or key not in network_map.devices:
+            return
+        devices = network_map.devices
+        if devices[key].kind == SWITCH:
+            actions[menu.addAction("Carry a VLAN Here...")] = lambda: self.carry_vlan(b=key)
+        chosen = [item for item in keys if item in devices and devices[item].kind in (SWITCH, ROUTER, FIREWALL)]
+        if len(chosen) == 2:
+            b = key if devices[key].kind == SWITCH else next((item for item in chosen if devices[item].kind == SWITCH),
+                                                             None)
+            if b is not None:
+                a = next(item for item in chosen if item != b)
+                actions[menu.addAction("Carry a VLAN Between These...")] = lambda: self.carry_vlan(a=a, b=b)
+
+    def carry_vlan(self, vlan=None, a=None, b=None, port=None, route=None):
+        """Carry VLAN: get a VLAN to a switch (b) over the map's links, from a or from wherever it already is."""
+        if self.network_map is None:
+            return
+        if self.carry_dialog is None:
+            self.carry_dialog = VlanPathDialog(self)
+        self.carry_dialog.set_target(vlan, a, b, port, route)
+
+    def carry_vlan_from_panel(self, vlan, _domain):
+        self.carry_vlan(vlan=vlan)
+
     def show_on_map(self, kind, row):
         item = (self.devices_table if kind == "device" else self.hosts_table).item(row, 0)
         if item is None or self.network_map is None:
@@ -2139,6 +2174,7 @@ class NetworkMapTab(QWidget):
         if news and self.worker is None:
             actions[menu.addAction("Mark as Seen")] = lambda: self.mark_seen(news)
         self.device_vlan_menu(menu, actions, device)
+        self.carry_vlan_menu(menu, actions, key, keys)
         self.device_ipam_menu(menu, actions, device)
         if self.worker is None and self.network_map is not None and key in self.network_map.devices and \
                 hub(self.window) is not None:
@@ -2333,6 +2369,8 @@ class NetworkMapTab(QWidget):
                 lambda number=number: self.highlight_vlan(number, domain)
         for number in numbers:
             self.add_vlan_link(menu, actions, number, domain or "")
+        if device is not None and device.kind == SWITCH and key in self.network_map.devices:
+            actions[menu.addAction("Carry a VLAN Here...")] = lambda: self.carry_vlan(b=key, port=port)
         if len(hosts) == 1:
             self.add_address_link(menu, actions, hosts[0].ip)
         if actions:

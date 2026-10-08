@@ -76,6 +76,24 @@ def device_port_vlans(tables, short_port):
     return dict(sorted(entries.items(), key=lambda item: port_sort_key(item[0])))
 
 
+def is_port_channel(port):
+    """Whether an interface is a port-channel (an aggregate of links), not a subinterface or tunnel over one."""
+    key = port_key(port)
+    return "." not in key and key.startswith(("po", "port-channel", "ae", "bond", "bridge-aggregation", "trk"))
+
+
+def device_port_channels(tables, short_port):
+    """A device's Device.port_channels from what was read: {member port: its port-channel} (short names). Only real
+    port-channels: ifStackTable also stacks a router's subinterfaces on their port."""
+    found = {}
+    for member, parent in sorted(tables.lag_parents.items()):
+        if member in tables.interfaces and parent in tables.interfaces:
+            name = short_port(tables.interfaces[parent])
+            if is_port_channel(name):
+                found[short_port(tables.interfaces[member])] = name
+    return found
+
+
 def port_info(device, port):
     """The device's VLAN entry for a port (written any way: Gi1/0/1 or GigabitEthernet1/0/1), or {}."""
     if not device.port_vlans or not port:

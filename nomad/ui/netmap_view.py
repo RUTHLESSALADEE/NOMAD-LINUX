@@ -800,6 +800,8 @@ class MapView(QGraphicsView):
     background_context_requested = pyqtSignal(object, object)  # Scene position, global position
     link_context_requested = pyqtSignal(object, object)  # [Link] the line stands for, global position
     link_drawn = pyqtSignal(str, str)  # Drawing a link by hand: from device key, to device key
+    device_picked = pyqtSignal(str)  # Picking devices one after another (Carry VLAN's Pick on Map): one clicked
+    picking_stopped = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -824,6 +826,7 @@ class MapView(QGraphicsView):
         self.fit_pending = False
         self.auto_fit = False  # Fitted automatically and not zoomed or panned since: refit when resized
         self.drawing = None  # Drawing a link by hand: (DeviceItem it starts from, the rubber line)
+        self.picking = False  # Picking devices one after another: each click on one is device_picked
         self.last_found = None  # (text, match) Find showed last, so Enter again goes on to the next
         self.vlan_focus = None  # netmap.vlans.Focus of the VLAN highlighted, or None
         self.scene().selectionChanged.connect(self.on_selection_changed)
@@ -1240,6 +1243,21 @@ class MapView(QGraphicsView):
         self.setFocus()
         return True
 
+    def start_picking(self):
+        """Each click on a device is device_picked, until the background is clicked, Esc or the right button (or
+        stop_picking)."""
+        self.cancel_drawing()
+        self.picking = True
+        self.viewport().setCursor(Qt.PointingHandCursor)
+        self.setFocus()
+
+    def stop_picking(self):
+        if not self.picking:
+            return
+        self.picking = False
+        self.viewport().unsetCursor()
+        self.picking_stopped.emit()
+
     def cancel_drawing(self):
         if self.drawing is None:
             return
@@ -1260,6 +1278,14 @@ class MapView(QGraphicsView):
 
     def mousePressEvent(self, event):
         self.auto_fit = False
+        if self.picking:
+            target = self.device_at(event.pos()) if event.button() == Qt.LeftButton else None
+            if target is None:
+                self.stop_picking()
+            else:
+                self.device_picked.emit(target.key)
+            event.accept()
+            return
         if self.drawing is not None:
             start, _ = self.drawing
             target = self.device_at(event.pos()) if event.button() == Qt.LeftButton else None
@@ -1308,7 +1334,10 @@ class MapView(QGraphicsView):
             self.setDragMode(QGraphicsView.ScrollHandDrag)
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape and self.drawing is not None:
+        if event.key() == Qt.Key_Escape and self.picking:
+            self.stop_picking()
+            event.accept()
+        elif event.key() == Qt.Key_Escape and self.drawing is not None:
             self.cancel_drawing()
             event.accept()
         elif event.matches(QKeySequence.SelectAll):
@@ -1496,6 +1525,10 @@ class MapView(QGraphicsView):
             self.selection_changed.emit(("port", selected[0].parentItem().device.key, selected[0].port))
 
     def contextMenuEvent(self, event):
+        if self.picking:
+            self.stop_picking()
+            event.accept()
+            return
         if self.drawing is not None:
             self.cancel_drawing()
             event.accept()

@@ -38,6 +38,16 @@ Q_VLAN_EGRESS = "1.3.6.1.2.1.17.7.1.4.2.1.4"  # dot1qVlanCurrentEgressPorts (ind
 Q_VLAN_UNTAGGED = "1.3.6.1.2.1.17.7.1.4.2.1.5"  # dot1qVlanCurrentUntaggedPorts: of those, the ones sent untagged
 Q_PVID = "1.3.6.1.2.1.17.7.1.4.5.1.1"  # dot1qPvid (index bridge port): the VLAN untagged frames go in
 VTP_MODES = {1: "client", 2: "server", 3: "transparent", 4: "off"}
+STP_TYPE = "1.3.6.1.4.1.9.9.82.1.6.1"  # CISCO-STP-EXTENSIONS-MIB stpxSpanningTreeType (a scalar: .0)
+STP_TYPES = {1: "pvst", 2: "mistp", 3: "mistp-pvst", 4: "mst", 5: "rapid-pvst"}
+# stpxSMSTInstanceTable (index: MST instance): 2 a bitmap of VLANs 0-2047 mapped to it, 3 of VLANs 2048-4095
+MST_INSTANCE_ENTRY = "1.3.6.1.4.1.9.9.82.1.14.5.1"
+# stpxRSTPPortRoleValue (index: instance, which is the VLAN on Rapid-PVST or the MST instance on MST, then bridge port)
+RSTP_PORT_ROLE = "1.3.6.1.4.1.9.9.82.1.12.2.1.3"
+RSTP_ROLES = {1: "disabled", 2: "root", 3: "designated", 4: "alternate", 5: "backup", 6: "boundary", 7: "master"}
+STP_PORT_STATE = "1.3.6.1.2.1.17.2.15.1.3"  # BRIDGE-MIB dot1dStpPortState (index bridge port); per VLAN on PVST+
+STP_STATES = {1: "disabled", 2: "blocking", 3: "listening", 4: "learning", 5: "forwarding", 6: "broken"}
+FORWARDING, BLOCKING, DISABLED = "forwarding", "blocking", "disabled"  # A port's STP state, simplified
 # VRFs: which interfaces are in which, and each VRF's routing table (ipCidrRouteTable has only the global one)
 CV_VRF_NAME = "1.3.6.1.4.1.9.9.711.1.1.1.1.2"  # CISCO-VRF-MIB cvVrfName (index cvVrfIndex)
 CV_VRF_INTERFACE_ENTRY = "1.3.6.1.4.1.9.9.711.1.2.1.1"  # cvVrfInterfaceTable (index cvVrfIndex, ifIndex)
@@ -58,10 +68,13 @@ PALO_ALTO = "1.3.6.1.4.1.25461"
 RESERVED_VLANS = range(1002, 1006)  # FDDI/Token Ring defaults every Catalyst lists
 FDB_LEARNED = 3
 AP_WORDS = ("air-", "access point", "c9105", "c9115", "c9120", "c9130", "c9136", "c9162", "c9164", "c9166", "cw916")
+# IOL and vIOS lab images name no model: their image names say which is the router (I86BI_LINUX-, VIOS-) and which
+# the switch (I86BI_LINUXL2-, VIOS_L2-)
 ROUTER_WORDS = ("isr", "asr1", "asr9", "csr1000", "c8200", "c8300", "c8500", "c8000", "c1100", "c1111", "c1121",
-                "c1161", "router")
+                "c1161", "router", "i86bi_linux-", "vios-adventerprise", "virtual xe")
 SWITCH_WORDS = ("catalyst", "nexus", "nx-os", "switch", "c9200", "c9300", "c9400", "c9500", "c9600", "c2960",
-                "c3560", "c3650", "c3750", "c3850", "c4500", "c6500", "c6800", "ws-c", "ie-", "cat9k", "cat3k")
+                "c3560", "c3650", "c3750", "c3850", "c4500", "c6500", "c6800", "ws-c", "ie-", "cat9k", "cat3k",
+                "linuxl2", "vios_l2", "viosl2")
 # Operating systems a computer's LLDP agent names in its system description
 HOST_WORDS = ("windows", "microsoft", "mac os", "macos", "darwin", "ubuntu", "debian", "red hat", "linux")
 
@@ -115,6 +128,10 @@ class DeviceTables:
     interface_vrfs: dict = field(default_factory=dict)  # ifIndex -> VRF name, for interfaces in one
     vrf_routes: dict = field(default_factory=dict)  # VRF name -> [(destination, next hop, ifIndex, protocol)]
     routes_read: bool = False  # Set when routes were read (a crawl always reads them; Read Again only when asked)
+    stp_mode: str = ""  # pvst, rapid-pvst, mst... (STP_TYPES), "" when it didn't say
+    stp_instance: int = -1  # With an STP read for one VLAN: its spanning tree instance (the VLAN, or an MST instance)
+    stp_ports: dict = field(default_factory=dict)  # ifIndex -> (FORWARDING, BLOCKING or DISABLED, role or state)
+    stp_read: bool = False  # An STP read for one VLAN was made (stp_ports may still be empty)
 
 
 @dataclass
@@ -549,8 +566,68 @@ def lag_parents(stack_rows, lag_rows):
     return parents
 
 
-def classify(object_id="", descr="", capabilities=frozenset(), platform=""):
-    """Switch, router, firewall, access point, phone or host, from what the device says about itself."""
+def base_port_ifindexes(rows):
+    """{bridge port: ifIndex} from dot1dBasePortIfIndex."""
+    return {index[0]: value.value for index, value in column(rows, BASE_PORT_IFINDEX).items()
+            if len(index) == 1 and isinstance(value.value, int)}
+
+
+def stp_mode(rows):
+    """The spanning tree a Cisco switch runs (STP_TYPES), from a walk of stpxSpanningTreeType, or ""."""
+    for value in column(rows, STP_TYPE).values():
+        return STP_TYPES.get(value.value, "")
+    return ""
+
+
+def mst_instance_of(rows, vlan):
+    """The MST instance a VLAN is mapped to, from stpxSMSTInstanceTable: 0 (the IST) when no other instance has
+    it, or -1 when the table is empty (unknown)."""
+    instances = columns(rows, MST_INSTANCE_ENTRY)
+    if not instances:
+        return -1
+    for index, row in sorted(instances.items()):
+        if len(index) != 1 or not index[0]:
+            continue
+        mapped = set()
+        if 2 in row:
+            mapped |= bitmap_members(row[2].value, 0)
+        if 3 in row:
+            mapped |= bitmap_members(row[3].value, 2048)
+        if vlan in mapped:
+            return index[0]
+    return 0
+
+
+def rstp_port_roles(rows, instance, base_ports):
+    """{ifIndex: (FORWARDING, BLOCKING or DISABLED, role)} for one spanning tree instance, from
+    stpxRSTPPortRoleTable (Rapid-PVST: the instance is the VLAN; MST: the MST instance)."""
+    found = {}
+    for index, value in column(rows, RSTP_PORT_ROLE).items():
+        if len(index) != 2 or index[0] != instance or index[1] not in base_ports:
+            continue
+        role = RSTP_ROLES.get(value.value, "")
+        state = BLOCKING if role in ("alternate", "backup") else DISABLED if role == "disabled" else FORWARDING
+        found[base_ports[index[1]]] = (state, role)
+    return found
+
+
+def stp_port_states(rows, base_ports):
+    """{ifIndex: (FORWARDING, BLOCKING or DISABLED, state)} from BRIDGE-MIB dot1dStpPortState (PVST+, read for one
+    VLAN with community@vlan). Listening and learning ports aren't forwarding yet, so they count as blocking."""
+    found = {}
+    for index, value in column(rows, STP_PORT_STATE).items():
+        if len(index) != 1 or index[0] not in base_ports:
+            continue
+        state = STP_STATES.get(value.value, "")
+        simple = FORWARDING if state == "forwarding" else DISABLED if state == "disabled" else BLOCKING
+        found[base_ports[index[0]]] = (simple, state)
+    return found
+
+
+def classify(object_id="", descr="", capabilities=frozenset(), platform="", switchports=False):
+    """Switch, router, firewall, access point, phone or host, from what the device says about itself. switchports: a
+    Cisco device's own tables have access or trunk ports, which makes it a switch unless its model is a router's (an
+    ISR with a switch module): its neighbors' CDP says "Router Switch" for any multilayer box."""
     words = f"{descr} {platform}".lower()
     if object_id.startswith(PALO_ALTO + ".") or "palo alto" in words or "pan-os" in words:
         return FIREWALL
@@ -564,6 +641,8 @@ def classify(object_id="", descr="", capabilities=frozenset(), platform=""):
     if any(word in words for word in ROUTER_WORDS):
         return ROUTER
     if any(word in words for word in SWITCH_WORDS):
+        return SWITCH
+    if switchports and object_id.startswith(CISCO + "."):
         return SWITCH
     if "switch" in capabilities or "bridge" in capabilities:
         return SWITCH
