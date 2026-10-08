@@ -12,7 +12,8 @@ from PyQt5.QtCore import QByteArray
 
 from .commands import CommandButton
 from .highlight import HighlightRule, Highlighter
-from .sessions import RDP, TERMINAL_PROTOCOLS, Session, SessionFolderStore, RecentEntry, validate_session
+from .sessions import RDP, TERMINAL_PROTOCOLS, Credential, Session, SessionFolderStore, RecentEntry, \
+    validate_credential, validate_session
 from .vault import derive_key
 
 MAGIC = b"NOMAD-TERMINAL-BACKUP\x01"
@@ -37,6 +38,12 @@ def write_backup(path, password, store, commands, highlights, settings):
         for field in SECRETS:
             item[field] = store.vault.reveal(item[field]) if item[field] else ""
         sessions.append(item)
+    credentials = []
+    for credential in store.credentials.items:
+        item = dataclasses.asdict(credential)
+        for field in SECRETS:
+            item[field] = store.vault.reveal(item[field]) if item[field] else ""
+        credentials.append(item)
     preferences = {}
     for key in settings.allKeys():
         if terminal_key(key):
@@ -46,6 +53,7 @@ def write_backup(path, password, store, commands, highlights, settings):
     data = {"sessions": sessions, "folders": sorted(SessionFolderStore(store, TERMINAL_PROTOCOLS).all_folders()),
             "rdp_folders": sorted(SessionFolderStore(store, {RDP}, "rdp_folders").all_folders()),
             "recent": [entry.to_dict() for entry in store.recent],
+            "credentials": credentials, "default_credential": store.credentials.default_id,
             "commands": [dataclasses.asdict(button) for button in commands.buttons],
             "highlights": [dataclasses.asdict(rule) for rule in highlights.rules],
             "highlight_enabled": highlights.enabled, "settings": preferences,
@@ -68,7 +76,7 @@ def _record(cls, item):
     if not isinstance(item, dict):
         raise ValueError("Invalid record")
     record = cls(**item)
-    defaults = cls(**({"name": "Session"} if cls in (Session, CommandButton) else {"pattern": ""}))
+    defaults = cls(**({"name": "Session"} if cls in (Session, CommandButton, Credential) else {"pattern": ""}))
     for field in dataclasses.fields(cls):
         value, default = getattr(record, field.name), getattr(defaults, field.name)
         if isinstance(default, float) or field.name == "stop_bits":
@@ -79,6 +87,10 @@ def _record(cls, item):
             raise ValueError(f"Invalid {field.name}")
     if cls is Session:
         problem = validate_session(record)
+        if problem:
+            raise ValueError(problem)
+    if cls is Credential:
+        problem = validate_credential(record)
         if problem:
             raise ValueError(problem)
     return record
@@ -104,6 +116,15 @@ def read_backup(path, password):
         data["sessions"] = [_record(Session, item) for item in data["sessions"]]
         if len({session.id for session in data["sessions"]}) != len(data["sessions"]):
             raise ValueError("Duplicate session IDs")
+        data.setdefault("credentials", [])  # Backups from before credentials existed
+        if not isinstance(data["credentials"], list):
+            raise ValueError("Invalid credentials")
+        data["credentials"] = [_record(Credential, item) for item in data["credentials"]]
+        if len({credential.id for credential in data["credentials"]}) != len(data["credentials"]):
+            raise ValueError("Duplicate credential IDs")
+        data.setdefault("default_credential", "")
+        if type(data["default_credential"]) is not str:
+            raise ValueError("Invalid default credential")
         data["commands"] = [_record(CommandButton, item) for item in data["commands"]]
         data["highlights"] = [_record(HighlightRule, item) for item in data["highlights"]]
         for item in data["recent"]:
@@ -146,6 +167,13 @@ def restore_backup(data, store, commands, highlights, settings):
             secret = getattr(session, field)
             setattr(session, field, store.vault.protect(secret) if secret else "")
         sessions.append(session)
+    credentials = []
+    for original in data.get("credentials", []):
+        credential = dataclasses.replace(original)
+        for field in SECRETS:
+            secret = getattr(credential, field)
+            setattr(credential, field, store.vault.protect(secret) if secret else "")
+        credentials.append(credential)
     originals = {}
     for owner in (store, commands, highlights):
         if os.path.exists(owner.path):
@@ -155,10 +183,17 @@ def restore_backup(data, store, commands, highlights, settings):
             originals[owner.path] = None
     previous = (store.sessions, store.folders, store.rdp_folders, store.recent, dict(store.vault_settings), commands.buttons,
                 highlights.rules, highlights.enabled, highlights.highlighter)
+    previous_credentials = (store.credentials.items, store.credentials.default_id)
     preferences = {key: settings.value(key) for key in settings.allKeys() if terminal_key(key)}
     try:
         store.sessions, store.folders, store.recent = sessions, set(data["folders"]), data["recent"]
         store.rdp_folders = set(data.get("rdp_folders", []))
+        store.credentials.items = credentials
+        store.credentials.default_id = data.get("default_credential", "")
+        if store.credentials.default is None:
+            store.credentials.default_id = ""
+        for session in store.sessions:
+            store.credentials.apply(session)  # Links to credentials the backup doesn't have are dropped
         store.vault_settings["lock_after"] = data["lock_after"]
         commands.buttons = data["commands"]
         highlights.rules, highlights.enabled = data["highlights"], data["highlight_enabled"]
@@ -177,6 +212,7 @@ def restore_backup(data, store, commands, highlights, settings):
     except Exception:
         (store.sessions, store.folders, store.rdp_folders, store.recent, vault_settings, commands.buttons,
          highlights.rules, highlights.enabled, highlights.highlighter) = previous
+        store.credentials.items, store.credentials.default_id = previous_credentials
         store.vault_settings.clear()
         store.vault_settings.update(vault_settings)
         for key in settings.allKeys():

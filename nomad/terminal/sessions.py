@@ -78,6 +78,7 @@ class Session:
     rdp_clipboard: bool = True
     rdp_audio: int = 0  # 0: this computer; 1: remote computer; 2: off
     rdp_admin: bool = False
+    credential_id: str = ""  # A saved Credential whose user name and password (or key) this session logs in with
 
     @property
     def path(self):
@@ -188,6 +189,136 @@ def same_host(first, second):
 
 
 @dataclass
+class Credential:
+    """A named login (user name plus a saved password, or a key file) that many sessions can share, such as the same
+    TACACS account on every switch. Sessions using it keep a copy of its user name and encrypted secrets, so every
+    way of connecting works unchanged; changing the credential updates them all."""
+    name: str
+    username: str = ""
+    auth: str = AUTH_PASSWORD
+    saved_password: str = ""  # Encrypted like a session's; "" to ask each time
+    key_file: str = ""
+    saved_passphrase: str = ""
+    notes: str = ""
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+
+    def summary(self):
+        """How it logs in, for lists: "jsmith, saved password"."""
+        how = {AUTH_KEY: "key file", AUTH_AGENT: "SSH agent"}.get(
+            self.auth, "saved password" if self.saved_password else "password asked")
+        return f"{self.username or 'user name asked'}, {how}"
+
+
+def credential_from_dict(data):
+    known = {item.name for item in dataclasses.fields(Credential)}
+    return Credential(**{"name": "Credential", **{key: value for key, value in data.items() if key in known}})
+
+
+CREDENTIAL_PROTOCOLS = {SSH, RDP}  # The ones that log in with a user name and password NOMAD supplies
+
+
+class CredentialBook:
+    """The saved credentials, kept in the sessions file. Only SSH and RDP sessions use them; RDP takes just the user
+    name and password."""
+
+    def __init__(self, store):
+        self.store = store
+        self.items = []
+        self.default_id = ""  # Filled into new sessions
+
+    def get(self, credential_id):
+        return next((item for item in self.items if item.id == credential_id), None) if credential_id else None
+
+    @property
+    def default(self):
+        return self.get(self.default_id)
+
+    def sorted(self, protocol=None):
+        """By name; for RDP only the ones with a password (RDP can't use a key)."""
+        items = [item for item in self.items if protocol != RDP or item.auth == AUTH_PASSWORD]
+        return sorted(items, key=lambda item: item.name.lower())
+
+    def users(self, credential_id):
+        """The saved sessions that log in with a credential."""
+        return [session for session in self.store.source_sessions() if session.credential_id == credential_id]
+
+    def apply(self, session):
+        """Copy a session's credential into it (dropping the link if the credential is gone). Returns the session."""
+        if not session.credential_id:
+            return session
+        credential = self.get(session.credential_id)
+        if credential is None or session.protocol not in CREDENTIAL_PROTOCOLS:
+            session.credential_id = ""
+            return session
+        session.username = credential.username
+        if session.protocol == RDP:
+            session.saved_password = credential.saved_password if credential.auth == AUTH_PASSWORD else ""
+        else:
+            session.auth, session.key_file = credential.auth, credential.key_file
+            session.saved_password, session.saved_passphrase = credential.saved_password, credential.saved_passphrase
+        return session
+
+    def put(self, credential, default=None):
+        """Add or replace a credential and update every session using it. default True/False makes it (or stops it
+        being) the one new sessions start with."""
+        for index, existing in enumerate(self.items):
+            if existing.id == credential.id:
+                self.items[index] = credential
+                break
+        else:
+            self.items.append(credential)
+        if default:
+            self.default_id = credential.id
+        elif default is False and self.default_id == credential.id:
+            self.default_id = ""
+        for session in self.users(credential.id):
+            self.apply(session)
+        self.store.save()
+
+    def delete(self, credential_id):
+        """Remove a credential. Sessions that used it keep its user name and password as their own."""
+        self.items = [item for item in self.items if item.id != credential_id]
+        if self.default_id == credential_id:
+            self.default_id = ""
+        for session in self.store.source_sessions():
+            if session.credential_id == credential_id:
+                session.credential_id = ""
+        self.store.save()
+
+    def assign(self, sessions, credential_id):
+        """Make sessions log in with a credential ("" to stop, keeping its details as their own). Sessions that
+        can't use it (Telnet, serial, raw TCP; RDP with a key credential) are skipped. Returns how many changed."""
+        credential = self.get(credential_id)
+        changed = 0
+        for session in sessions:
+            if session.protocol not in CREDENTIAL_PROTOCOLS:
+                continue
+            if credential is not None and session.protocol == RDP and credential.auth != AUTH_PASSWORD:
+                continue
+            if session.credential_id != credential_id:
+                session.credential_id = credential_id
+                self.apply(session)
+                changed += 1
+        if changed:
+            self.store.save()
+        return changed
+
+
+def validate_credential(credential, book=None):
+    """Returns an error message, or None."""
+    if not credential.name.strip():
+        return "Give the credential a name, such as TACACS or Domain Admin."
+    if book is not None and any(item.name.lower() == credential.name.strip().lower() and item.id != credential.id
+                                for item in book.items):
+        return f"There's already a credential called {credential.name.strip()}."
+    if not credential.username.strip():
+        return "Enter the user name."
+    if credential.auth == AUTH_KEY and not credential.key_file.strip():
+        return "Choose the private key file, or use password authentication."
+    return None
+
+
+@dataclass
 class RecentEntry:
     """A connection made recently. session is a copy without saved secrets; saved_id is the saved session it came
     from (or was later saved as), which is used instead while it still exists."""
@@ -217,6 +348,7 @@ class SessionStore:
         self.recent = []  # RecentEntry, newest first
         self.vault_settings = {}  # Master password salt and check value (no secrets), kept by the Vault
         self.vault = Vault(self.vault_settings, self.save)
+        self.credentials = CredentialBook(self)
         self.listeners = []  # Called after every save, so each page showing the sessions can refresh
         self.load()
 
@@ -224,6 +356,7 @@ class SessionStore:
         self.sessions, self.folders, self.recent = [], set(), []
         self.rdp_folders = set()
         self.vault_settings.clear()
+        self.credentials.items, self.credentials.default_id = [], ""
         if not os.path.exists(self.path):
             return
         try:
@@ -242,6 +375,13 @@ class SessionStore:
                        if isinstance(item, dict)][:RECENT_LIMIT]
         if isinstance(data.get("vault"), dict):
             self.vault_settings.update(data["vault"])
+        self.credentials.items = [credential_from_dict(item) for item in data.get("credentials", [])
+                                  if isinstance(item, dict)]
+        self.credentials.default_id = str(data.get("default_credential") or "")
+        if self.credentials.default is None:
+            self.credentials.default_id = ""
+        for session in self.sessions:
+            self.credentials.apply(session)
 
     def save(self):
         terminal_folders = SessionFolderStore(self, TERMINAL_PROTOCOLS).all_folders()
@@ -251,6 +391,9 @@ class SessionStore:
                 "recent": [entry.to_dict() for entry in self.recent]}
         if self.vault_settings:
             data["vault"] = dict(self.vault_settings)
+        if self.credentials.items:
+            data["credentials"] = [dataclasses.asdict(item) for item in self.credentials.items]
+            data["default_credential"] = self.credentials.default_id
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         temporary = self.path + ".tmp"
         with open(temporary, "w", encoding="utf-8") as file:
@@ -268,10 +411,15 @@ class SessionStore:
                 folders.add("/".join(parts[:depth]))
         return folders
 
+    def source_sessions(self):
+        """Every saved session, whichever page's folder view this is."""
+        return self.sessions
+
     @property
     def credential_sessions(self):
-        """All sessions protected by this vault, across folder namespaces."""
-        return self.sessions
+        """Everything holding secrets protected by this vault: every session across folder namespaces, and the
+        saved credentials."""
+        return [*self.source_sessions(), *self.credentials.items]
 
     def get(self, session_id):
         return next((session for session in self.sessions if session.id == session_id), None)
@@ -279,6 +427,7 @@ class SessionStore:
     def put(self, session):
         """Add a session, or replace the one with the same id."""
         session.folder = normalize_folder(session.folder)
+        self.credentials.apply(session)
         for index, existing in enumerate(self.sessions):
             if existing.id == session.id:
                 self.sessions[index] = session
@@ -401,7 +550,7 @@ class SessionStore:
     def recent_session(self, entry):
         """What to open for a recent entry: the saved session if it still exists, otherwise a fresh copy."""
         saved = self.get(entry.saved_id) if entry.saved_id else None
-        return saved if saved is not None else entry.session.copy()
+        return saved if saved is not None else self.credentials.apply(entry.session.copy())
 
     def link_recent(self, session):
         """A session was just saved: recent entries for the same place (not already tied to a saved session) now
@@ -472,14 +621,18 @@ class SessionFolderStore(SessionStore):
     def recent(self, recent):
         self.source.recent = recent
 
+    def source_sessions(self):
+        return self.source.sessions
+
     @property
     def credential_sessions(self):
-        return self.source.sessions
+        return self.source.credential_sessions
 
     def put(self, session):
         if session.protocol not in self.protocols:
             raise ValueError("This session belongs to a different page.")
         session.folder = normalize_folder(session.folder)
+        self.credentials.apply(session)
         sessions = self.sessions
         for index, existing in enumerate(sessions):
             if existing.id == session.id:

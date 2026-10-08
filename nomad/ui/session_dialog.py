@@ -2,16 +2,15 @@
 from PyQt5.QtWidgets import QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox, \
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox, QStackedWidget, QVBoxLayout, QWidget
 
-from ..terminal.credentials import CredentialError, protect
-from ..terminal.sessions import AUTH_AGENT, AUTH_KEY, AUTH_PASSWORD, BAUD_RATES, DEFAULT_PORTS, ENCODINGS, \
-    FLOW_CONTROLS, LINE_ENDINGS, PARITIES, TERMINAL_PROTOCOLS, RAW, SERIAL, SSH, TELNET, validate_session
+from ..terminal.credentials import CredentialError
+from ..terminal.sessions import AUTH_KEY, AUTH_PASSWORD, BAUD_RATES, DEFAULT_PORTS, ENCODINGS, FLOW_CONTROLS, \
+    LINE_ENDINGS, PARITIES, TERMINAL_PROTOCOLS, RAW, SERIAL, SSH, TELNET, validate_session
 from ..terminal.transports import serial_ports
 from .common import set_hint
-from .vault_dialog import protect_secret
+from .credential_dialogs import AUTH_CHOICES, SAVED_PLACEHOLDER, CredentialPicker, default_credential_id, \
+    secret_to_store
 
-AUTH_CHOICES = [(AUTH_PASSWORD, "Password"), (AUTH_KEY, "Private key file"), (AUTH_AGENT, "Pageant or SSH agent")]
 TERMINAL_TYPES = ["xterm-256color", "xterm", "vt100", "vt220", "linux"]
-SAVED_PLACEHOLDER = "Saved (encrypted). Type to replace it."
 
 
 class SessionDialog(QDialog):
@@ -152,6 +151,12 @@ class SessionDialog(QDialog):
 
         self.ssh_group = QGroupBox("SSH")
         ssh_form = QFormLayout(self.ssh_group)
+        self.credential_picker = None
+        self.own_login = None  # What was typed for this session, kept while a saved credential is chosen
+        if self.store is not None:
+            self.credential_picker = CredentialPicker(self, self.store, SSH,
+                                                      default_credential_id(self.store, self.session))
+            ssh_form.addRow("Credential:", self.credential_picker)
         self.username_input = QLineEdit(self.session.username)
         self.username_input.setPlaceholderText("Asked when connecting if left blank")
         self.auth_combo = QComboBox()
@@ -229,9 +234,13 @@ class SessionDialog(QDialog):
         raw_form.addRow("Local echo:", self.raw_echo_check)
         form.addRow(self.raw_group)
 
+        self.login_widgets = [self.username_input, self.auth_combo, self.password_input, self.save_password_check,
+                              self.key_input, key_browse, self.passphrase_input, self.save_passphrase_check]
         self.auth_combo.currentIndexChanged.connect(self.update_auth_fields)
         key_browse.clicked.connect(self.browse_key)
-        self.update_auth_fields()
+        if self.credential_picker is not None:
+            self.credential_picker.combo.currentIndexChanged.connect(self.update_credential_fields)
+        self.update_credential_fields()
         return page
 
     def build_serial_page(self):
@@ -317,6 +326,41 @@ class SessionDialog(QDialog):
         self.previous_protocol = protocol
         self.adjustSize()
 
+    def update_credential_fields(self, *_):
+        """A saved credential shows its user name and how it logs in, which can't be changed here."""
+        credential = self.credential_picker.credential() if self.credential_picker is not None else None
+        if credential is not None:
+            if self.own_login is None:
+                self.own_login = (self.username_input.text(), self.auth_combo.currentIndex(), self.key_input.text(),
+                                  self.save_password_check.isChecked(), self.save_passphrase_check.isChecked())
+            self.username_input.setText(credential.username)
+            self.auth_combo.setCurrentIndex(max(0, self.auth_combo.findData(credential.auth)))
+            self.key_input.setText(credential.key_file)
+            self.save_password_check.setChecked(bool(credential.saved_password))
+            self.save_passphrase_check.setChecked(bool(credential.saved_passphrase))
+            self.password_input.clear()
+            self.passphrase_input.clear()
+            self.password_input.setPlaceholderText(f"Saved in {credential.name}" if credential.saved_password else
+                                                   f"Asked when connecting ({credential.name} has none saved)")
+            self.passphrase_input.setPlaceholderText(f"Saved in {credential.name}" if credential.saved_passphrase else
+                                                     "Asked when needed")
+        else:
+            if self.own_login is not None:
+                username, auth_index, key_file, save_password, save_passphrase = self.own_login
+                self.own_login = None
+                self.username_input.setText(username)
+                self.auth_combo.setCurrentIndex(auth_index)
+                self.key_input.setText(key_file)
+                self.save_password_check.setChecked(save_password)
+                self.save_passphrase_check.setChecked(save_passphrase)
+            self.password_input.setPlaceholderText(SAVED_PLACEHOLDER if self.session.saved_password else "")
+            self.passphrase_input.setPlaceholderText(
+                SAVED_PLACEHOLDER if self.session.saved_passphrase else
+                "Only if the key is protected; asked when needed")
+        for widget in self.login_widgets:
+            widget.setEnabled(credential is None)
+        self.update_auth_fields()
+
     def update_auth_fields(self):
         auth = self.auth_combo.currentData()
         for widget in self.password_widgets:
@@ -371,7 +415,14 @@ class SessionDialog(QDialog):
                 session.local_echo = self.raw_echo_check.isChecked()
             elif session.protocol == TELNET:
                 session.local_echo = False
-        if session.protocol == SSH:
+        session.credential_id = ""
+        if session.protocol == SSH and self.credential_picker is not None and self.credential_picker.credential():
+            session.credential_id = self.credential_picker.credential_id()
+            session.keepalive = self.keepalive_input.value()
+            session.file_protocol = self.file_protocol_combo.currentData()
+            session.scp_sudo = self.scp_sudo_check.isChecked()
+            self.store.credentials.apply(session)
+        elif session.protocol == SSH:
             session.username = self.username_input.text().strip()
             session.auth = self.auth_combo.currentData()
             session.key_file = self.key_input.text().strip()
@@ -379,10 +430,10 @@ class SessionDialog(QDialog):
             session.file_protocol = self.file_protocol_combo.currentData()
             session.scp_sudo = self.scp_sudo_check.isChecked()
             try:
-                session.saved_password = self.secret_to_store(self.password_input, self.save_password_check,
-                                                              self.session.saved_password)
-                session.saved_passphrase = self.secret_to_store(self.passphrase_input, self.save_passphrase_check,
-                                                                self.session.saved_passphrase)
+                session.saved_password = secret_to_store(self, self.store, self.password_input,
+                                                         self.save_password_check, self.session.saved_password)
+                session.saved_passphrase = secret_to_store(self, self.store, self.passphrase_input,
+                                                           self.save_passphrase_check, self.session.saved_passphrase)
             except CredentialError as error:
                 QMessageBox.critical(self, "Save Password", str(error))
                 return
@@ -393,14 +444,3 @@ class SessionDialog(QDialog):
         self.session = session
         self.accept()
 
-    def secret_to_store(self, field, save_check, existing):
-        """The encrypted value to keep: a newly typed secret, the one already saved, or none."""
-        if not save_check.isChecked():
-            return ""
-        typed = field.text()
-        if not typed:
-            return existing
-        encrypted = protect_secret(self, self.store, typed) if self.store is not None else protect(typed)
-        if encrypted is None:
-            raise CredentialError("The master password is needed to save passwords. Enter it, or untick Save.")
-        return encrypted

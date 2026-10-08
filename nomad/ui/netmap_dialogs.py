@@ -99,11 +99,19 @@ V3_PREFIX = "v3:"  # A per-subnet entry naming an SNMPv3 user instead of a commu
 class CommunitiesDialog(QDialog):
     """The map's SNMP credentials: community strings, SNMPv3 users, and which to try first for some subnets."""
 
-    def __init__(self, communities, overrides, version, timeout, parent=None, v3_users=(), v3_first=True):
+    def __init__(self, communities, overrides, version, timeout, parent=None, v3_users=(), v3_first=True,
+                 tribe_map=None):
+        """tribe_map: the name of the tribe map open (its credentials are shared with the tribe), or None."""
         super().__init__(parent)
-        self.setWindowTitle("SNMP Credentials")
+        self.setWindowTitle("SNMP Credentials" if tribe_map is None else f"SNMP Credentials: Tribe Map {tribe_map}")
         self.resize(680, 640)
         layout = QVBoxLayout(self)
+        if tribe_map is not None:
+            shared = QLabel(f"These are the tribe map {tribe_map}'s credentials, shared with everyone in the tribe: "
+                            "changing them here changes them for everyone who opens or watches it.")
+            shared.setWordWrap(True)
+            shared.setStyleSheet(f"color: {COLORS['accent']};")
+            layout.addWidget(shared)
         layout.addWidget(QLabel("Community strings (v1/v2c) to try on each device, in order, one per line. The first "
                                 "one that answers is used for that device."))
         self.communities_input = QPlainTextEdit("\n".join(communities))
@@ -163,8 +171,10 @@ class CommunitiesDialog(QDialog):
         form.addRow("Community string version:", self.version_combo)
         form.addRow("Timeout:", self.timeout_input)
         layout.addLayout(form)
-        note = QLabel("Saved encrypted for your Windows account. The SNMP Config page builds switch configuration "
-                      "for these.")
+        where = ("Kept encrypted on the tribe server, and on each computer for when the server can't be reached."
+                 if tribe_map is not None else "Saved encrypted for your Windows account.")
+        note = QLabel(f"{where} The SNMP Config page builds switch configuration for these.")
+        note.setWordWrap(True)
         note.setEnabled(False)
         layout.addWidget(note)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)

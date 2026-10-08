@@ -9,8 +9,8 @@ import pytest
 from PyQt5.QtCore import QPoint, Qt, QTimer
 from PyQt5.QtGui import QContextMenuEvent
 from PyQt5.QtTest import QTest
-from PyQt5.QtWidgets import QApplication, QGraphicsScene, QGraphicsView, QLabel, QLineEdit, QMenu, QPlainTextEdit, \
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QApplication, QGraphicsScene, QGraphicsView, QLabel, QLineEdit, QListWidget, QMenu, \
+    QPlainTextEdit, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
 
 from nomad.ui.host_menu import HostActions
 from nomad.ui.ip_menu import IpContextMenus, addresses_at, ip_addresses
@@ -60,6 +60,17 @@ def test_cell_target_and_row_fallback(app, window):
     assert addresses_at(viewport, table.visualItemRect(table.item(0, 2)).center()) == ["10.0.0.2"]
     assert addresses_at(viewport, table.visualItemRect(table.item(0, 0)).center()) == ["10.0.0.1", "10.0.0.2"]
     assert addresses_at(table.horizontalHeader(), QPoint(10, 5)) == []
+
+
+def test_list_widget_without_address_has_no_actions(app, window):
+    # QListWidget's model hides columnCount(); the drawer's tool list must not raise.
+    items = QListWidget(window)
+    window.layout().addWidget(items)
+    items.addItems(["Ping", "Gateway 10.0.0.9"])
+    window.show()
+    app.processEvents()
+    assert addresses_at(items.viewport(), items.visualItemRect(items.item(0)).center()) == []
+    assert addresses_at(items.viewport(), items.visualItemRect(items.item(1)).center()) == ["10.0.0.9"]
 
 
 def test_existing_custom_menu_is_extended_and_original_action_runs(app, window):

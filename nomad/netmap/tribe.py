@@ -5,6 +5,11 @@ latest of each item). A map is read as base with pending on top, so it opens and
 pending changes, then fetches everyone else's, which land in base under any pending change to the same item (the
 pending one is sent afterwards, so it wins: the last change made to an item is the one kept).
 
+Each map's SNMP credentials (its secrets) are kept on the server too, encrypted, so everyone in the tribe crawls and
+watches it with the same ones. The copy keeps them (encrypted for this Windows account, or this computer in the
+service) for offline use, fetches them again whenever the server says the map changed, and holds a change made
+offline until it can be sent, like the map's own changes.
+
 Thread-safe: the map page syncs on a worker thread while it reads and saves on the UI thread, and the Map Watcher
 service uses it from its own.
 """
@@ -28,10 +33,15 @@ CREATE TABLE IF NOT EXISTS base (map_id INTEGER NOT NULL, section TEXT NOT NULL,
                                  PRIMARY KEY (map_id, section, key));
 CREATE TABLE IF NOT EXISTS pending (map_id INTEGER NOT NULL, section TEXT NOT NULL, key TEXT NOT NULL, data TEXT,
                                     seq INTEGER NOT NULL, PRIMARY KEY (map_id, section, key));
-CREATE TABLE IF NOT EXISTS secrets (map_id INTEGER PRIMARY KEY, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS secrets (map_id INTEGER PRIMARY KEY, data TEXT NOT NULL, pending INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS stale_secrets (map_id INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS collapsed (map_id INTEGER PRIMARY KEY, groups TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS meta (name TEXT PRIMARY KEY, value TEXT);
 """
+
+
+SECRETS = ("secrets", "")  # Among the items sync() says changed on a map: its credentials did
+TABLES = ("maps", "base", "pending", "secrets", "stale_secrets", "collapsed")  # Emptied when the copy starts again
 
 
 def copy_path():
@@ -52,12 +62,22 @@ class TribeMaps:
         self.unprotect = unprotect or (lambda text: text)
         self.leases = {}  # Map id -> lease, from the last sync
         self.online, self.last_error = False, ""
+        self._upgrade()
         if self._meta("server_id") not in ("", server_id):  # Another server's maps: start again
             with self._transaction():
-                for table in ("maps", "base", "pending", "secrets", "collapsed"):
+                for table in TABLES:
                     self.db.execute(f"DELETE FROM {table}")
                 self._set_meta("revision", 0)
         self._set_meta("server_id", server_id)
+
+    def _upgrade(self):
+        """Bring a copy made by an older NOMAD up to date."""
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(secrets)")}
+        if "pending" not in columns:
+            with self._transaction():
+                self.db.execute("ALTER TABLE secrets ADD COLUMN pending INTEGER NOT NULL DEFAULT 0")
+                # Older copies never fetched credentials again once they had some: fetch them all on the next sync
+                self.db.execute("INSERT OR IGNORE INTO stale_secrets (map_id) SELECT id FROM maps WHERE deleted = 0")
 
     def close(self):
         with self.lock:
@@ -66,7 +86,7 @@ class TribeMaps:
     def clear(self):
         """Forget the copy (leaving the tribe): maps, changes not sent and community strings."""
         with self._transaction():
-            for table in ("maps", "base", "pending", "secrets", "collapsed"):
+            for table in TABLES:
                 self.db.execute(f"DELETE FROM {table}")
             self.db.execute("INSERT OR REPLACE INTO meta (name, value) VALUES ('revision', '0')")
 
@@ -166,10 +186,12 @@ class TribeMaps:
                         (int(map_id), json.dumps(groups)))
 
     def pending_count(self, map_id=None):
+        """How many changes are waiting to be sent (a change to a map's credentials counts as one)."""
+        where, values = ("", ()) if map_id is None else (" AND map_id = ?", (int(map_id),))
         with self.lock:
-            if map_id is None:
-                return self.db.execute("SELECT COUNT(*) FROM pending").fetchone()[0]
-            return self.db.execute("SELECT COUNT(*) FROM pending WHERE map_id = ?", (int(map_id),)).fetchone()[0]
+            items = self.db.execute("SELECT COUNT(*) FROM pending WHERE 1" + where, values).fetchone()[0]
+            secrets = self.db.execute("SELECT COUNT(*) FROM secrets WHERE pending = 1" + where, values).fetchone()[0]
+        return items + secrets
 
     # ----------------------------------------------------------------- Changing
 
@@ -232,46 +254,109 @@ class TribeMaps:
 
     def _forget(self, map_id):
         with self._transaction():
-            for table in ("base", "pending", "secrets", "collapsed"):
+            for table in ("base", "pending", "secrets", "stale_secrets", "collapsed"):
                 self.db.execute(f"DELETE FROM {table} WHERE map_id = ?", (int(map_id),))
             self.db.execute("UPDATE maps SET deleted = 1 WHERE id = ?", (int(map_id),))
 
-    # ----------------------------------------------------------------- Community strings
+    # ----------------------------------------------------------------- Community strings (SNMP credentials)
 
-    def _cache_secrets(self, map_id, secrets):
+    def _cache_secrets(self, map_id, secrets, pending=False):
+        """Keep a map's credentials here. pending: changed here, to send. Returns whether they were kept."""
         try:
             data = self.protect(json.dumps(secrets or {}))
         except Exception as error:  # DPAPI unavailable: they'll be fetched again next time
             log.warning("Couldn't keep a map's community strings: %s", error)
-            return
+            return False
         with self._transaction():
-            self.db.execute("INSERT OR REPLACE INTO secrets (map_id, data) VALUES (?, ?)", (int(map_id), data))
+            self.db.execute("INSERT OR REPLACE INTO secrets (map_id, data, pending) VALUES (?, ?, ?)",
+                            (int(map_id), data, int(pending)))
+        return True
 
-    def secrets(self, map_id):
-        """The map's community strings as last fetched ({} if never)."""
-        with self.lock:
-            row = self.db.execute("SELECT data FROM secrets WHERE map_id = ?", (int(map_id),)).fetchone()
-        if row is None:
-            return {}
+    def _decrypt(self, data):
         try:
-            return json.loads(self.unprotect(row["data"]))
+            return json.loads(self.unprotect(data))
         except Exception as error:
             log.warning("Couldn't read a map's community strings: %s", error)
             return {}
 
+    def secrets(self, map_id):
+        """The map's community strings and SNMPv3 users as last fetched, or as changed here ({} if never)."""
+        with self.lock:
+            row = self.db.execute("SELECT data FROM secrets WHERE map_id = ?", (int(map_id),)).fetchone()
+        return {} if row is None else self._decrypt(row["data"])
+
     def fetch_secrets(self, map_id):
+        """Fetch a map's credentials from the server (network) and keep them here. If they were changed here and
+        not sent yet, those are kept and returned instead: they're sent next, so they win."""
         secrets = self.client.map_secrets(map_id)
+        with self._transaction():
+            self.db.execute("DELETE FROM stale_secrets WHERE map_id = ?", (int(map_id),))
+            row = self.db.execute("SELECT data FROM secrets WHERE map_id = ? AND pending = 1",
+                                  (int(map_id),)).fetchone()
+        if row is not None:
+            return self._decrypt(row["data"])
         self._cache_secrets(map_id, secrets)
         return secrets
 
     def set_secrets(self, map_id, secrets):
-        self.client.map_request("secrets", map_id=int(map_id), secrets=secrets)
-        self._cache_secrets(map_id, secrets)
+        """Change a map's credentials for everyone in the tribe. They're kept here at once and sent now if the
+        server can be reached, else with the next sync. Returns whether they reached the server."""
+        if not self._cache_secrets(map_id, secrets, pending=True):
+            self.client.map_request("secrets", map_id=int(map_id), secrets=secrets)  # Can't be kept: send or fail
+            return True
+        try:
+            self._send_secrets(map_id)
+        except Exception as error:
+            log.info("Couldn't send a tribe map's credentials yet: %s", error)
+            return False
+        return True
+
+    def _send_secrets(self, map_id):
+        """Send a map's credentials changed here (network)."""
+        with self.lock:
+            row = self.db.execute("SELECT data FROM secrets WHERE map_id = ? AND pending = 1",
+                                  (int(map_id),)).fetchone()
+        if row is None:
+            return
+        self.client.map_request("secrets", map_id=int(map_id), secrets=self._decrypt(row["data"]))
+        with self._transaction():  # Unless they were changed again meanwhile
+            self.db.execute("UPDATE secrets SET pending = 0 WHERE map_id = ? AND data = ?", (int(map_id), row["data"]))
+
+    def refresh_secrets(self):
+        """Fetch the credentials of the maps the server changed since theirs were last fetched (network: on a
+        worker thread). Returns the ids of the maps whose credentials are now different here."""
+        with self.lock:
+            stale = [row["map_id"] for row in self.db.execute("SELECT map_id FROM stale_secrets")]
+        changed = []
+        for map_id in stale:
+            before = self.secrets(map_id)
+            try:
+                after = self.fetch_secrets(map_id)
+            except Exception as error:
+                if "isn't on the server any more" in str(error):
+                    with self._transaction():
+                        self.db.execute("DELETE FROM stale_secrets WHERE map_id = ?", (int(map_id),))
+                else:  # Tried again on the next sync
+                    log.info("Couldn't fetch the credentials of tribe map %s: %s", map_id, error)
+                continue
+            if after != before:
+                changed.append(map_id)
+        return changed
 
     # ----------------------------------------------------------------- Syncing
 
     def send_pending(self):
         """Send the changes made here (network: call on a worker thread). Returns how many were sent."""
+        with self.lock:
+            changed_secrets = [row["map_id"] for row in self.db.execute("SELECT map_id FROM secrets WHERE pending = 1")]
+        for map_id in changed_secrets:
+            try:
+                self._send_secrets(map_id)
+            except Exception as error:
+                if "isn't on the server any more" in str(error):
+                    self._forget(map_id)
+                    continue
+                raise
         with self.lock:
             outgoing = {}
             for row in self.db.execute("SELECT * FROM pending ORDER BY seq"):
@@ -311,8 +396,10 @@ class TribeMaps:
                 self.db.execute("INSERT OR REPLACE INTO maps (id, name, created_by, created, deleted, revision) "
                                 "VALUES (:id, :name, :created_by, :created, :deleted, :revision)", item)
                 if item["deleted"]:
-                    for table in ("base", "pending", "secrets"):
+                    for table in ("base", "pending", "secrets", "stale_secrets"):
                         self.db.execute(f"DELETE FROM {table} WHERE map_id = ?", (item["id"],))
+                else:  # Shared, renamed or its credentials changed: fetch them again (refresh_secrets)
+                    self.db.execute("INSERT OR IGNORE INTO stale_secrets (map_id) VALUES (?)", (item["id"],))
                 touched.setdefault(item["id"], set())
             for item in payload.get("items", []):
                 key = (item["map_id"], item["section"], item["key"])
@@ -328,7 +415,8 @@ class TribeMaps:
 
     def sync(self):
         """Send what's pending, then fetch everyone's changes (network: call on a worker thread). Returns
-        {map id: items changed} as apply_changes does."""
+        {map id: items changed} as apply_changes does, with SECRETS among a map's items when its credentials
+        changed."""
         try:
             self.send_pending()
             payload, revision = self.client.map_changes(self.revision)
@@ -336,7 +424,10 @@ class TribeMaps:
             self.online, self.last_error = False, str(error)
             raise
         self.online, self.last_error = True, ""
-        return self.apply_changes(payload, revision)
+        touched = self.apply_changes(payload, revision)
+        for map_id in self.refresh_secrets():
+            touched.setdefault(map_id, set()).add(SECRETS)
+        return touched
 
     # ----------------------------------------------------------------- Watching
 

@@ -458,6 +458,82 @@ def test_tribe_map_offline_changes_kept_until_sent(server, tmp_path):
 
 
 
+class FlakyClient:
+    """A TeamClient that can be cut off from the server (down = True)."""
+
+    def __init__(self, client):
+        self.client, self.down = client, False
+
+    def __getattr__(self, name):
+        attribute = getattr(self.client, name)
+        if self.down and callable(attribute):
+            def unreachable(*args, **kwargs):
+                raise ServerUnreachable("The tribe server can't be reached.")
+            return unreachable
+        return attribute
+
+
+def test_tribe_map_credentials_changed_reach_everyone(server, tmp_path):
+    from nomad.netmap.tribe import SECRETS
+    alice, bob = tribe_maps(server, tmp_path, "alice"), tribe_maps(server, tmp_path, "bob")
+    map_id = alice.create("HQ", small_map(), {}, {"communities": ["public"]})
+    bob.sync()
+    assert bob.secrets(map_id) == {"communities": ["public"]}  # Fetched with the map, before it's opened
+
+    assert alice.set_secrets(map_id, {"communities": ["s3cret"], "v3_users": [{"user": "nomad"}]})
+    touched = bob.sync()
+    assert SECRETS in touched[map_id]
+    assert bob.secrets(map_id) == {"communities": ["s3cret"], "v3_users": [{"user": "nomad"}]}
+    assert SECRETS not in alice.sync().get(map_id, set())  # Her own change coming back isn't news
+    assert bob.sync() == {}  # Only fetched again when they change
+
+    alice.rename(map_id, "Head Office")  # Fetched again, but the same
+    assert SECRETS not in bob.sync()[map_id]
+
+
+def test_tribe_map_credentials_changed_offline_sent_later(server, tmp_path):
+    from nomad.netmap.tribe import SECRETS, TribeMaps
+    key = key_for(server)
+    flaky = FlakyClient(TeamClient(key, user="alice", computer="ALICE"))
+    alice = TribeMaps(key.server_id, flaky, tmp_path / "alice-maps.db")
+    bob = tribe_maps(server, tmp_path, "bob")
+    map_id = alice.create("HQ", small_map(), {}, {"communities": ["public"]})
+    bob.sync()
+
+    flaky.down = True
+    assert not alice.set_secrets(map_id, {"communities": ["offline"]})
+    assert alice.secrets(map_id) == {"communities": ["offline"]} and alice.pending_count(map_id) == 1
+    assert bob.set_secrets(map_id, {"communities": ["bobs"]})  # Someone else changes them meanwhile
+
+    flaky.down = False
+    touched = alice.sync()  # Hers are sent, then fetched back: the last change made wins
+    assert alice.pending_count() == 0 and SECRETS not in touched.get(map_id, set())
+    assert alice.secrets(map_id) == {"communities": ["offline"]}
+    assert SECRETS in bob.sync()[map_id] and bob.secrets(map_id) == {"communities": ["offline"]}
+
+
+def test_tribe_copy_from_older_nomad_fetches_credentials_again(server, tmp_path):
+    import sqlite3
+    from nomad.netmap.tribe import SECRETS, TribeMaps
+    alice, key = tribe_maps(server, tmp_path, "alice"), key_for(server)
+    map_id = alice.create("HQ", small_map(), {}, {"communities": ["new"]})
+    path = tmp_path / "old-maps.db"
+    old = sqlite3.connect(path)  # As 1.21 left it: credentials fetched once, never again
+    old.executescript("CREATE TABLE maps (id INTEGER PRIMARY KEY, name TEXT NOT NULL, created_by TEXT, created TEXT, "
+                      "deleted INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0);"
+                      "CREATE TABLE secrets (map_id INTEGER PRIMARY KEY, data TEXT NOT NULL);"
+                      "CREATE TABLE meta (name TEXT PRIMARY KEY, value TEXT);")
+    old.execute("INSERT INTO maps (id, name) VALUES (?, 'HQ')", (map_id,))
+    old.execute("INSERT INTO secrets VALUES (?, ?)", (map_id, json.dumps({"communities": ["stale"]})))
+    old.execute("INSERT INTO meta VALUES ('server_id', ?), ('revision', '999999')", (key.server_id,))
+    old.commit()
+    old.close()
+    bob = TribeMaps(key.server_id, TeamClient(key, user="bob"), path)
+    assert bob.secrets(map_id) == {"communities": ["stale"]}
+    assert SECRETS in bob.sync()[map_id]
+    assert bob.secrets(map_id) == {"communities": ["new"]}
+
+
 def test_tribe_map_groups_collapsed_by_each_person(server, tmp_path):
     alice, bob = tribe_maps(server, tmp_path, "alice"), tribe_maps(server, tmp_path, "bob")
     network_map = small_map()

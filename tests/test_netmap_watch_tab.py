@@ -171,6 +171,13 @@ def test_tribe_map_shared_between_two_pages(app, server, tmp_path, monkeypatch):
         assert bob.communities == ["public", "s3cret"]  # The map's community strings came with it
         assert bob.v3_users == alice.v3_users  # And its SNMPv3 users
 
+        # Alice changes the credentials: Bob's page uses them without opening the map again
+        alice.communities = ["n3w"]
+        alice.credentials_changed()
+        assert "Shared the SNMP credentials" in alice.status_label.text()
+        assert wait_for(app, lambda: bob.communities == ["n3w"], 15)
+        assert "changed this map's SNMP credentials" in bob.status_label.text()
+
         # Bob moves a device; Alice sees it
         bob.view.items_by_key["core"].setPos(1234, 567)
         bob.save_positions()

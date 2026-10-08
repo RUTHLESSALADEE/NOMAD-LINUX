@@ -330,6 +330,7 @@ class MainWindow(QMainWindow):
         tools_menu.addSeparator()
         tools_menu.addAction("&Flush DNS Cache", self.flush_dns)
         tools_menu.addAction("Saved Password &Protection...", lambda: self.terminal_tab.manager.show_protection())
+        tools_menu.addAction("Saved &Credentials...", lambda: self.terminal_tab.manager.show_credentials())
         tools_menu.addAction("&Tribe Management...", self.show_tribe_management)
         tools_menu.addAction("&Map Watcher Service...", self.show_map_watcher)
         tools_menu.addSeparator()

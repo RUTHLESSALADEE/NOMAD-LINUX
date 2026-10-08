@@ -17,7 +17,7 @@ def password_field(placeholder=""):
 
 
 def vault_sessions(store):
-    """Folder views share one vault; password changes must include every namespace."""
+    """Folder views share one vault; password changes must include every namespace (and the saved credentials)."""
     return getattr(store, "credential_sessions", store.sessions)
 
 
@@ -211,8 +211,9 @@ class SecurityDialog(QDialog):
         self.refresh()
 
     def saved_count(self):
-        return sum(1 for session in vault_sessions(self.store) for field in (session.saved_password,
-                                                                      session.saved_passphrase) if field)
+        """Saved secrets, counting a shared credential's once (not again for each session using it)."""
+        return sum(1 for session in vault_sessions(self.store) if not getattr(session, "credential_id", "")
+                   for field in (session.saved_password, session.saved_passphrase) if field)
 
     def refresh(self):
         vault = self.store.vault
