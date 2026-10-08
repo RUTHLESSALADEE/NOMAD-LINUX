@@ -84,6 +84,7 @@ class TerminalView(QWidget):
         self.zoom = 0  # Points added to the text size (Ctrl+wheel)
         self.selection = None  # (anchor, end) Positions
         self.selecting = False
+        self.double_click = None  # (time, QPoint) of the last double-click, so a click straight after it takes the line
         self.highlight = None  # (Position, length) of a find match
         self.highlighter = None  # Keyword highlighting (terminal.highlight.Highlighter), or None when it's off
         self.hotkey = None  # Called with 0-8 for Ctrl+1 to Ctrl+9 (command buttons); True if it used the key
@@ -335,6 +336,9 @@ class TerminalView(QWidget):
     def mousePressEvent(self, event):
         self.setFocus()
         if event.button() == Qt.LeftButton:
+            if self.is_triple_click(event.pos()):
+                self.select_at(self.model.line_at, event.pos())  # As in PuTTY: double-click a word, triple-click a line
+                return
             position = self.position_at(event.pos())
             self.selection = (position, position)
             self.selecting = True
@@ -366,10 +370,24 @@ class TerminalView(QWidget):
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self.selection = self.model.word_at(self.position_at(event.pos()))
-            self.selecting = False
-            self.copy_selection()
-            self.update()
+            self.select_at(self.model.word_at, event.pos())
+            self.double_click = (time.monotonic(), event.pos())
+
+    def is_triple_click(self, point):
+        """Whether a press is the third click: straight after a double-click, in the same place."""
+        if self.double_click is None:
+            return False
+        clicked, where = self.double_click
+        self.double_click = None
+        return time.monotonic() - clicked <= QApplication.doubleClickInterval() / 1000 and \
+            (point - where).manhattanLength() <= QApplication.startDragDistance()
+
+    def select_at(self, span, point):
+        """Select and copy the span (a word or line) under a point."""
+        self.selection = span(self.position_at(point))
+        self.selecting = False
+        self.copy_selection()
+        self.update()
 
     def wheelEvent(self, event):
         steps = event.angleDelta().y() / 120

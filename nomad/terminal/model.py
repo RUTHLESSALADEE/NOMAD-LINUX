@@ -237,6 +237,13 @@ class TerminalModel:
             end += 1
         return Position(position.line, start), Position(position.line, end)
 
+    def line_at(self, position):
+        """The start and end of the text on the line under a position, for triple-click selection."""
+        text = self.line_text(position.line)
+        if not text:
+            return position, position
+        return Position(position.line, 0), Position(position.line, len(text) - 1)
+
     def find(self, query, before=None):
         """The last match of query (ignoring case) that starts before `before` (or anywhere), or None."""
         query = query.lower()

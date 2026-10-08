@@ -178,6 +178,7 @@ The **SNMP Config** page (under SNMP) builds the Cisco IOS / IOS-XE configuratio
 - **Recent** at the top of the list keeps your last 10 connections.
 - **Layout** tiles sessions side by side, stacked, or in a 2 × 2 or 3 × 2 grid. Drag tabs between panes and windows.
 - Pop any tab out into its own window (right-click the tab).
+- **Copy and paste** as in PuTTY: dragging over text copies it, double-click copies a word, triple-click (or a click straight after a double-click) copies the whole line, and right-click pastes.
 
 **Working with many devices**
 

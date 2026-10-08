@@ -43,11 +43,14 @@ def test_modes_and_split_characters():
     assert model.line(0)[0].data == "é"
 
 
-def test_selection_words_and_find():
+def test_selection_words_lines_and_find():
     model = TerminalModel(30, 3)
     model.feed(b"interface Gi1/0/24\r\n description uplink\r\nend")
     assert model.text_between(Position(0, 10), Position(1, 11)) == "Gi1/0/24\n description"
     assert model.word_at(Position(0, 12)) == (Position(0, 10), Position(0, 17))
+    assert model.line_at(Position(0, 12)) == (Position(0, 0), Position(0, 17))
+    assert model.text_between(*model.line_at(Position(1, 25))) == " description uplink"
+    assert model.line_at(Position(2, 10)) == (Position(2, 0), Position(2, 2))  # Past the text still takes the line
     assert model.find("UPLINK") == Position(1, 13)
     assert model.find("i", before=Position(1, 13)) == Position(1, 9)
     assert model.find("interface", before=Position(0, 0)) is None and model.find("missing") is None
