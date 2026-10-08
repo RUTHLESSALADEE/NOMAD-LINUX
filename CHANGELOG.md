@@ -6,6 +6,25 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.24.0] - 2026-10-08
+
+### Added
+
+- **Carry VLAN** (Network Map): get a VLAN to a switch over the map's links on Cisco IOS / IOS-XE switches, with the configuration for each switch on the way. Right-click a switch or a port's hosts > **Carry a VLAN Here...**, two selected devices > **Carry a VLAN Between These...**, or a VLAN on the VLANs tab > **Carry It to a Switch...**.
+  - **The way:** from the nearest switch already carrying the VLAN (its gateway's part first), or from A, over the links needing the fewest changes. Or set the route by hand, switch by switch: **Add Switch...**, **Pick on Map**, the link to use where there are several, **Fill In Between** for gaps, and **Edit This Route** to start from the way NOMAD chose. Routers and firewalls are only ever where it starts; access ports in another VLAN are never crossed or turned into trunks.
+  - **Plan** reads the switches involved again first, then lists each switch's changes: the VLAN created where it's missing (on a VTP client, on its domain's VTP server, sent first), `switchport trunk allowed vlan add` on trunk ends that don't allow it (never without `add`), on port-channels rather than their members, and B's edge ports you tick. Each switch's undo is made too.
+  - **Spanning tree:** the mode is read on every crawl and Read VLANs Again, and for the VLAN being carried, which ports forward or block (Rapid-PVST+ and MST port roles, PVST+ port states). Redundant links that would close a loop are listed with what spanning tree does there and changed only when ticked, last. On MST, ports blocking the VLAN's instance are avoided, or warned about on a route set by hand.
+  - **Gateway check:** says whether B will reach the VLAN's gateway on the map (never sets one up).
+  - **Send** each switch's step (or its undo) to a terminal session, or open an SSH session to the switch (its saved session if there is one) and send once it's at the enable prompt; **Copy**, **Export All...**, and `write memory` only if ticked. **Verify** reads the switches again and marks each done, or says what's still missing.
+
+### Changed
+
+- **Network Map:** crawls and Read VLANs Again now also note each switch's port-channel members and spanning tree mode (port-channels are read even when hosts aren't collected).
+
+### Fixed
+
+- **Network Map:** switches that don't name their model (such as IOL and vIOS lab images) are no longer taken for routers, or routers for switches, depending on which neighbor's CDP the crawl used ("Router Switch" for both). The image names say which is which, and a Cisco device whose own tables have access or trunk ports is a switch unless its model is a router's. **Read VLANs Again** corrects maps made before (a kind set by hand is kept).
+
 ## [1.23.0] - 2026-10-08
 
 ### Added

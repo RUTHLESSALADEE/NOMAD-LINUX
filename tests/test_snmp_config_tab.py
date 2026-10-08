@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import QApplication, QMessageBox, QWidget  # noqa: E402
 
 from nomad.snmpv3 import V3User  # noqa: E402
 from nomad.terminal.sessions import SSH, TELNET, Session  # noqa: E402
-from nomad.ui import snmp_config_tab  # noqa: E402
+from nomad.ui import session_send, snmp_config_tab  # noqa: E402
 from nomad.ui.snmp_config_tab import SnmpConfigTab  # noqa: E402
 from nomad.ui.terminal_view import CONNECTED, DISCONNECTED  # noqa: E402
 
@@ -228,7 +228,7 @@ def test_send_to_a_session_at_the_enable_prompt(page, monkeypatch):
     idf = hq.actions()[0].menu()
     assert hq.actions()[0].text() == "IDF 1" and [action.text() for action in idf.actions()] == ["core"]
     assert page.send_to(view)
-    assert view.sent == [(page.text(), snmp_config_tab.SEND_DELAY)]
+    assert view.sent == [(page.text(), session_send.SEND_DELAY)]
     assert page.window.shown == ["terminal"]
 
 
@@ -246,7 +246,7 @@ def test_a_session_not_at_enable_is_warned_about(page, monkeypatch):
 
 
 def test_a_session_opened_to_send_to_waits_for_its_prompt(page, monkeypatch, app):
-    monkeypatch.setattr(snmp_config_tab.QInputDialog, "getText", lambda *args, **kwargs: ("10.0.0.12", True))
+    monkeypatch.setattr(session_send.QInputDialog, "getText", lambda *args, **kwargs: ("10.0.0.12", True))
     monkeypatch.setattr(QMessageBox, "exec_", lambda self: QMessageBox.Yes)
     page.open_new_session()
     terminal = page.window.terminal_tab
@@ -260,7 +260,7 @@ def test_a_session_opened_to_send_to_waits_for_its_prompt(page, monkeypatch, app
 
 
 def test_a_session_at_user_exec_is_not_sent_to(page, monkeypatch):
-    monkeypatch.setattr(snmp_config_tab.QInputDialog, "getText", lambda *args, **kwargs: ("10.0.0.13", True))
+    monkeypatch.setattr(session_send.QInputDialog, "getText", lambda *args, **kwargs: ("10.0.0.13", True))
     page.open_new_session()
     view = page.window.terminal_tab.views[-1]
     view.model.prompt = "acc3>"
@@ -269,7 +269,7 @@ def test_a_session_at_user_exec_is_not_sent_to(page, monkeypatch):
 
 
 def test_a_session_that_never_connects_gives_up(page, monkeypatch):
-    monkeypatch.setattr(snmp_config_tab.QInputDialog, "getText", lambda *args, **kwargs: ("10.0.0.14", True))
+    monkeypatch.setattr(session_send.QInputDialog, "getText", lambda *args, **kwargs: ("10.0.0.14", True))
     page.open_new_session()
     view = page.window.terminal_tab.views[-1]
     view.state = DISCONNECTED

@@ -7,22 +7,20 @@ import secrets
 
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, \
-    QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSplitter, \
+    QLabel, QLineEdit, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSplitter, \
     QToolButton, QVBoxLayout, QWidget
 
 from ..snmpv3 import AUTH_NAMES, PRIV_NAMES, V3User, is_v3
 from ..switchconfig import SYSLOG_LEVELS, TRAP_CATEGORIES, ConfigOptions, build, problems, undo
 from ..terminal.credentials import CredentialError, protect, unprotect
-from ..terminal.sessions import SSH
 from .common import set_hint
+from .session_send import SessionSender
 from .theme import accent_button, monospace_font
 
 log = logging.getLogger(__name__)
 
 FORM_ROOM = 1.2  # The form starts this much wider than it needs at least, so nothing in it is cramped
 MIN_PREVIEW = 380  # The preview keeps at least this many pixels when the form gets its room
-SEND_DELAY = 150  # ms between lines sent to a switch: older Catalysts drop characters from a fast paste
-PROMPT_WAIT = 20000  # ms to wait for a session just opened to show its prompt
 SECRET_SETTINGS = "snmpconfig/secrets"
 
 
@@ -30,19 +28,13 @@ def split_items(text):
     return [item for item in text.replace(",", " ").split() if item]
 
 
-def prompt_of(view):
-    """The text on the session's cursor line: its prompt, when it's waiting for a command."""
-    model = view.model
-    return model.line_text(model.cursor_position().line).strip()
-
-
 class SnmpConfigTab(QWidget):
     def __init__(self, window):
         super().__init__(window)
         self.window = window
         self.lines = []
-        self.waiting = None  # (view, QTimer) for a session opened to send to, until it shows its prompt
         self.init_ui()
+        self.session_sender = SessionSender(self, window, self.status_label)
         self.update_preview()
 
     # ----------------------------------------------------------------- Layout
@@ -512,137 +504,22 @@ class SnmpConfigTab(QWidget):
             return
         set_hint(self.status_label, f"Saved to {path}. It has the passwords in it: keep it safe.", "success")
 
-    def terminal(self):
-        return getattr(self.window, "terminal_tab", None)
-
-    def connected_sessions(self):
-        from .terminal_view import CONNECTED
-        terminal = self.terminal()
-        if terminal is None:
-            return []
-        return [view for view in terminal.all_views() if view.state == CONNECTED and hasattr(view, "send_block")]
-
     def fill_send_menu(self):
-        self.send_menu.clear()
-        for view in self.connected_sessions():
-            prompt = prompt_of(view)
-            label = f"{view.title}" + (f"  ({prompt})" if prompt else "")
-            self.send_menu.addAction(label, lambda view=view: self.send_to(view))
-        if self.send_menu.isEmpty():
-            self.send_menu.addAction("No terminal sessions connected").setEnabled(False)
-        self.send_menu.addSeparator()
-        self.fill_open_menu(self.send_menu.addMenu("Open SSH Session"))
-
-    def fill_open_menu(self, menu):
-        """New Session, then the saved SSH sessions, in their folders as on the Terminal page."""
-        menu.addAction("New Session...", self.open_new_session)
-        terminal = self.terminal()
-        store = getattr(terminal, "store", None)
-        sessions = sorted((session for session in (store.sessions if store is not None else [])
-                           if session.protocol == SSH), key=lambda session: session.name.lower())
-        menu.addSeparator()
-        if not sessions:
-            menu.addAction("No saved SSH sessions").setEnabled(False)
-            return
-        submenus = {"": menu}
-
-        def folder_menu(path):
-            if path not in submenus:
-                parent, _, name = path.rpartition("/")
-                submenus[path] = folder_menu(parent).addMenu(name)
-            return submenus[path]
-        for path in sorted({session.folder for session in sessions if session.folder}, key=str.lower):
-            folder_menu(path)
-        for session in sessions:
-            action = folder_menu(session.folder).addAction(session.name,
-                                                           lambda session=session: self.open_saved(session))
-            action.setToolTip(session.target())
+        self.session_sender.fill_menu(self.send_menu, self.text)
 
     def send_to(self, view):
         """Type the lines into view's session, after asking. Returns whether they're being sent."""
-        if not self.lines:
-            return False
-        prompt = prompt_of(view)
-        text = (f"Type these {len(self.lines)} lines into {view.title}, one every {SEND_DELAY} ms?\n\n"
-                f"Its prompt is now: {prompt or '(nothing yet)'}")
-        icon = QMessageBox.Question
-        if not prompt.endswith("#"):
-            text += ("\n\nThat doesn't look like the enable (#) prompt, so the configuration commands would be "
-                     "refused. Type enable (and its password) in the session first.")
-            icon = QMessageBox.Warning
-        box = QMessageBox(icon, "Send to Session", text, QMessageBox.Yes | QMessageBox.No, self)
-        box.setDefaultButton(QMessageBox.Yes if prompt.endswith("#") else QMessageBox.No)
-        if box.exec_() != QMessageBox.Yes:
-            return False
-        if not view.send_block(self.text(), min_delay=SEND_DELAY):
-            set_hint(self.status_label, f"{view.title} isn't connected any more.", "error")
-            return False
-        set_hint(self.status_label, f"Sending {len(self.lines)} lines to {view.title}. Watch its answers on the "
-                                    "Terminal page.", "success")
-        self.show_session(view)
-        return True
-
-    def show_session(self, view):
-        terminal = self.terminal()
-
-        def reveal():
-            for tabs in terminal.all_tabs():
-                if tabs.pane_of(view) is not None:
-                    tabs.show_view(view)
-        if hasattr(self.window, "show_terminal"):
-            self.window.show_terminal(reveal)
+        return bool(self.lines) and self.session_sender.send_to(view, self.text())
 
     def open_new_session(self):
-        """An SSH session to a switch that isn't saved, then send to it once it shows its prompt."""
-        terminal = self.terminal()
-        if terminal is None:
-            return
-        address, ok = QInputDialog.getText(self, "New SSH Session", "Switch to connect to (such as admin@10.0.0.1 "
-                                           "or admin@switch:2222):")
-        address = address.strip()
-        if not ok or not address:
-            return
-        view = terminal.open_address(address, SSH, use_saved=False)
-        if view is not None:
-            self.wait_for_prompt(view)
+        self.session_sender.open_new_session(self.text)
 
     def open_saved(self, session):
-        """A saved SSH session (its user name and saved password), then send to it once it shows its prompt."""
-        terminal = self.terminal()
-        if terminal is not None:
-            self.wait_for_prompt(terminal.open_session(session))
+        self.session_sender.open_saved(session, self.text)
 
-    def wait_for_prompt(self, view):
-        """Once the session just opened shows a prompt, offer to send to it."""
-        from .terminal_view import CONNECTED, DISCONNECTED
-        self.stop_waiting()
-        timer = QTimer(self)
-        timer.setInterval(500)
-        waited = [0]
-
-        def check():
-            waited[0] += timer.interval()
-            prompt = prompt_of(view) if view.state == CONNECTED else ""
-            if view.state == DISCONNECTED or waited[0] > PROMPT_WAIT:
-                self.stop_waiting()
-                set_hint(self.status_label, f"{view.title} didn't connect, so nothing was sent.", "warning")
-            elif prompt.endswith("#"):
-                self.stop_waiting()
-                QTimer.singleShot(0, lambda: self.send_to(view))
-            elif prompt.endswith(">"):
-                self.stop_waiting()
-                set_hint(self.status_label, f"{view.title} is at the > prompt: type enable (and its password) "
-                                            "there, then Send to Session again.", "warning")
-        timer.timeout.connect(check)
-        timer.start()
-        self.waiting = (view, timer)
-        set_hint(self.status_label, f"Connecting to {view.title}...", "info")
-
-    def stop_waiting(self):
-        if self.waiting is not None:
-            self.waiting[1].stop()
-            self.waiting[1].deleteLater()
-            self.waiting = None
+    @property
+    def waiting(self):
+        return self.session_sender.waiting
 
     # ----------------------------------------------------------------- Page interface
 
@@ -723,4 +600,4 @@ class SnmpConfigTab(QWidget):
         self.update_preview()
 
     def shutdown(self):
-        self.stop_waiting()
+        self.session_sender.stop_waiting()

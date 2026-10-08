@@ -18,8 +18,8 @@ from ..oui import format_mac, vendor
 from ..snmp import V2C, SnmpClient, SnmpError, parse_oid
 from ..snmpv3 import credential_from_json, credential_to_json, is_v3, users_from_json
 from . import collect, l3, vlans
-from .model import AP, HOST, KIND_NAMES, NEIGHBOR, NETWORK_KINDS, NO_SNMP, PHONE, SERVER, SNMP, UNKNOWN, UNREACHABLE, Device, \
-    Host, Link, NetworkMap, Trace, display_name, normalize_name, port_key, short_port
+from .model import AP, HOST, KIND_NAMES, NEIGHBOR, NETWORK_KINDS, NO_SNMP, PHONE, ROUTER, SERVER, SNMP, UNKNOWN, \
+    UNREACHABLE, Device, Host, Link, NetworkMap, Trace, display_name, normalize_name, port_key, short_port
 
 log = logging.getLogger(__name__)
 
@@ -386,12 +386,12 @@ class Crawler:
         tables.arp = collect.arp(self.walk(client, collect.ARP_PHYS_ADDRESS, tables, "ARP", timing="ARP table"))
         self.read_routes(client, tables)
         self.read_vlans(client, tables)
-        if not self.settings.collect_hosts:
-            return
-        tables.own_macs = collect.own_macs(self.walk(client, collect.IF_PHYS_ADDRESS, tables, "Interfaces"))
         tables.lag_parents = collect.lag_parents(
             self.walk(client, collect.IF_STACK_STATUS, tables, "Port-channels", timing="Interfaces"),
             self.walk(client, collect.LAG_ATTACHED, tables, "Port-channels", timing="Interfaces"))
+        if not self.settings.collect_hosts:
+            return
+        tables.own_macs = collect.own_macs(self.walk(client, collect.IF_PHYS_ADDRESS, tables, "Interfaces"))
         info = tables.info
         vlan_list = sorted(tables.vlan_names) if info.object_id.startswith(collect.CISCO + ".") else []
         if vlan_list and "nx-os" not in info.descr.lower():
@@ -443,6 +443,8 @@ class Crawler:
         """Its VLANs and their names, its VTP domain, and each switch port's VLANs: from CISCO-VTP-MIB and
         CISCO-VLAN-MEMBERSHIP-MIB on Cisco switches, otherwise (or when those are empty) from Q-BRIDGE-MIB."""
         if tables.info.object_id.startswith(collect.CISCO + "."):
+            tables.stp_mode = collect.stp_mode(self.walk(client, collect.STP_TYPE, tables, "Spanning tree",
+                                                         timing="VLANs"))
             state_rows = self.walk(client, collect.VTP_VLAN_STATE, tables, "VLANs")
             if state_rows:
                 tables.vlan_names = collect.vlan_names(
@@ -499,13 +501,7 @@ class Crawler:
             if self.should_stop():
                 return None
             try:
-                if is_v3(community):
-                    vlan_client = self.client_factory(client.host, community, self.settings.version,
-                                                      timeout=self.settings.timeout, retries=self.settings.retries,
-                                                      context=f"vlan-{vlan}")
-                else:
-                    vlan_client = self.client_factory(client.host, f"{community}@{vlan}", self.settings.version,
-                                                      timeout=self.settings.timeout, retries=self.settings.retries)
+                vlan_client = self.vlan_client(client, community, vlan)
                 rows = []
                 for column in (2, 3):  # Port and status: the MAC is in the index
                     rows += list(vlan_client.walk(parse_oid(f"{collect.FDB_ENTRY}.{column}"),
@@ -527,6 +523,55 @@ class Crawler:
                     tables.fdb += entries
         tables.timings["MAC tables"] = tables.timings.get("MAC tables", 0) + time.monotonic() - started
         return answered
+
+    def vlan_client(self, client, community, vlan):
+        """A client for one VLAN's BRIDGE-MIB on a Catalyst: community@vlan, or over SNMPv3 the context vlan-N."""
+        if is_v3(community):
+            return self.client_factory(client.host, community, self.settings.version, timeout=self.settings.timeout,
+                                       retries=self.settings.retries, context=f"vlan-{vlan}")
+        return self.client_factory(client.host, f"{community}@{vlan}", self.settings.version,
+                                   timeout=self.settings.timeout, retries=self.settings.retries)
+
+    def read_stp(self, client, tables, community, vlan):
+        """Whether each port forwards or blocks in one VLAN's spanning tree (for Carry VLAN): on Rapid-PVST and MST
+        from CISCO-STP-EXTENSIONS-MIB's port roles (MST: in the instance the VLAN is mapped to), on PVST+ from
+        BRIDGE-MIB read in the VLAN's context. Needs read_vlans first (its STP mode and VLANs)."""
+        tables.stp_read = True
+        mode = tables.stp_mode
+        base_ports = collect.base_port_ifindexes(self.walk(client, collect.BASE_PORT_IFINDEX, tables, "Bridge ports",
+                                                           timing="STP"))
+        vlan_client = None
+        if vlan in tables.vlan_names and tables.info.object_id.startswith(collect.CISCO + "."):
+            try:
+                vlan_client = self.vlan_client(client, community, vlan)
+                # On a Catalyst the plain community's bridge ports are VLAN 1's: add the VLAN's own
+                base_ports = {**collect.base_port_ifindexes(list(vlan_client.walk(
+                    parse_oid(collect.BASE_PORT_IFINDEX), max_repetitions=BULK_ROWS, should_stop=self.should_stop))),
+                              **base_ports}
+            except (SnmpError, OSError) as problem:
+                tables.warnings.append(f"VLAN {vlan} bridge ports: {problem}")
+                vlan_client = None
+        if mode in ("rapid-pvst", "mst"):
+            instance = vlan
+            if mode == "mst":
+                instance = collect.mst_instance_of(self.walk(client, collect.MST_INSTANCE_ENTRY, tables,
+                                                             "MST instances", timing="STP"), vlan)
+                if instance < 0:
+                    return
+            tables.stp_instance = instance
+            tables.stp_ports = collect.rstp_port_roles(
+                self.walk(client, collect.RSTP_PORT_ROLE, tables, "STP port roles", timing="STP"), instance, base_ports)
+            if tables.stp_ports or mode == "mst":
+                return
+        if vlan_client is not None:  # PVST+ (or Rapid-PVST without the role table): the VLAN's own BRIDGE-MIB
+            try:
+                rows = list(vlan_client.walk(parse_oid(collect.STP_PORT_STATE), max_repetitions=BULK_ROWS,
+                                             should_stop=self.should_stop))
+            except (SnmpError, OSError) as problem:
+                tables.warnings.append(f"VLAN {vlan} spanning tree: {problem}")
+                return
+            tables.stp_instance = vlan
+            tables.stp_ports = collect.stp_port_states(rows, base_ports)
 
     # ----------------------------------------------------------------- Putting results on the map
 
@@ -748,11 +793,13 @@ class Crawler:
         device.vtp_domain, device.vtp_mode = tables.vtp_domain, tables.vtp_mode
         device.vlans = [[vlan, name] for vlan, name in sorted(tables.vlan_names.items())]
         device.port_vlans = vlans.device_port_vlans(tables, short_port)
+        device.port_channels = vlans.device_port_channels(tables, short_port)
+        device.stp_mode = tables.stp_mode
         apply_vrfs(device, tables)
         for ip in device.addresses:
             self.aliases.setdefault(ip, key)
         device.kind = collect.classify(info.object_id, info.descr, frozenset(self.capabilities.get(key, ())),
-                                       device.platform)
+                                       device.platform, switchports=bool(tables.port_vlans))
         if tables.warnings:
             log.info("%s: %s", device.label, "; ".join(tables.warnings))
             for warning in tables.warnings:
@@ -933,11 +980,11 @@ class Check:
                 device.kind = collect.classify(self.info.object_id, self.info.descr, platform=device.platform)
 
 
-def read_vlans_of(settings, address, client_factory=SnmpClient, routes=False):
+def read_vlans_of(settings, address, client_factory=SnmpClient, routes=False, stp_vlan=None):
     """Read just a device's VLANs and IP interfaces (the VLAN interfaces among them), and with routes its routing
     tables (global and each VRF's), not its neighbors or tables of hosts: for a map made before NOMAD read these, or
-    to bring them up to date quickly. Returns (DeviceTables, the community or V3User it answered to), or (None,
-    None) when it answers none."""
+    to bring them up to date quickly. stp_vlan: also how that VLAN's spanning tree has each port (Carry VLAN).
+    Returns (DeviceTables, the community or V3User it answered to), or (None, None) when it answers none."""
     crawler = Crawler(settings, client_factory=client_factory)
     client, info, community = crawler.connect(address)
     if client is None:
@@ -951,6 +998,8 @@ def read_vlans_of(settings, address, client_factory=SnmpClient, routes=False):
         crawler.walk(client, collect.IF_STACK_STATUS, tables, "Port-channels", timing="Interfaces"),
         crawler.walk(client, collect.LAG_ATTACHED, tables, "Port-channels", timing="Interfaces"))
     crawler.read_vlans(client, tables)
+    if stp_vlan:
+        crawler.read_stp(client, tables, community, stp_vlan)
     if routes:
         crawler.read_routes(client, tables)
         tables.routes_read = True
@@ -962,6 +1011,12 @@ def apply_vlans(device, tables):
     device.vtp_domain, device.vtp_mode = tables.vtp_domain, tables.vtp_mode
     device.vlans = [[vlan, name] for vlan, name in sorted(tables.vlan_names.items())]
     device.port_vlans = vlans.device_port_vlans(tables, short_port)
+    device.port_channels = vlans.device_port_channels(tables, short_port)
+    device.stp_mode = tables.stp_mode
+    if device.kind in (ROUTER, UNKNOWN) and tables.port_vlans and "kind" not in device.corrected:
+        # A switch a crawl took for a router (its neighbors' CDP says "Router Switch"): its switchports say otherwise
+        kind = collect.classify(device.sys_object_id, device.sys_descr, platform=device.platform, switchports=True)
+        device.kind = kind if kind != UNKNOWN else device.kind
     if tables.addresses:
         device.interfaces_l3 = [[ip, prefix_length(mask), tables.interfaces.get(if_index, "")]
                                 for ip, if_index, mask in tables.addresses]

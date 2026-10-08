@@ -101,6 +101,8 @@ class Device:
     # "allowed": a trunk's VLANs as text, such as "1-10,20"} (numbers that are 0 are left out)
     port_vlans: dict = field(default_factory=dict)
     port_vrfs: dict = field(default_factory=dict)  # Port (short name) -> VRF, for the ports in one (else global)
+    port_channels: dict = field(default_factory=dict)  # Port-channel member (short name) -> its port-channel's
+    stp_mode: str = ""  # The spanning tree it runs: pvst, rapid-pvst, mst... ("" if unknown)
     # VRF -> [[destination, next hop, port, protocol]], like routes (which are the global table's). Only VRFs whose
     # routes could be read are here
     vrf_routes: dict = field(default_factory=dict)

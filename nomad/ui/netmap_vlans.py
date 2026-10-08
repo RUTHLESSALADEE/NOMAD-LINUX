@@ -25,6 +25,7 @@ class VlanPanel(QWidget):
     add_to_database_requested = pyqtSignal()
     read_requested = pyqtSignal()  # Read VLANs Again
     vlans_page_requested = pyqtSignal(int, str)  # VLAN, VTP domain: show it on Manage > VLANs
+    carry_requested = pyqtSignal(int, str)  # VLAN, VTP domain: Carry VLAN to a switch
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -183,6 +184,8 @@ class VlanPanel(QWidget):
             action = menu.addAction(button.text())
             action.setEnabled(button.isEnabled())
             actions[action] = button.click
+        menu.addSeparator()
+        actions[menu.addAction("Carry It to a Switch...")] = self.carry_selected
         chosen = menu.exec_(self.table.viewport().mapToGlobal(position))
         if chosen in actions:
             actions[chosen]()
@@ -202,6 +205,11 @@ class VlanPanel(QWidget):
             self.show_finding(cell)
         elif chosen is expand:
             self.expand_checks_button.click()
+
+    def carry_selected(self):
+        item = self.selected_item()
+        if item is not None:
+            self.carry_requested.emit(item.vlan, item.domain)
 
     def show_on_vlans_page(self):
         item = self.selected_item()
