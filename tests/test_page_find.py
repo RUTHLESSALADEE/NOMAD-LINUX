@@ -38,6 +38,7 @@ from nomad.ui.snmp_tab import SnmpTab
 from nomad.ui.subnet_tab import SubnetTab
 from nomad.ui.switch_tab import SwitchTab
 from nomad.ui.mac_finder_tab import MacFinderTab
+from nomad.ui.inventory_tab import InventoryTab
 from nomad.ui.tftp_tab import TftpTab
 from nomad.ui.traceroute_tab import TracerouteTab
 from nomad.ui.wake_tab import WakeTab
@@ -119,7 +120,7 @@ def press_find(window, page, source, target):
     (WebCheckTab, "url_input"), (SnmpTab, "host_input"), (SubnetTab, "subnet_input"),
     (WakeTab, "wake_mac_input"), (CaptureTab, "address_input"), (SnmpConfigTab, "community_input"),
     (SwitchTab, "filter_input"), (MacFinderTab, "search_input"), (DhcpTab, "filter_input"),
-    (NetworkResetTab, "find_input"),
+    (NetworkResetTab, "find_input"), (InventoryTab, "filter_input"),
 ])
 def test_ctrl_f_focuses_diagnostic_input(window, page_type, field):
     page = page_type(window)
