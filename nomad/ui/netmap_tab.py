@@ -29,6 +29,7 @@ from ..netmap.layout import BOTTOM, CENTER, GROUP_PAD, GROUP_TITLE, HORIZONTAL, 
     NORMAL, RESPACE_MIN_GAP, RIGHT, SPACING_NAMES, SPACINGS, STYLE_NAMES, TOP, TOP_DOWN, VERTICAL, align, arrange, \
     arrange_boxes_in_place, arrange_in_place, distribute, merge_positions, nearest_spacing, respace, spacing_of
 from ..netmap.placement import places as subnet_places
+from ..netmap.tribe import SECRETS
 from ..netmap.model import BUILDING, CORRECTED_NAMES, FIREWALL, GROUP_KINDS, KIND_NAMES, NO_SNMP, PARENT_KIND, \
     ROUTER, SNMP, SWITCH, UNCHECKED, UNREACHABLE, Group, NetworkMap, display_name, port_key, short_port
 from ..snmp import V2C
@@ -214,9 +215,9 @@ class NetworkMapTab(QWidget):
         self.seeds_input = QLineEdit()
         self.seeds_input.setPlaceholderText("Core switch or gateway to start from (IP addresses, separated by commas)")
         self.gateway_button = QPushButton("Adapter's Gateway")
-        self.communities_button = QPushButton("Credentials...")
+        self.communities_button = QPushButton("SNMP Credentials...")
         self.communities_button.setToolTip("The SNMP community strings and SNMPv3 users to try, including ones for "
-                                           "particular subnets.")
+                                           "particular subnets. A tribe map's are shared with everyone in the tribe.")
         self.scope_button = QPushButton("Scope...")
         self.scope_button.setToolTip("Which subnets the crawl may go into, how many hops, and whether to read "
                                      "MAC tables for hosts and traceroute for the logical view.")
@@ -836,8 +837,11 @@ class NetworkMapTab(QWidget):
             self.seeds_input.setText(self.gateway())
 
     def edit_communities(self):
+        tribe_map = None
+        if self.tribe_map_id is not None and self.tribe.maps is not None:
+            tribe_map = (self.tribe.maps.map_info(self.tribe_map_id) or {}).get("name", "")
         dialog = CommunitiesDialog(self.communities, self.overrides, self.version, self.timeout, self,
-                                   v3_users=self.v3_users, v3_first=self.v3_first)
+                                   v3_users=self.v3_users, v3_first=self.v3_first, tribe_map=tribe_map)
         if dialog.exec_() == QDialog.Accepted:
             self.communities, self.overrides, self.version, self.timeout, self.v3_users, self.v3_first = \
                 dialog.values()
@@ -845,15 +849,24 @@ class NetworkMapTab(QWidget):
 
     def credentials_changed(self):
         """After the credentials change: ask the devices that don't answer SNMP with them, and share them with the
-        tribe map, if it's one."""
+        tribe map, if it's one (now, or when the server can next be reached)."""
         self.watcher.recheck_now()
         if self.tribe_map_id is not None:
             try:
-                self.tribe.maps.set_secrets(self.tribe_map_id, self.tribe_secrets())
+                sent = self.tribe.maps.set_secrets(self.tribe_map_id, self.tribe_secrets())
             except IpamError as error:
                 QMessageBox.warning(self, "SNMP Credentials", "The credentials are changed on this computer, but "
                                     f"couldn't be saved with the tribe map:\n\n{error}")
+            else:
+                if sent:
+                    set_hint(self.status_label, "Shared the SNMP credentials with everyone in the tribe: they're "
+                             "used for this map wherever it's opened or watched.", "success")
+                else:
+                    self.tribe.request_sync()
+                    set_hint(self.status_label, "The tribe server can't be reached, so the SNMP credentials are "
+                             "used on this computer for now and shared with the tribe once it can be.", "warning")
             self.write_map(self.network_map, None)  # Version and timeout go with the map
+            self.update_tribe_label()
 
     def credentials(self):
         """The community strings and SNMPv3 users a crawl tries, in order."""
@@ -3252,8 +3265,15 @@ class NetworkMapTab(QWidget):
         self.workers = max(1, min(MAX_WORKERS, self.workers))
         if settings.get("seeds"):
             self.seeds_input.setText(settings["seeds"])
-        if secrets.get("communities") or secrets.get("v3_users"):
-            self.communities, self.overrides, self.v3_users, self.v3_first = credentials_from_json(secrets, [])
+        self.apply_tribe_secrets(secrets)
+
+    def apply_tribe_secrets(self, secrets):
+        """Use a tribe map's SNMP credentials (kept on the tribe server). Returns whether it has any (without,
+        those already set here are used)."""
+        if not (secrets.get("communities") or secrets.get("v3_users")):
+            return False
+        self.communities, self.overrides, self.v3_users, self.v3_first = credentials_from_json(secrets, [])
+        return True
 
     def fill_tribe_menu(self):
         menu = self.tribe_menu
@@ -3355,7 +3375,10 @@ class NetworkMapTab(QWidget):
         self.update_tribe_label()
         if not quiet:
             set_hint(self.status_label, f"Opened the tribe map {info['name']}. Changes made here reach everyone "
-                     "with the tribe key (and are sent later if the server can't be reached now).", "info")
+                     "with the tribe key (and are sent later if the server can't be reached now)." +
+                     ("" if secrets.get("communities") or secrets.get("v3_users") else
+                      " It has no shared SNMP credentials yet, so this computer's own are used: set them with SNMP "
+                      "Credentials... to share them with everyone."), "info")
             if not network_map.ipam_network:
                 QTimer.singleShot(0, self.ask_tribe_map_network)
         return True
@@ -3459,8 +3482,19 @@ class NetworkMapTab(QWidget):
         if info is None or info.get("deleted"):
             self.leave_tribe_map("Someone deleted this tribe map. This computer keeps a copy as a file.")
             return
-        if touched[map_id]:
+        changed = touched[map_id]
+        if SECRETS in changed:
+            self.tribe_secrets_changed()
+        if changed - {SECRETS}:
             self.reload_from_tribe()
+
+    def tribe_secrets_changed(self):
+        """Someone changed the tribe map's SNMP credentials: use theirs from now on."""
+        if not self.apply_tribe_secrets(self.tribe.maps.secrets(self.tribe_map_id)):
+            return
+        self.watcher.recheck_now()
+        set_hint(self.status_label, "Someone in the tribe changed this map's SNMP credentials; they're used here "
+                 "now.", "info")
 
     def reload_from_tribe(self):
         """Others changed the tribe map open: show their changes, keeping the view where it is."""

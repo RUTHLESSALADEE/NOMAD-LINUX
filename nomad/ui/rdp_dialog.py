@@ -5,6 +5,7 @@ from PyQt5.QtWidgets import QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFo
 from ..terminal.credentials import CredentialError
 from ..terminal.sessions import RDP, normalize_folder, validate_session
 from .common import set_hint
+from .credential_dialogs import CredentialPicker, default_credential_id
 from .vault_dialog import password_field, protect_secret
 
 
@@ -33,10 +34,15 @@ class RdpDialog(QDialog):
         self.save_password_check = QCheckBox("Remember password in NOMAD's vault")
         self.save_password_check.setChecked(bool(session.saved_password))
         self.save_password_check.setToolTip("Untick to forget the saved password. Windows may still ask you to sign in.")
-        for label, widget in (("Name:", self.name_input), ("Folder:", self.folder_combo),
-                              ("Address:", self.host_input), ("Port:", self.port_input),
-                              ("Username:", self.username_input), ("Password:", self.password_input),
-                              ("", self.save_password_check)):
+        self.credential_picker = None
+        self.own_login = None  # What was typed for this session, kept while a saved credential is chosen
+        rows = [("Name:", self.name_input), ("Folder:", self.folder_combo), ("Address:", self.host_input),
+                ("Port:", self.port_input)]
+        if store is not None:
+            self.credential_picker = CredentialPicker(self, store, RDP, default_credential_id(store, session))
+            rows.append(("Credential:", self.credential_picker))
+        rows += [("Username:", self.username_input), ("Password:", self.password_input), ("", self.save_password_check)]
+        for label, widget in rows:
             form.addRow(label, widget)
         self.fullscreen_check = QCheckBox("Full screen")
         self.fullscreen_check.setChecked(session.rdp_fullscreen)
@@ -72,6 +78,31 @@ class RdpDialog(QDialog):
         self.fullscreen_check.toggled.connect(self.update_dimensions)
         self.multimon_check.toggled.connect(self.update_dimensions)
         self.update_dimensions()
+        if self.credential_picker is not None:
+            self.credential_picker.combo.currentIndexChanged.connect(self.update_credential_fields)
+            self.update_credential_fields()
+
+    def update_credential_fields(self, *_):
+        """A saved credential shows its user name; its password is used without being shown."""
+        credential = self.credential_picker.credential()
+        if credential is not None:
+            if self.own_login is None:
+                self.own_login = (self.username_input.text(), self.save_password_check.isChecked())
+            self.username_input.setText(credential.username)
+            self.password_input.clear()
+            self.password_input.setPlaceholderText(f"Saved in {credential.name}" if credential.saved_password else
+                                                   "Windows asks when connecting")
+            self.save_password_check.setChecked(bool(credential.saved_password))
+        else:
+            if self.own_login is not None:
+                username, save_password = self.own_login
+                self.own_login = None
+                self.username_input.setText(username)
+                self.save_password_check.setChecked(save_password)
+            self.password_input.setPlaceholderText("Saved (encrypted). Type to replace." if self.session.saved_password
+                                                   else "Leave blank to sign in through Windows")
+        for widget in (self.username_input, self.password_input, self.save_password_check):
+            widget.setEnabled(credential is None)
 
     def update_dimensions(self):
         enabled = not (self.fullscreen_check.isChecked() or self.multimon_check.isChecked())
@@ -97,8 +128,12 @@ class RdpDialog(QDialog):
         if problem:
             set_hint(self.error_label, problem, "error")
             return
+        credential = self.credential_picker.credential() if self.credential_picker is not None else None
+        session.credential_id = credential.id if credential is not None else ""
         try:
-            if not self.save_password_check.isChecked():
+            if credential is not None:
+                self.store.credentials.apply(session)
+            elif not self.save_password_check.isChecked():
                 session.saved_password = ""
             elif self.password_input.text():
                 encrypted = protect_secret(self, self.store, self.password_input.text())

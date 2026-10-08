@@ -158,6 +158,17 @@ class PromptAnswers:
             self.report(f"The {kind} wasn't saved (the master password wasn't entered).", True)
             return
         stored = self.store.get(self.session.id)
+        credential = self.store.credentials.get(stored.credential_id)
+        if credential is not None:  # Shared: save it there, so every session using it gets the new one
+            if kind == "password":
+                credential.saved_password = encrypted
+            else:
+                credential.saved_passphrase = encrypted
+            self.store.credentials.put(credential)
+            self.session.saved_password, self.session.saved_passphrase = (stored.saved_password,
+                                                                          stored.saved_passphrase)
+            self.report(f"Saved the {kind} in the credential {credential.name}, for every session using it.", False)
+            return
         if kind == "password":
             stored.saved_password = self.session.saved_password = encrypted
         else:

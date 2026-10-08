@@ -6,9 +6,10 @@ Only the menu shown during that delivery gets an additional, independently wired
 """
 import html
 import ipaddress
+import itertools
 import re
 
-from PyQt5.QtCore import QEvent, QObject, Qt
+from PyQt5.QtCore import QEvent, QModelIndex, QObject, Qt
 from PyQt5.QtGui import QContextMenuEvent
 from PyQt5.QtWidgets import QAbstractItemView, QApplication, QComboBox, QGraphicsTextItem, QGraphicsView, \
     QHeaderView, QLabel, QLineEdit, QMenu, QPlainTextEdit, QTextEdit, QWidget
@@ -52,9 +53,10 @@ def addresses_at(widget, position):
         found = ip_addresses(index.data(Qt.DisplayRole) or "")
         if found:
             return found
-        model = view.model()
-        return list(dict.fromkeys(address for column in range(model.columnCount(index.parent()))
-                                 for address in ip_addresses(index.sibling(index.row(), column).data() or "")))
+        # Walk siblings until invalid: QListWidget's list model makes columnCount() private in PyQt.
+        cells = itertools.takewhile(QModelIndex.isValid,
+                                    (index.sibling(index.row(), column) for column in itertools.count()))
+        return list(dict.fromkeys(address for cell in cells for address in ip_addresses(cell.data() or "")))
     view = widget if isinstance(widget, QGraphicsView) else widget.parentWidget()
     if isinstance(view, QGraphicsView):
         point = view.viewport().mapFromGlobal(widget.mapToGlobal(position))

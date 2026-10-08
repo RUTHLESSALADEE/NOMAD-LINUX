@@ -6,6 +6,28 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.22.0] - 2026-10-07
+
+### Added
+
+- **Saved credentials:** save a user name and password (or SSH key) once under a name, such as TACACS or Domain Admin, and choose it in SSH (and so SCP) and Remote Desktop sessions instead of typing the login again. They're encrypted like saved session passwords, including with the master password, and travel in Export/Import NOMAD Terminal backups.
+  - **Credential:** at the top of the session editor's SSH section and above Username in the RDP editor. Choosing one fills in its user name and greys out the login fields; **Typed for this session** goes back to the session's own login. Remote Desktop only offers credentials with a password.
+  - Mark one credential **Use for New Sessions** (the first one you make is marked automatically) and every new SSH or RDP session starts with it chosen, including the ones from **Create Terminal Session…** / **Create RDP Session…**. Sessions that already have a user name of their own aren't changed.
+  - Changing a credential (such as after a password change) updates every session using it. Saving a new password when a login with a credential fails saves it in the credential, for all of its sessions. Deleting a credential leaves its sessions with its user name and password as their own.
+  - **Tools > Saved Credentials…** adds, edits and deletes credentials from any page; it's also on the session list's New button arrow menu and the master password button's menu. Right-click a session for **Credential**, or select several for **Use Credential**, to switch existing sessions over in one go. A session's tooltip names its credential.
+
+### Changed
+
+- **Network Map:** **Credentials…** (on the crawl row and in the Map menu) is now **SNMP Credentials…**, so it isn't mistaken for the saved login credentials used by Terminal and Remote Desktop sessions.
+
+### Fixed
+
+- **Tribe maps:** a tribe map's SNMP credentials now reach everyone in the tribe, so nobody has to type them in. They were already kept encrypted on the tribe server, but each computer fetched them only the first time it opened the map, so later changes never reached anyone else.
+  - Each computer, and the Map Watcher service, now fetches them again whenever they change on the server. A tribe map that's open switches to the new credentials at once and says so.
+  - Credentials changed while the server can't be reached are used on this computer straight away. They're sent with the map's other waiting changes once the server is back.
+  - **SNMP Credentials…** says when the credentials belong to a tribe map and are shared. Opening a tribe map that has no shared credentials yet says so too.
+  - The first time it syncs after updating, each computer fetches the credentials of every tribe map again.
+
 ## [1.21.1] - 2026-10-07
 
 ### Fixed

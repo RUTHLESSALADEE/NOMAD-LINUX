@@ -457,7 +457,7 @@ class SnmpConfigTab(QWidget):
         for user in [item for item in self.map_credentials() if is_v3(item)]:
             menu.addAction(user.label, lambda user=user: self.use_credential(user))
         if menu.isEmpty():
-            menu.addAction("The Network Map has no SNMPv3 users (add them with Credentials... on its page)") \
+            menu.addAction("The Network Map has no SNMPv3 users (add them with SNMP Credentials... on its page)") \
                 .setEnabled(False)
 
     def use_credential(self, credential):

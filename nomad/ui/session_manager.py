@@ -10,9 +10,11 @@ from PyQt5.QtWidgets import QAbstractItemView, QComboBox, QFileDialog, QHBoxLayo
 
 from ..terminal.securecrt import IMPORT_FOLDER as SECURECRT_FOLDER, SecureCrtError, WrongPassphrase, \
     import_securecrt, read_securecrt_export
-from ..terminal.sessions import PROTOCOLS, SSH, Session, import_putty, normalize_folder, parse_quick_connect
+from ..terminal.sessions import CREDENTIAL_PROTOCOLS, PROTOCOLS, RDP, SSH, Session, import_putty, normalize_folder, \
+    parse_quick_connect
 from .common import set_hint
 from .folder_picker import FolderPickerDialog
+from .credential_dialogs import OWN_LOGIN, CredentialsDialog
 from .session_dialog import SessionDialog
 from .vault_dialog import SecurityDialog, ensure_unlocked
 from .theme import COLORS
@@ -167,6 +169,8 @@ class SessionManager(QWidget):
         new_menu = QMenu(self.new_button)
         new_menu.addAction("New Session...", lambda: self.new_session(self.selected_folder()))
         new_menu.addAction("New Folder...", lambda: self.new_folder(self.selected_folder()))
+        new_menu.addSeparator()
+        new_menu.addAction("Saved Credentials...", self.show_credentials)
         self.new_button.setMenu(new_menu)
         # The master password's state, which is also its menu: unlock, lock, or set up and change it
         self.protection_button = QToolButton()
@@ -301,12 +305,14 @@ class SessionManager(QWidget):
         vault = self.store.vault
         if not vault.enabled:
             menu.addAction("Set Master Password...", self.show_protection)
-            return
-        if vault.unlocked:
-            menu.addAction("Lock Now", self.lock_now)
         else:
-            menu.addAction("Unlock...", self.unlock_now)
-        menu.addAction("Master Password Settings...", self.show_protection)
+            if vault.unlocked:
+                menu.addAction("Lock Now", self.lock_now)
+            else:
+                menu.addAction("Unlock...", self.unlock_now)
+            menu.addAction("Master Password Settings...", self.show_protection)
+        menu.addSeparator()
+        menu.addAction("Saved Credentials...", self.show_credentials)
 
     def unlock_now(self):
         ensure_unlocked(self, self.store)
@@ -315,6 +321,39 @@ class SessionManager(QWidget):
     def show_protection(self):
         SecurityDialog(self, self.store).exec_()
         self.update_protection()
+
+    def show_credentials(self):
+        CredentialsDialog(self, self.store).exec_()
+        self.fill_tree()
+
+    def add_credential_menu(self, menu, actions, sessions):
+        """"Credential" (or "Use Credential" for several): log the SSH and RDP ones in with a saved credential."""
+        sessions = [session for session in sessions if session.protocol in CREDENTIAL_PROTOCOLS]
+        if not sessions:
+            return
+        submenu = menu.addMenu("Credential" if len(sessions) == 1 else "Use Credential")
+        current = {session.credential_id for session in sessions}
+        protocols = {session.protocol for session in sessions}
+        choices = [("", OWN_LOGIN)] + [(credential.id, f"{credential.name}  ({credential.summary()})")
+                                       for credential in self.store.credentials.sorted(RDP if protocols == {RDP}
+                                                                                       else None)]
+        for credential_id, label in choices:
+            action = submenu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(current == {credential_id})
+            actions[action] = lambda credential_id=credential_id: self.assign_credential(sessions, credential_id)
+        submenu.addSeparator()
+        actions[submenu.addAction("Manage Credentials...")] = self.show_credentials
+
+    def assign_credential(self, sessions, credential_id):
+        changed = self.store.credentials.assign(sessions, credential_id)
+        skipped = len([session for session in sessions if session.credential_id != credential_id])
+        if skipped:
+            QMessageBox.information(self, "Use Credential", f"{skipped} Remote Desktop session"
+                                    f"{'' if skipped == 1 else 's'} kept {'its' if skipped == 1 else 'their'} own "
+                                    "login: Remote Desktop can only use a credential with a password.")
+        if changed:
+            self.fill_tree()
 
     def quick_connect(self, into=None):
         try:
@@ -374,6 +413,9 @@ class SessionManager(QWidget):
             lines = [f"{session.target()}  ({session.protocol})"]
             if session.folder:
                 lines.append(f"Folder: {session.folder}")
+            credential = self.store.credentials.get(session.credential_id)
+            if credential is not None:
+                lines.append(f"Credential: {credential.name}")
             if session.notes:
                 lines.append(session.notes)
             item.setToolTip(0, "\n".join(lines))
@@ -499,6 +541,7 @@ class SessionManager(QWidget):
             self.add_companion_actions(menu, actions, session)
             menu.addSeparator()
             actions[menu.addAction("Edit...")] = lambda: self.edit_session(session)
+            self.add_credential_menu(menu, actions, [session])
             actions[menu.addAction("Duplicate")] = lambda: self.duplicate_session(session)
             actions[menu.addAction("Move to...")] = lambda: self.move_to_dialog([session], [])
             actions[menu.addAction("Delete")] = lambda: self.delete_session(session)
@@ -744,6 +787,7 @@ class SessionManager(QWidget):
             label = f"{'Launch' if self.launch_only else 'Connect'} {len(sessions)} Session{'' if len(sessions) == 1 else 's'}"
             actions[menu.addAction(label)] = lambda: [self.page.open_session(session) for session in sessions]
             menu.addSeparator()
+        self.add_credential_menu(menu, actions, sessions)
         actions[menu.addAction("Move to...")] = lambda: self.move_to_dialog(sessions, folders)
         actions[menu.addAction("Delete...")] = lambda: self.delete_items(sessions, folders)
         chosen = menu.exec_(self.tree.viewport().mapToGlobal(position))
