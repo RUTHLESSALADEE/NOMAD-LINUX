@@ -6,6 +6,16 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.24.1] - 2026-10-08
+
+### Added
+
+- **Carry VLAN:** the route planned is drawn on the map while its window is open: thick green dashed on links the VLAN will be added to, thick green on links of the route that already carry it (or do once sent and verified), thick amber dashed on redundant links ticked to carry it too, amber dotted on redundant links left as they are, and red dashed on a link of a route set by hand that can't carry it. A link's tooltip says what's changed there (such as "allowed vlan add 300 on sw1 Gi0/2"). The map's key explains each.
+
+### Changed
+
+- **Network Map:** rings round devices (Carry VLAN's route, Compare's added and changed devices, devices being read) are drawn solid and a little thicker. Carry VLAN's switches stay at full strength while the VLAN is highlighted, even those that don't have it yet.
+
 ## [1.24.0] - 2026-10-08
 
 ### Added

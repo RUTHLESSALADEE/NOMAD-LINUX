@@ -12,6 +12,7 @@ from PyQt5.QtWidgets import QApplication, QMenu, QMessageBox, QWidget  # noqa: E
 from nomad.netmap import collect, store  # noqa: E402
 from nomad.netmap.crawl import CrawlSettings, Crawler, read_vlans_of  # noqa: E402
 from nomad.ui import netmap_tab  # noqa: E402
+from nomad.ui.netmap_view import FADED, PATH_CARRIES, PATH_CHOSEN, PATH_OFFERED, PATH_PLANNED  # noqa: E402
 from nomad.ui.terminal_view import CONNECTED  # noqa: E402
 
 
@@ -289,3 +290,60 @@ def test_open_session_to_a_switch_uses_its_saved_telnet_session_without_ssh(setu
     dialog.session_sender.terminal = lambda: Terminal()
     dialog.session_sender.open_device({"address": "10.0.0.3", "aliases": ["sw2"], "name": "sw2"}, lambda: "")
     assert opened == [("10.0.0.3", TELNET)]
+
+
+def link_kind(page, one, other):
+    """The path style drawn on the link between two devices."""
+    for item in page.view.link_items:
+        if {item.a_item.key, item.b_item.key} == {one, other}:
+            return item.path_kind, item.toolTip(), item.opacity()
+    return None
+
+
+def test_the_planned_path_is_drawn_on_the_map(setup):
+    page, network, keys = setup
+    page.carry_vlan(vlan=20, b=keys["sw2"])
+    dialog = page.carry_dialog
+    dialog.plan_button.click()
+    wait_for(dialog)
+    kind, tip, opacity = link_kind(page, keys["sw1"], keys["sw2"])
+    assert kind == PATH_PLANNED and opacity == 1.0
+    assert "Carry VLAN 20: on the route: allowed vlan add 20 on sw1 Gi0/2 and sw2 Gi0/1" in tip
+    assert link_kind(page, keys["core"], keys["sw1"])[0] is None  # Not on the route (it carries 20 already)
+    sw2 = page.view.items_by_key[keys["sw2"]]
+    assert sw2.opacity() == 1.0 and sw2.highlight  # On the route: not faded with what lacks VLAN 20
+    network.devices["10.0.0.2"].trunk(2, [1, 20])
+    network.devices["10.0.0.3"].vlan(20, "USERS")
+    network.devices["10.0.0.3"].trunk(1, [1, 20])
+    dialog.verify_button.click()
+    wait_for(dialog)
+    assert link_kind(page, keys["sw1"], keys["sw2"])[0] == PATH_CARRIES
+    dialog.close()
+    kind, tip, _ = link_kind(page, keys["sw1"], keys["sw2"])
+    assert kind is None and "Carry VLAN" not in tip
+
+
+def test_redundant_links_are_drawn_ticked_or_not(setup):
+    page, network, keys = setup
+    core, sw2 = network.devices["10.0.0.1"], network.devices["10.0.0.3"]
+    core.interface(2, "GigabitEthernet0/2")
+    core.trunk(2, [1])
+    core.cdp(2, 2, "sw2", "GigabitEthernet0/2", "10.0.0.3", "cisco WS-C2960", 0x28)
+    sw2.interface(2, "GigabitEthernet0/2")
+    sw2.trunk(2, [1])
+    sw2.cdp(2, 2, "core", "GigabitEthernet0/2", "10.0.0.1", "cisco WS-C3850", 0x28)
+    page.on_crawled(Crawler(CrawlSettings(seeds=["10.0.0.1"], trace=False, collect_hosts=False),
+                            client_factory=network.client, pinger=network.ping, echo=network.echo).run())
+    keys = {device.label: key for key, device in page.network_map.devices.items()}
+    page.carry_vlan(vlan=20, b=keys["sw2"])
+    dialog = page.carry_dialog
+    dialog.plan_button.click()
+    wait_for(dialog)
+    item = dialog.plan.redundant[0]
+    assert link_kind(page, item.hop.a, item.hop.b)[0] == PATH_OFFERED
+    dialog.redundant_list.item(0).setCheckState(Qt.Checked)
+    assert link_kind(page, item.hop.a, item.hop.b)[0] == PATH_CHOSEN
+    others = [key for key in page.network_map.devices if key not in dialog.plan.route
+              and key not in (item.hop.a, item.hop.b)]
+    assert all(page.view.items_by_key[key].opacity() == FADED for key in others
+               if key in page.view.items_by_key and key not in page.view.vlan_focus.devices)
