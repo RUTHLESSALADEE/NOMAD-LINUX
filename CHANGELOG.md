@@ -6,6 +6,12 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.24.2] - 2026-10-08
+
+### Added
+
+- **Terminal:** triple-click (or a click straight after a double-click) selects and copies the whole line, as in PuTTY; double-click still copies a word.
+
 ## [1.24.1] - 2026-10-08
 
 ### Added
