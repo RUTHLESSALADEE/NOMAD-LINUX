@@ -71,6 +71,7 @@ SHORTCUT_SECTIONS = [
         ("Ctrl+F", "Search command output", "Network Reset; Enter: next, Shift+Enter: previous, Esc: close search"),
         ("Ctrl+F", "Filter discovered switch details", "Switch Port"),
         ("Ctrl+F", "MAC address, IP address or name to find; the list in List mode", "MAC Finder"),
+        ("Ctrl+F", "Filter devices", "Ansible Inventory"),
         ("Ctrl+F", "Filter server addresses", "DHCP Servers"),
         ("Ctrl+F", "Page search / filter", "Routing Table, ARP, Connections, Syslog, IP Addresses, Network Map, VLANs, Subnet Placement"),
     ]),

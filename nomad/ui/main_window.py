@@ -22,6 +22,7 @@ from .dialogs import AboutDialog, LogDialog
 from .dns_servers_tab import DnsServersTab
 from .iperf_tab import IperfTab
 from .integration import Integration
+from .inventory_tab import InventoryTab
 from .ipam_tab import IpamTab
 from .ip_menu import IpContextMenus
 from .latency_tab import LatencyTab
@@ -169,6 +170,7 @@ class MainWindow(QMainWindow):
         self.tftp_tab = TftpTab(self)
         self.subnet_tab = SubnetTab(self)
         self.snmp_config_tab = SnmpConfigTab(self)
+        self.inventory_tab = InventoryTab(self)  # The Network Map's devices and the saved sessions
         self.wake_tab = WakeTab(self)
         self.session_store = SessionStore()  # Shared by Terminal, SCP and RDP
         terminal_store = SessionFolderStore(self.session_store, TERMINAL_PROTOCOLS)
@@ -196,7 +198,7 @@ class MainWindow(QMainWindow):
                                       (self.web_check_tab, "Web Check")]),
             ("Network Management", [(self.netmap_tab, "Network Map"), (self.ipam_tab, "IP Addresses"),
                 (self.vlan_tab, "VLANs"), (self.placement_tab, "Subnet Placement"),
-                (self.snmp_config_tab, "SNMP Config")]),
+                (self.snmp_config_tab, "SNMP Config"), (self.inventory_tab, "Ansible Inventory")]),
             ("Capture & Logs", [(self.capture_tab, "Packet Capture"), (self.syslog_tab, "Syslog")]),
             ("Utilities", [(self.subnet_tab, "Subnet Calculator")]),
         ]

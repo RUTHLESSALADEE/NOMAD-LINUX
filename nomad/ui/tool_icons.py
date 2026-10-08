@@ -78,6 +78,8 @@ TOOL_ART = {
     "SNMP Config": '<path d="M4 5h16M4 12h16M4 19h16 M8 3v4m8 3v4m-6 3v4"/>'
                    '<circle cx="8" cy="5" r="2"/><circle cx="16" cy="12" r="2"/>'
                    '<circle cx="10" cy="19" r="2"/>',
+    "Ansible Inventory": '<rect x="4" y="3" width="16" height="19" rx="2"/>'
+                         '<path d="M9 3V1h6v2 M8 9h1m3 0h4 M8 13h1m3 0h4 M8 17h1m3 0h4"/>',
     "Packet Capture": '<path d="M2 7h20M5 7l3 13h8l3-13 M12 2v12m-3-3 3 3 3-3"/>',
     "Syslog": '<path d="M5 2h10l4 4v16H5z M15 2v5h4 M8 11h8m-8 4h8m-8 4h5"/>',
     "Subnet Calculator": '<rect x="5" y="2" width="14" height="20" rx="2"/>'

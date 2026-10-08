@@ -6,6 +6,18 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.23.0] - 2026-10-08
+
+### Added
+
+- **Ansible Inventory** (Network Management): make an Ansible inventory, in YAML or INI, from the Network Map's devices and your saved SSH sessions, ready to copy or save for a control node.
+  - A saved session of a device on the map joins it (matched by address or name), giving its user name and port. Sessions of devices not on the map are listed on their own.
+  - Each device gets the `ansible_network_os` and connection its make and model call for, worked out from what the map read of it: Cisco IOS / IOS XE, NX-OS, IOS XR and ASA, Palo Alto PAN-OS, Juniper Junos, Arista EOS and Fortinet FortiOS. Where the map can't tell, or gets it wrong, select the devices and choose it with **Set Ansible OS** (also on the right-click menu). Linux / Unix servers can be chosen too.
+  - Groups by the map's sites, buildings and rooms (nested), kind (switches, routers, firewalls…), Ansible OS (each OS group holds its variables) and session folders (nested). Each grouping can be turned off.
+  - Tick the devices to include; **Network Devices**, **All Shown** and **None Shown** tick whatever the filter shows. Switches, routers, firewalls and saved sessions are ticked to start with.
+  - Options: `ansible_user` for everything (saved credentials' user names are offered), sessions' own user names, short names without the domain, enable mode (`ansible_become`) for IOS, ASA and EOS, and `nomad_*` variables (kind, model, location, folder) for playbooks to use.
+  - The file starts with the `ansible-galaxy collection install` line for the collections it needs. Passwords are never written to it: run with `--ask-pass`, or keep them in ansible-vault. Names Ansible would reject are made safe and unique, and anything worth knowing (a device with no address, an unknown OS, a renamed group) is listed under the inventory.
+
 ## [1.22.0] - 2026-10-07
 
 ### Added
