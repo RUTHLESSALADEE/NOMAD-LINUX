@@ -6,7 +6,8 @@ from PyQt5.QtWidgets import QDialog, QDialogButtonBox, QGridLayout, QLabel, QScr
 from ..netmap.model import AP, FIREWALL, ROUTER, SERVER, SHARED_PORT_HOSTS, SWITCH, UNKNOWN
 from ..netmap.monitor import DOWN, UNKNOWN as NOT_CHECKED, UP
 from ..netmap.vlans import ACCESS, NATIVE, ONE_END, TAGGED
-from .netmap_view import KIND_COLORS, KIND_TAGS, STATUS_COLORS, VLAN_LINK_COLORS
+from .netmap_view import KIND_COLORS, KIND_TAGS, PATH_BLOCKED, PATH_CARRIES, PATH_CHOSEN, PATH_OFFERED, PATH_PLANNED, \
+    PATH_STYLES, STATUS_COLORS, VLAN_LINK_COLORS
 from .theme import COLORS
 
 SWATCH_WIDTH, SWATCH_HEIGHT = 96, 40
@@ -248,6 +249,17 @@ SECTIONS = [
         (line(VLAN_LINK_COLORS[ONE_END], 3, Qt.DashLine), "Amber dashed: only one end carries it (a mismatch "
                                                           "worth checking)"),
         (line(faded=True), "Faint: doesn't carry it (devices without it fade too)"),
+    ]),
+    ("Carry VLAN (while its window is open): the route planned", [
+        (line(*PATH_STYLES[PATH_PLANNED]), "Thick green dashed: a link of the route the VLAN will be added to"),
+        (line(*PATH_STYLES[PATH_CARRIES]), "Thick green: a link of the route that carries it (already, or once "
+                                           "sent and verified)"),
+        (line(*PATH_STYLES[PATH_CHOSEN]), "Thick amber dashed: a redundant link ticked to carry it too"),
+        (line(*PATH_STYLES[PATH_OFFERED]), "Amber dotted: a redundant link not ticked (left as it is)"),
+        (line(*PATH_STYLES[PATH_BLOCKED]), "Red dashed: a link of the route that can't carry it (an access port in "
+                                           "another VLAN)"),
+        (device(ring=COLORS["warning"]), "Amber ring: a switch the plan changes"),
+        (device(ring=COLORS["success"]), "Green ring: a switch of the route that needs nothing, or verified done"),
     ]),
     ("Sites, buildings and rooms", [
         (group(COLORS["accent"]), "Green box: a site"),

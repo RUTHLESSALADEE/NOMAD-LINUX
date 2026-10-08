@@ -19,6 +19,7 @@ from ..netmap import vlan_path, vlans, watch
 from ..netmap.crawl import apply_vlans
 from ..netmap.model import SNMP, SWITCH
 from .common import StoppableThread, set_hint
+from .netmap_view import PATH_BLOCKED, PATH_CARRIES, PATH_CHOSEN, PATH_OFFERED, PATH_PLANNED
 from .session_send import SessionSender
 from .theme import COLORS, accent_button, monospace_font
 
@@ -798,6 +799,7 @@ class VlanPathDialog(QDialog):
         self.gateway_label.clear()
         self.update_buttons()
         self.page.view.set_highlights({})
+        self.page.view.set_path_overlay(None)
 
     # ----------------------------------------------------------------- Showing the plan
 
@@ -1035,6 +1037,44 @@ class VlanPathDialog(QDialog):
             if step is not None and text == "Done":
                 colors[step.device] = COLORS["success"]
         self.page.view.set_highlights(colors)
+        self.page.view.set_path_overlay(self.path_overlay())
+
+    def path_overlay(self):
+        """The route and redundant links to draw over the map's links (MapView.set_path_overlay)."""
+        plan, graph = self.plan, self.graph()
+        links = {}
+
+        def note(hop):
+            ends = [f"{graph.label(key)} {hop.port_on(key)}" for key in (hop.a, hop.b)
+                    if key in graph.devices and vlan_path.end_state(graph.devices[key], hop.port_on(key),
+                                                                     plan.vlan) == vlan_path.ADD]
+            return f"allowed vlan add {plan.vlan} on {' and '.join(ends)}" if ends else ""
+
+        def put(hop, kind, text):
+            for link in hop.links:
+                links[link.key] = (kind, text)
+
+        chosen = {item.hop.key for item in plan.chosen}
+        for item in plan.redundant:
+            if vlan_path.carries(graph, item.hop, plan.vlan):
+                put(item.hop, PATH_CARRIES, "a redundant link: carries it")
+            elif item.hop.key in chosen:
+                put(item.hop, PATH_CHOSEN, "a redundant link, ticked: " + (note(item.hop) or "to carry it"))
+            else:
+                put(item.hop, PATH_OFFERED, "a redundant link, not ticked: left as it is")
+        for hop in plan.hops:
+            if hop is None:
+                continue
+            states = vlan_path.hop_states(graph, hop, plan.vlan)
+            if vlan_path.BLOCKED in states:
+                put(hop, PATH_BLOCKED, "can't carry it (an access port in another VLAN, or a router port without a "
+                                       "subinterface for it)")
+            elif vlan_path.carries(graph, hop, plan.vlan):
+                put(hop, PATH_CARRIES, "on the route: carries it")
+            else:
+                put(hop, PATH_PLANNED, "on the route: " + (note(hop) or "the switches need the VLAN"))
+        devices = set(plan.route) | {step.device for step in plan.changes}
+        return {"vlan": plan.vlan, "devices": devices, "links": links}
 
     def on_map_shown(self):
         if self.page.network_map is not self.network_map:
@@ -1057,6 +1097,7 @@ class VlanPathDialog(QDialog):
             self.thread.stop()
         self.session_sender.stop_waiting()
         self.page.view.set_highlights({})
+        self.page.view.set_path_overlay(None)
         if self.previous_vlan is not None:
             _, shown = self.previous_vlan
             self.previous_vlan = None
