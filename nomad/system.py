@@ -134,14 +134,21 @@ def relaunch_as_admin():
         log.warning("Neither pkexec nor sudo was found to relaunch as admin")
         return False
 
+    # Allow root to connect to user X11 display
+    try:
+        subprocess.run(["xhost", "+si:localuser:root"], capture_output=True)
+    except Exception:
+        pass
+
+    disp = os.environ.get("DISPLAY") or ":0"
     cmd = [elevate_bin]
     if "pkexec" in elevate_bin:
-        # pkexec needs env vars forwarded or wrapper if GUI
-        cmd += ["env", f"DISPLAY={os.environ.get('DISPLAY', ':0')}"]
+        cmd += ["env", f"DISPLAY={disp}"]
         if "XAUTHORITY" in os.environ:
             cmd.append(f"XAUTHORITY={os.environ['XAUTHORITY']}")
         if "WAYLAND_DISPLAY" in os.environ:
             cmd.append(f"WAYLAND_DISPLAY={os.environ['WAYLAND_DISPLAY']}")
+        cmd.append("QT_QPA_PLATFORM=xcb")
     cmd += [executable] + arguments
 
     try:
