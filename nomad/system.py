@@ -120,8 +120,14 @@ def relaunch_as_admin():
 
 
 def _data_dir(environment_variable):
-    """The app's folder under %APPDATA% or %LOCALAPPDATA%, moving over the folder from before the rename."""
-    base = Path(os.environ.get(environment_variable, Path.home()))
+    """The app's folder under %APPDATA% or %LOCALAPPDATA% (or XDG base on Linux), moving over the folder from before the rename."""
+    if os.name == "nt":
+        base = Path(os.environ.get(environment_variable, Path.home()))
+    else:
+        if environment_variable == "APPDATA":
+            base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        else:
+            base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
     path = base / APP_NAME
     legacy = base / LEGACY_APP_NAME
     if not path.exists() and legacy.is_dir():

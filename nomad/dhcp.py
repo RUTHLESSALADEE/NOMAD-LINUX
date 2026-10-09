@@ -326,6 +326,8 @@ def parse_offer(data, transaction_id, sender=""):
 
 def current_dhcp_server(interface_index):
     """The DHCP server this adapter's current lease came from, or "" (static address, or unknown)."""
+    if os.name != "nt":
+        return ""
     try:
         data = run_powershell_json(LEASE_SCRIPT % {"index": int(interface_index)}, timeout=30) or {}
     except Exception:  # Only used to label results; the test works without it

@@ -5,7 +5,9 @@ and spots signs of duplicate IP addresses and ARP spoofing.
 """
 import ctypes
 import ipaddress
+import json
 import logging
+import os
 import socket
 from dataclasses import dataclass, field
 
@@ -89,7 +91,46 @@ def parse_neighbors(data):
 
 def load_neighbors():
     """Read the neighbor table. Slow (about a second); call it off the UI thread."""
-    return parse_neighbors(run_powershell_json(NEIGHBORS_SCRIPT))
+    if os.name == "nt":
+        return parse_neighbors(run_powershell_json(NEIGHBORS_SCRIPT))
+    return load_linux_neighbors()
+
+
+def load_linux_neighbors():
+    """Build a NeighborTable natively from ip -j neigh."""
+    import subprocess
+    import json
+    try:
+        raw = subprocess.run(["ip", "-j", "neigh"], capture_output=True, text=True, check=True).stdout
+        data = json.loads(raw)
+    except Exception as e:
+        log.warning("Failed to run ip -j neigh: %s", e)
+        data = []
+
+    from nomad.neighbors import Neighbor, NeighborTable
+    neighbors = []
+    for item in data:
+        dst = item.get("dst")
+        lladdr = item.get("lladdr")
+        dev = item.get("dev", "")
+        state_list = item.get("state", [])
+        state = state_list[0].lower() if state_list else "unknown"
+
+        if not dst or not lladdr:
+            continue
+
+        family = 6 if ":" in dst else 4
+        mac = lladdr.replace(":", "-").upper()
+        neighbors.append(Neighbor(
+            interface=dev,
+            interface_name=dev,
+            address=dst,
+            mac=mac,
+            state=state,
+            family=family,
+        ))
+
+    return NeighborTable(neighbors, [])
 
 
 def shared_macs(neighbors, networks=None):

@@ -417,6 +417,11 @@ def load_linux_snapshot():
                 pass
 
         adapters[if_index] = adapter
+        if adapter.ipv4:
+            adapter.families.add(4)
+        if adapter.ipv6:
+            adapter.families.add(6)
+        adapter.connected = adapter.status == "Up"
 
     # 2. Routes via ip -j route
     try:
