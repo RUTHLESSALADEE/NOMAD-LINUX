@@ -305,8 +305,11 @@ class Navigator(SidebarNavigator):
         content_layout = QVBoxLayout(self.content)
         content_layout.setContentsMargins(0, 0, 0, 0)
         self.page_title = QLabel()
+        self.page_title.setAutoFillBackground(True)
+        self.page_title.setStyleSheet(f"background-color: {COLORS['panel']}; color: {COLORS['accent']}; font-weight: bold; border-bottom: 1px solid {COLORS['border']};")
         self.page_title.setContentsMargins(12, 6, 12, 6)
         content_layout.addWidget(self.page_title)
+        self.stack.setAutoFillBackground(True)
         content_layout.addWidget(self.stack, 1)
         self.layout().addWidget(self.content, 1)
         self.panel.setParent(self.content)
@@ -579,10 +582,14 @@ class Navigator(SidebarNavigator):
         favorites = settings.value("navigation/favorites", self.favorites)
         if isinstance(favorites, str):
             favorites = [favorites]
+        elif favorites is None:
+            favorites = []
         self.favorites = list(dict.fromkeys(title for title in favorites if title in self.sections))
         recent = settings.value("navigation/recent", [])
         if isinstance(recent, str):
             recent = [recent]
+        elif recent is None:
+            recent = []
         self.recent = [title for title in recent if title in self.sections][:5]
         self.rebuild_rail()
         self.set_sidebar_visible(settings.value("navigation/keep_open", False, bool))

@@ -30,7 +30,7 @@ cat << 'DESKTOPEOF' | sudo tee /usr/local/share/applications/nomad.desktop > /de
 [Desktop Entry]
 Name=NOMAD
 Comment=Network Operations, Monitoring And Diagnostics
-Exec=nomad %F
+Exec=env QT_QPA_PLATFORM=xcb nomad %F
 Icon=nomad
 Terminal=false
 Type=Application
