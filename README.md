@@ -1,4 +1,4 @@
-# NOMAD
+# NOMAD-LINUX
 
 **Network Operations, Monitoring And Diagnostics**: one Windows app to set up network adapters, troubleshoot networks, talk to devices and keep track of IP addresses. (Formerly NIC Manager, with the RADAR subnet sweep and the Latenct latency monitor built in.)
 
