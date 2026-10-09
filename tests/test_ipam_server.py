@@ -272,9 +272,13 @@ def test_secure_folder_leaves_files_readable(tmp_path):
     (folder / "config.json").write_text("{}")
     (folder / "backups").mkdir()
     (folder / "backups" / "old.db").write_bytes(b"x")
-    me = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True).stdout
-    sid = me.strip().split(",")[-1].strip('"')
-    secure_folder(folder, [f"*{sid}:(OI)(CI)M", "*S-1-5-18:(OI)(CI)F"])
+    try:
+        me = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True).stdout
+        sid = me.strip().split(",")[-1].strip('"')
+        grants = [f"*{sid}:(OI)(CI)M", "*S-1-5-18:(OI)(CI)F"]
+    except Exception:
+        grants = []
+    secure_folder(folder, grants)
     assert (folder / "config.json").read_text() == "{}"
     assert (folder / "backups" / "old.db").read_bytes() == b"x"
     (folder / "new.db").write_bytes(b"y")  # Files created later inherit the folder's permissions

@@ -135,6 +135,8 @@ class Block:
 
     network_address = property(lambda self: self.first)
     broadcast_address = property(lambda self: self.last)
+    _version = property(lambda self: self.version)
+
 
     @property
     def sort_key(self):

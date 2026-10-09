@@ -1,6 +1,6 @@
-# NOMAD-LINUX
+# NOMAD
 
-**Network Operations, Monitoring And Diagnostics**: one Windows app to set up network adapters, troubleshoot networks, talk to devices and keep track of IP addresses. (Formerly NIC Manager, with the RADAR subnet sweep and the Latenct latency monitor built in.)
+**Network Operations, Monitoring And Diagnostics**: one Linux app to set up network adapters, troubleshoot networks, talk to devices and keep track of IP addresses. (Formerly NIC Manager, with the RADAR subnet sweep and the Latenct latency monitor built in.)
 
 **Version 1.21.0** adds **MAC Finder**: type a MAC address in any format (or part of one, an IP address or a name) to find the switch and port it's plugged into, from the Network Map's last crawl or live over SNMP, with lists and a history of where each MAC has been. It also adds Ctrl+S / Ctrl+Shift+S for terminal logging and config saving, Add Device to Map and Create Terminal/RDP Session on address menus, and a Key for the Network Map. See the [changelog](CHANGELOG.md#1210---2026-10-06) and [keyboard guide](docs/keyboard-shortcuts.md).
 
@@ -382,36 +382,44 @@ SCP folder-back is now **Alt+Up**; **Alt+Left** switches sessions. Terminal **Ct
 
 | What | Where |
 | --- | --- |
-| Terminal sessions and SSH host keys | `%APPDATA%\NOMAD\sessions.json`, `known_hosts` |
-| Profiles | `%APPDATA%\NOMAD\profiles.json` |
-| Local IPAM networks | `%APPDATA%\NOMAD\ipam.db` |
-| Network maps | `%APPDATA%\NOMAD\maps` |
-| Log (Tools > View Log) | `%LOCALAPPDATA%\NOMAD\nomad.log` |
-| IPAM server | `%ProgramData%\NOMAD\server` |
+| Terminal sessions and SSH host keys | `~/.config/nomad/sessions.json`, `known_hosts` |
+| Profiles | `~/.config/nomad/profiles.json` |
+| Local IPAM networks | `~/.local/share/nomad/ipam.db` |
+| Network maps | `~/.local/share/nomad/maps` |
+| Log (Tools > View Log) | `~/.local/state/nomad/nomad.log` |
+| IPAM server | `/var/lib/nomad/server` |
 
-The first time NOMAD runs, it moves over the folders and settings from NIC Manager.
+The first time NOMAD runs, it creates its configuration directories automatically.
 
 ## Running from source and building
 
-    pip install -r requirements.txt
-    pythonw Main.py
+### One-Click Installer (Desktop & Menu Integration)
 
-Tests, and a standalone exe (`dist\NOMAD-<version>.exe`):
+Run the included install script on Ubuntu, Debian, Arch Linux, or Omarchy:
+
+    sudo ./install.sh
+
+### Running from source
+
+    pip install -r requirements.txt
+    python3 main.py
+
+Tests, and a standalone Linux executable (`dist/NOMAD-<version>-linux-x86_64`):
 
     pip install -r requirements-dev.txt
-    python -m pytest
-    .\build.ps1
+    python3 -m pytest
+    ./build.sh
 
-**Releases:** the version lives in `nomad\__init__.py`. Note changes under Unreleased in `CHANGELOG.md` as you go, then:
+**Releases:** the version lives in `nomad/__init__.py`. Note changes under Unreleased in `CHANGELOG.md` as you go, then:
 
-    python -m nomad.version bump patch     (or minor / major)
+    python3 -m nomad.version bump patch     (or minor / major)
     git add -A
     git commit -m "Release X.Y.Z"
     git tag vX.Y.Z
-    .\build.ps1
+    ./build.sh
 
 ## Third-party software
 
-NOMAD bundles PyQt5 (GPL), paramiko (LGPL 2.1) for SSH, pyte (LGPL 3) for terminal emulation, pyserial (BSD) for serial ports, openpyxl (MIT) for workbooks, and pywin32 (PSF) for the IPAM server service.
+NOMAD bundles PyQt5 (GPL), paramiko (LGPL 2.1) for SSH, pyte (LGPL 3) for terminal emulation, pyserial (BSD) for serial ports, and openpyxl (MIT) for workbooks.
 
 Happy troubleshooting!

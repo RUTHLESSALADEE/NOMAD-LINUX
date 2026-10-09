@@ -148,9 +148,21 @@ def secure_folder(directory, grants=FOLDER_GRANTS):
     server creates later get them too). Setting them on the files directly doesn't work: icacls gives a file no
     permissions at all when handed the folder-only (OI)(CI) flags.
     """
-    _run(["icacls", str(directory), "/inheritance:r", "/grant:r", *grants, "/C", "/Q"])
-    if any(Path(directory).iterdir()):
-        _run(["icacls", str(Path(directory) / "*"), "/reset", "/T", "/C", "/Q"])
+    if os.name == "nt":
+        _run(["icacls", str(directory), "/inheritance:r", "/grant:r", *grants, "/C", "/Q"])
+        if any(Path(directory).iterdir()):
+            _run(["icacls", str(Path(directory) / "*"), "/reset", "/T", "/C", "/Q"])
+    else:
+        # Linux POSIX permissions
+        try:
+            os.chmod(directory, 0o700)
+            for root, dirs, files in os.walk(directory):
+                for d in dirs:
+                    os.chmod(os.path.join(root, d), 0o700)
+                for f in files:
+                    os.chmod(os.path.join(root, f), 0o600)
+        except OSError as e:
+            log.warning("Could not secure folder %s: %s", directory, e)
 
 
 def open_firewall(port, rule=FIREWALL_RULE, protocol="TCP"):

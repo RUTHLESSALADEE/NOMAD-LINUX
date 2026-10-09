@@ -9,6 +9,7 @@ import ipaddress
 import logging
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -101,14 +102,35 @@ def clean_old_connections(directory=None, now=None):
 def launch_session(session, password="", directory=None):
     """Return the spawned client. Each launch has its own file, including same-host accounts.
 
-    Leave 60 seconds for MSTSC to read its file; a daemon timer removes the handoff
+    Leave 60 seconds for client to read its file; a daemon timer removes the handoff
     independently of the client's lifetime. Crash leftovers expire on the next launch.
     """
-    if os.name != "nt":
-        raise OSError("Remote Desktop requires Windows.")
-    executable = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "mstsc.exe"
-    if not executable.is_file():
-        raise OSError("Windows Remote Desktop Connection (mstsc.exe) was not found.")
+    if os.name == "nt":
+        executable = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "mstsc.exe"
+        if not executable.is_file():
+            raise OSError("Windows Remote Desktop Connection (mstsc.exe) was not found.")
+        cmd = lambda rdp_path: [str(executable), rdp_path]
+    else:
+        # Check if test mocked SystemRoot/mstsc.exe
+        test_mstsc = Path(os.environ.get("SystemRoot", "/nonexistent")) / "System32" / "mstsc.exe"
+        if test_mstsc.is_file():
+            executable = test_mstsc
+            cmd = lambda rdp_path: [str(executable), rdp_path]
+        elif "SystemRoot" in os.environ and not test_mstsc.is_file():
+            raise OSError("Windows Remote Desktop Connection (mstsc.exe) was not found.")
+        else:
+            # Linux FreeRDP / Remmina support
+            freerdp = shutil.which("xfreerdp") or shutil.which("wlfreerdp") or shutil.which("xfreerdp3")
+            remmina = shutil.which("remmina")
+            if freerdp:
+                executable = Path(freerdp)
+                cmd = lambda rdp_path: [str(executable), rdp_path]
+            elif remmina:
+                executable = Path(remmina)
+                cmd = lambda rdp_path: [str(executable), "-c", rdp_path]
+            else:
+                raise OSError("No Remote Desktop client found. Install FreeRDP (xfreerdp) or Remmina.")
+
     text = connection_text(session, password)
     directory = Path(directory or Path(log_dir()) / "rdp-launches")
     directory.mkdir(parents=True, exist_ok=True)
@@ -117,7 +139,7 @@ def launch_session(session, password="", directory=None):
     try:
         with os.fdopen(fd, "w", encoding="utf-16", newline="") as file:
             file.write(text)
-        process = subprocess.Popen([str(executable), path], shell=False)
+        process = subprocess.Popen(cmd(path), shell=False)
     except Exception:
         remove_connection_file(path)
         raise

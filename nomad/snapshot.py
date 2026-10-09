@@ -5,7 +5,9 @@ JSON, so parsing doesn't depend on the Windows display language.
 """
 import ipaddress
 import logging
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from .system import run_powershell_json
@@ -341,7 +343,135 @@ def dns_is_static(guid):
 
 def load_snapshot():
     """Read the current network configuration. Slow (about a second); call it off the UI thread."""
-    data = run_powershell_json(SNAPSHOT_SCRIPT)
-    snapshot = parse_snapshot(data, dns_is_static)
+    if os.name == "nt":
+        data = run_powershell_json(SNAPSHOT_SCRIPT)
+        snapshot = parse_snapshot(data, dns_is_static)
+    else:
+        snapshot = load_linux_snapshot()
     log.debug("Loaded snapshot: %d interfaces, %d routes", len(snapshot.adapters), len(snapshot.routes))
     return snapshot
+
+
+def load_linux_snapshot():
+    """Build a NetworkSnapshot natively from Linux iproute2 / sysfs / resolvectl."""
+    import subprocess
+    import json
+    import ipaddress
+    adapters = {}
+    routes = []
+
+    # 1. Links & Addresses via ip -j addr
+    try:
+        raw_addr = subprocess.run(["ip", "-j", "addr"], capture_output=True, text=True, check=True).stdout
+        addr_list = json.loads(raw_addr)
+    except Exception as e:
+        log.warning("Failed to run ip -j addr: %s", e)
+        addr_list = []
+
+    for item in addr_list:
+        if_index = str(item.get("ifindex", 0))
+        name = item.get("ifname", "")
+        flags = item.get("flags", [])
+        operstate = item.get("operstate", "").upper()
+        
+        status = "Up" if operstate == "UP" else "Disabled" if "UP" not in flags else "Disconnected"
+        mac = item.get("address", "").replace(":", "-").upper()
+        mtu = item.get("mtu", 1500)
+        
+        # Read speed if available
+        speed = 0
+        speed_path = Path(f"/sys/class/net/{name}/speed")
+        try:
+            if speed_path.is_file():
+                speed = int(speed_path.read_text().strip()) * 1_000_000
+        except Exception:
+            pass
+
+        adapter = Adapter(
+            index=if_index,
+            name=name,
+            description=name,
+            status=status,
+            mac=mac,
+            speed_bps=speed,
+            guid=name,
+            is_adapter=(name != "lo"),
+            metric4=100,
+            metric6=100,
+            mtu4=mtu,
+            mtu6=mtu,
+        )
+
+        for addr_info in item.get("addr_info", []):
+            family = addr_info.get("family")
+            local = addr_info.get("local")
+            prefixlen = addr_info.get("prefixlen")
+            if not local or prefixlen is None:
+                continue
+            try:
+                if family == "inet":
+                    adapter.ipv4.append(ipaddress.ip_interface(f"{local}/{prefixlen}"))
+                elif family == "inet6":
+                    adapter.ipv6.append(ipaddress.ip_interface(f"{local}/{prefixlen}"))
+            except ValueError:
+                pass
+
+        adapters[if_index] = adapter
+
+    # 2. Routes via ip -j route
+    try:
+        raw_routes = subprocess.run(["ip", "-j", "route"], capture_output=True, text=True, check=True).stdout
+        route_list = json.loads(raw_routes)
+    except Exception as e:
+        log.warning("Failed to run ip -j route: %s", e)
+        route_list = []
+
+    from nomad.snapshot import Route
+    for r in route_list:
+        dst = r.get("dst", "default")
+        dev = r.get("dev", "")
+        gateway = r.get("gateway", "")
+        metric = r.get("metric", 0)
+        
+        net_str = "0.0.0.0/0" if dst == "default" else dst
+        if "/" not in net_str:
+            net_str = f"{net_str}/32"
+        try:
+            net = ipaddress.ip_network(net_str, strict=False)
+        except ValueError:
+            continue
+
+        on_link = not gateway
+        gw_display = gateway if gateway else "On-link"
+        routes.append(Route(
+            family=net.version,
+            network=net,
+            gateway=gw_display,
+            interface=dev,
+            route_metric=metric,
+            interface_metric=0,
+            persistent=False,
+            active=True,
+        ))
+
+        # Assign gateway to adapter
+        for a in adapters.values():
+            if a.name == dev and gateway and gateway not in a.gateways4:
+                a.gateways4.append(gateway)
+
+    # 3. DNS via resolvectl or /etc/resolv.conf
+    dns_servers = []
+    try:
+        with open("/etc/resolv.conf", "r") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 2 and parts[0] == "nameserver":
+                    dns_servers.append(parts[1])
+    except Exception:
+        pass
+
+    for a in adapters.values():
+        if a.status == "Up" and not a.dns4:
+            a.dns4.extend(dns_servers)
+
+    return NetworkSnapshot(adapters, routes)

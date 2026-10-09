@@ -1,19 +1,39 @@
 """TCP connections and listening TCP/UDP ports with the program that owns each (what netstat -ano shows).
 
-Reads the tables straight from the IP Helper API, so it's quick enough to refresh every couple of seconds
-and doesn't depend on the Windows display language.
+Reads the tables straight from the IP Helper API on Windows or /proc/net on Linux, so it's quick enough
+to refresh every couple of seconds and doesn't depend on the Windows display language.
 """
 import ctypes
+import glob
 import ipaddress
+import os
 import socket
-from ctypes import wintypes
+import struct
+import sys
 from dataclasses import dataclass
+
+if sys.platform == "win32":
+    from ctypes import wintypes
+else:
+    class _WinTypes:
+        DWORD = ctypes.c_uint32
+        HANDLE = ctypes.c_void_p
+        c_wchar = ctypes.c_wchar
+        c_long = ctypes.c_long
+        c_size_t = ctypes.c_size_t
+        c_ubyte = ctypes.c_ubyte
+    wintypes = _WinTypes()
 
 TCP = "TCP"
 UDP = "UDP"
 LISTENING = "Listening"
-TCP_STATES = {1: "Closed", 2: LISTENING, 3: "SYN sent", 4: "SYN received", 5: "Established", 6: "FIN wait 1",
-              7: "FIN wait 2", 8: "Close wait", 9: "Closing", 10: "Last ACK", 11: "Time wait", 12: "Delete TCB"}
+TCP_STATES = {1: "Established", 2: "SYN sent", 3: "SYN received", 4: "FIN wait 1",
+              5: "FIN wait 2", 6: "Time wait", 7: "Closed", 8: "Close wait",
+              9: "Last ACK", 10: LISTENING, 11: "Closing"}
+# Note: Windows MIB states have different numeric IDs:
+WIN_TCP_STATES = {1: "Closed", 2: LISTENING, 3: "SYN sent", 4: "SYN received", 5: "Established", 6: "FIN wait 1",
+                  7: "FIN wait 2", 8: "Close wait", 9: "Closing", 10: "Last ACK", 11: "Time wait", 12: "Delete TCB"}
+
 TCP_TABLE_OWNER_PID_ALL = 5
 UDP_TABLE_OWNER_PID = 1
 ERROR_INSUFFICIENT_BUFFER = 122
@@ -127,6 +147,27 @@ def _read_table(function, family, table_class, row_class):
 
 def process_names():
     """{pid: executable name} for every running process (names are visible without administrator rights)."""
+    if sys.platform != "win32":
+        names = {}
+        for proc_path in glob.glob("/proc/[0-9]*"):
+            try:
+                pid = int(os.path.basename(proc_path))
+                exe_link = os.path.join(proc_path, "exe")
+                if os.path.islink(exe_link):
+                    try:
+                        exe_name = os.path.basename(os.readlink(exe_link))
+                        if exe_name:
+                            names[pid] = exe_name
+                            continue
+                    except OSError:
+                        pass
+                comm_path = os.path.join(proc_path, "comm")
+                with open(comm_path, "r", encoding="utf-8", errors="replace") as f:
+                    names[pid] = f.read().strip()
+            except (OSError, ValueError):
+                pass
+        return names
+
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
     kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
@@ -149,19 +190,115 @@ def process_names():
     return names
 
 
+def _linux_parse_ipv4(hex_str):
+    return socket.inet_ntoa(struct.pack("<I", int(hex_str, 16)))
+
+
+def _linux_parse_ipv6(hex_str):
+    raw = bytes.fromhex(hex_str)
+    words = struct.unpack("<4I", raw)
+    be = struct.pack(">4I", *words)
+    return str(ipaddress.IPv6Address(be))
+
+
+def _linux_socket_inodes():
+    """Map socket inode string to owning PID."""
+    inode_to_pid = {}
+    for fd_path in glob.glob("/proc/[0-9]*/fd/*"):
+        try:
+            target = os.readlink(fd_path)
+            if target.startswith("socket:["):
+                inode = target[8:-1]
+                pid = int(fd_path.split("/")[2])
+                inode_to_pid[inode] = pid
+        except OSError:
+            pass
+    return inode_to_pid
+
+
+def _linux_list_connections():
+    inode_to_pid = _linux_socket_inodes()
+    names = process_names()
+    connections = []
+
+    files = [
+        ("/proc/net/tcp", TCP, 4),
+        ("/proc/net/tcp6", TCP, 6),
+        ("/proc/net/udp", UDP, 4),
+        ("/proc/net/udp6", UDP, 6),
+    ]
+
+    for path, proto, family in files:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+        if len(lines) <= 1:
+            continue
+        for line in lines[1:]:
+            parts = line.strip().split()
+            if len(parts) < 10:
+                continue
+            local_addr_str, local_port_str = parts[1].split(":")
+            remote_addr_str, remote_port_str = parts[2].split(":")
+            st_hex = int(parts[3], 16)
+            inode = parts[9]
+
+            local_port = int(local_port_str, 16)
+            remote_port = int(remote_port_str, 16)
+
+            if family == 4:
+                local_addr = _linux_parse_ipv4(local_addr_str)
+                remote_addr = _linux_parse_ipv4(remote_addr_str)
+            else:
+                local_addr = _linux_parse_ipv6(local_addr_str)
+                remote_addr = _linux_parse_ipv6(remote_addr_str)
+
+            if proto == TCP:
+                state = TCP_STATES.get(st_hex, str(st_hex))
+                if state == LISTENING:
+                    remote_addr = ""
+                    remote_port = 0
+            else:
+                state = ""
+                remote_addr = ""
+                remote_port = 0
+
+            pid = inode_to_pid.get(inode, 0)
+            proc_name = names.get(pid, "")
+
+            connections.append(Connection(
+                protocol=proto,
+                local_address=local_addr,
+                local_port=local_port,
+                remote_address=remote_addr,
+                remote_port=remote_port,
+                state=state,
+                pid=pid,
+                process=proc_name
+            ))
+    return connections
+
+
 def list_connections():
     """Every TCP connection and listening socket, and every UDP endpoint, with its owning process."""
+    if sys.platform != "win32":
+        return _linux_list_connections()
+
     api = ctypes.WinDLL("iphlpapi")
     connections = []
     for row in _read_table(api.GetExtendedTcpTable, socket.AF_INET, TCP_TABLE_OWNER_PID_ALL, MIB_TCPROW_OWNER_PID):
-        state = TCP_STATES.get(row.dwState, str(row.dwState))
+        state = WIN_TCP_STATES.get(row.dwState, str(row.dwState))
         remote = "" if state == LISTENING else ipv4_from_dword(row.dwRemoteAddr)
         connections.append(Connection(TCP, ipv4_from_dword(row.dwLocalAddr), port_from_dword(row.dwLocalPort),
                                       remote, 0 if state == LISTENING else port_from_dword(row.dwRemotePort),
                                       state, row.dwOwningPid))
     for row in _read_table(api.GetExtendedTcpTable, socket.AF_INET6, TCP_TABLE_OWNER_PID_ALL,
                            MIB_TCP6ROW_OWNER_PID):
-        state = TCP_STATES.get(row.dwState, str(row.dwState))
+        state = WIN_TCP_STATES.get(row.dwState, str(row.dwState))
         remote = "" if state == LISTENING else ipv6_text(row.ucRemoteAddr, row.dwRemoteScopeId)
         connections.append(Connection(TCP, ipv6_text(row.ucLocalAddr, row.dwLocalScopeId),
                                       port_from_dword(row.dwLocalPort), remote,
