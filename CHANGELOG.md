@@ -6,6 +6,14 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+### Fixed
+
+- **Navigation Settings (`nomad/ui/navigation.py`)**: Fixed crash `TypeError: 'NoneType' object is not iterable` during `restore_settings` when `navigation/recent` or `navigation/favorites` is stored as `@Invalid()` or `None` in `NOMAD.conf`.
+- **Linux / Wayland Rendering (`main.py`, `nomad/ui/navigation.py`)**:
+  - Automatically fallback/prefer `xcb` (XWayland) when running under Wayland sessions (`QT_QPA_PLATFORM="xcb;wayland"`) if not explicitly overridden, resolving sub-surface buffer ghosting, unmapping glitches, and dropdown label truncation on Wayland compositors (Hyprland, Sway).
+  - Explicitly filled background on `page_title` and page stack to eliminate transparent widget underdraw and ghosted section headers.
+- **Session Manager (`nomad/ui/session_manager.py`)**: Increased sidebar minimum width from 170px to 240px to prevent text truncation ("No mast...assword") in the master password protection button.
+
 ## [1.24.2] - 2026-10-08
 
 ### Added

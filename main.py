@@ -4,6 +4,7 @@ Run with:  python Main.py   (or pythonw Main.py to avoid a console window)
 """
 import ctypes
 import logging
+import os
 import sys
 import traceback
 
@@ -60,6 +61,11 @@ def main():
         from nomad.ipam.server import run_in_foreground
         run_in_foreground()
         return
+    # On Linux/Wayland, prefer xcb (XWayland) if available to avoid dirty-rectangle and buffer unmapping glitches in PyInstaller Qt5
+    if sys.platform.startswith("linux") and "QT_QPA_PLATFORM" not in os.environ:
+        if os.environ.get("WAYLAND_DISPLAY"):
+            os.environ["QT_QPA_PLATFORM"] = "xcb;wayland"
+
     memory_log_handler = setup_logging()
     install_exception_hook()
     log.info("Starting %s %s", APP_NAME, __version__)

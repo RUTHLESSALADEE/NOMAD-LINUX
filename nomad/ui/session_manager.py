@@ -123,7 +123,7 @@ class SessionManager(QWidget):
         self.protocols = protocols
         self.settings_prefix = settings_prefix
         self.collapsed = set()
-        self.setMinimumWidth(170)
+        self.setMinimumWidth(240)
         manager_layout = QVBoxLayout(self)
         manager_layout.setContentsMargins(4, 4, 2, 4)
         manager_layout.setSpacing(4)
