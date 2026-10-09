@@ -422,4 +422,10 @@ Tests, and a standalone Linux executable (`dist/NOMAD-<version>-linux-x86_64`):
 
 NOMAD bundles PyQt5 (GPL), paramiko (LGPL 2.1) for SSH, pyte (LGPL 3) for terminal emulation, pyserial (BSD) for serial ports, and openpyxl (MIT) for workbooks.
 
+## Contributors & Credits
+
+- **Original Project (Windows)**: [nousernamesavailabel](https://github.com/nousernamesavailabel) (Jared Polack) & [claude](https://github.com/claude) (Claude Opus)
+- **Linux Port & Maintenance**: [RUTHLESSALADEE](https://github.com/RUTHLESSALADEE) (Jordan Owens)
+- **Co-Authored-By**: Hermes Agent / Ultron (google/gemini-3.8-flash via Nous Research)
+
 Happy troubleshooting!
