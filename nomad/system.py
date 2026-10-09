@@ -96,27 +96,60 @@ def run_powershell_json(script, timeout=120):
 
 
 def is_admin():
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except (AttributeError, OSError):
-        return False
+    if os.name == "nt":
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except (AttributeError, OSError):
+            return False
+    return os.geteuid() == 0
 
 
 def relaunch_as_admin():
     """Start a new elevated copy of the app. Returns False if the user declined the UAC prompt."""
+    if os.name == "nt":
+        if getattr(sys, "frozen", False):
+            executable, arguments = sys.executable, sys.argv[1:]
+        else:
+            executable = sys.executable
+            # Prefer pythonw so the elevated copy doesn't open a console window
+            pythonw = Path(executable).with_name("pythonw.exe")
+            if pythonw.exists():
+                executable = str(pythonw)
+            arguments = [os.path.abspath(sys.argv[0])] + sys.argv[1:]
+        result = ctypes.windll.shell32.ShellExecuteW(None, "runas", executable, subprocess.list2cmdline(arguments),
+                                                     os.getcwd(), 1)
+        log.info("Relaunch as administrator returned %s", result)
+        return result > 32
+
+    # Linux implementation using pkexec / sudo
     if getattr(sys, "frozen", False):
         executable, arguments = sys.executable, sys.argv[1:]
     else:
-        executable = sys.executable
-        # Prefer pythonw so the elevated copy doesn't open a console window
-        pythonw = Path(executable).with_name("pythonw.exe")
-        if pythonw.exists():
-            executable = str(pythonw)
-        arguments = [os.path.abspath(sys.argv[0])] + sys.argv[1:]
-    result = ctypes.windll.shell32.ShellExecuteW(None, "runas", executable, subprocess.list2cmdline(arguments),
-                                                 os.getcwd(), 1)
-    log.info("Relaunch as administrator returned %s", result)
-    return result > 32
+        executable, arguments = sys.executable, [os.path.abspath(sys.argv[0])] + sys.argv[1:]
+
+    # Preserve display environment for graphical elevation under pkexec
+    env = os.environ.copy()
+    elevate_bin = shutil.which("pkexec") or shutil.which("sudo")
+    if not elevate_bin:
+        log.warning("Neither pkexec nor sudo was found to relaunch as admin")
+        return False
+
+    cmd = [elevate_bin]
+    if "pkexec" in elevate_bin:
+        # pkexec needs env vars forwarded or wrapper if GUI
+        cmd += ["env", f"DISPLAY={os.environ.get('DISPLAY', ':0')}"]
+        if "XAUTHORITY" in os.environ:
+            cmd.append(f"XAUTHORITY={os.environ['XAUTHORITY']}")
+        if "WAYLAND_DISPLAY" in os.environ:
+            cmd.append(f"WAYLAND_DISPLAY={os.environ['WAYLAND_DISPLAY']}")
+    cmd += [executable] + arguments
+
+    try:
+        subprocess.Popen(cmd, shell=False)
+        return True
+    except Exception as e:
+        log.error("Failed to relaunch as admin on Linux: %s", e)
+        return False
 
 
 def _data_dir(environment_variable):
