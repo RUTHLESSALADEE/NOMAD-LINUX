@@ -21,13 +21,29 @@ sudo install -m 755 "$BIN_SOURCE" /usr/local/bin/nomad
 echo "Installing elevation wrapper..."
 cat << 'WRAPPEREOF' | sudo tee /usr/local/bin/nomad-pkexec > /dev/null
 #!/usr/bin/env bash
-export DISPLAY="${DISPLAY:-:0}"
-if [ -n "$XAUTHORITY" ]; then
-    export XAUTHORITY="$XAUTHORITY"
-elif [ -f "/home/$USER/.Xauthority" ]; then
-    export XAUTHORITY="/home/$USER/.Xauthority"
+# Nomad elevation wrapper supporting Wayland (Hyprland, Omarchy) and X11 (Ubuntu)
+TARGET_UID="${PKEXEC_UID:-$SUDO_UID}"
+if [ -z "$TARGET_UID" ]; then
+    TARGET_UID="$(id -u)"
 fi
-export QT_QPA_PLATFORM="xcb"
+TARGET_USER="$(id -un "$TARGET_UID")"
+RUNTIME_DIR="/run/user/$TARGET_UID"
+
+WAYLAND_SOCK="$(ls -t "$RUNTIME_DIR"/wayland-* 2>/dev/null | grep -v "\.lock$" | head -n 1)"
+
+if [ -n "$WAYLAND_SOCK" ]; then
+    export XDG_RUNTIME_DIR="$RUNTIME_DIR"
+    export WAYLAND_DISPLAY="$(basename "$WAYLAND_SOCK")"
+    export QT_QPA_PLATFORM="wayland"
+else
+    export DISPLAY="${DISPLAY:-:0}"
+    XAUTH_FILE="/home/$TARGET_USER/.Xauthority"
+    if [ -f "$XAUTH_FILE" ]; then
+        export XAUTHORITY="$XAUTH_FILE"
+    fi
+    export QT_QPA_PLATFORM="xcb"
+fi
+
 exec /usr/local/bin/nomad "$@"
 WRAPPEREOF
 sudo chmod 755 /usr/local/bin/nomad-pkexec
