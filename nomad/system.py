@@ -142,15 +142,12 @@ def relaunch_as_admin():
         pass
 
     disp = os.environ.get("DISPLAY") or ":0"
-    cmd = [elevate_bin]
     if "pkexec" in elevate_bin:
-        cmd += ["env", f"DISPLAY={disp}"]
-        if "XAUTHORITY" in os.environ:
-            cmd.append(f"XAUTHORITY={os.environ['XAUTHORITY']}")
-        if "WAYLAND_DISPLAY" in os.environ:
-            cmd.append(f"WAYLAND_DISPLAY={os.environ['WAYLAND_DISPLAY']}")
-        cmd.append("QT_QPA_PLATFORM=xcb")
-    cmd += [executable] + arguments
+        # polkit action /usr/share/polkit-1/actions/com.nomad.network.policy matches /usr/local/bin/nomad directly
+        # and has org.freedesktop.policykit.exec.allow_gui set to true
+        cmd = [elevate_bin, executable] + arguments
+    else:
+        cmd = [elevate_bin, executable] + arguments
 
     try:
         subprocess.Popen(cmd, shell=False)
