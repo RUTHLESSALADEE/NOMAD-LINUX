@@ -369,7 +369,8 @@ def open_in_program(path, program=""):
         if program:
             subprocess.Popen([program, path], close_fds=True)
         else:
-            os.startfile(path)
+            from ..system import open_path
+            open_path(path)
     except OSError as error:
         return f"Couldn't open {os.path.basename(path)}{' in ' + os.path.basename(program) if program else ''}: " \
                f"{error.strerror or error}"

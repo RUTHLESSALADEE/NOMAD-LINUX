@@ -470,7 +470,8 @@ class FileSessionView(PromptAnswers, QWidget):
 
     def local_properties(self, entry):
         try:
-            os.startfile(entry.path, "properties")
+            from ..system import open_path
+            open_path(entry.path)
         except OSError as error:
             self.fail("Properties", str(error.strerror or error))
 

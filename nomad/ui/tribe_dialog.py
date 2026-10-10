@@ -111,7 +111,8 @@ class TribeDialog(QDialog):
         self.uninstall_button.clicked.connect(self.uninstall)
         self.save_key_button.clicked.connect(self.save_key)
         self.change_key_button.clicked.connect(self.change_key)
-        self.open_folder_button.clicked.connect(lambda: os.startfile(server_dir()))
+        from ..system import open_path
+        self.open_folder_button.clicked.connect(lambda: open_path(server_dir()))
         self.busy = False
         self.refresh()
 

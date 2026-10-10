@@ -179,7 +179,8 @@ class TftpTab(QWidget):
         folder = self.folder_input.text().strip()
         try:
             os.makedirs(folder, exist_ok=True)
-            os.startfile(folder)
+            from ..system import open_path
+            open_path(folder)
         except OSError as error:
             QMessageBox.critical(self, "Open Folder", f"Couldn't open {folder}:\n\n{error}")
 

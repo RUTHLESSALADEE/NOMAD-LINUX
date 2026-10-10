@@ -498,7 +498,8 @@ class LocalPane(FilePane):
 
     def open_file(self, entry):
         try:
-            os.startfile(entry.path)
+            from ..system import open_path
+            open_path(entry.path)
         except OSError as error:
             self.status.setText(f"Couldn't open {entry.name}: {error.strerror or error}")
 

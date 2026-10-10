@@ -596,9 +596,12 @@ class MainWindow(QMainWindow):
 
     def restart_as_admin(self):
         self.save_settings()
-        if relaunch_as_admin():
-            for tab in self.all_tabs:
+        for tab in self.all_tabs:
+            try:
                 tab.shutdown()
+            except Exception as e:
+                log.warning("Error shutting down tab during admin restart: %s", e)
+        if relaunch_as_admin():
             self.hide()
             QApplication.quit()
         else:
@@ -696,7 +699,12 @@ class MainWindow(QMainWindow):
     def open_default_apps(self):
         """Windows Settings page for choosing the browser that the Sweep tab's Open in Browser uses."""
         try:
-            os.startfile("ms-settings:defaultapps")
+            from ..system import open_path
+            from ..logs import log_file_path
+            if os.name == "nt":
+                os.startfile("ms-settings:defaultapps")
+            else:
+                open_path(log_file_path().parent)
         except OSError as error:
             QMessageBox.critical(self, "Default Apps", f"Couldn't open Windows Default Apps settings:\n\n{error}")
 
