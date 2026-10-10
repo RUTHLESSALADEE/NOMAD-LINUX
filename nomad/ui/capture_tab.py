@@ -2,6 +2,7 @@
 import logging
 import os
 import subprocess
+import sys
 
 from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, \
@@ -293,7 +294,11 @@ class CaptureTab(QWidget):
         folder = os.path.dirname(path)
         try:
             if self.saved_path and os.path.isfile(self.saved_path):
-                subprocess.Popen(["explorer", "/select,", os.path.normpath(self.saved_path)])
+                if sys.platform == "win32":
+                    subprocess.Popen(["explorer", "/select,", os.path.normpath(self.saved_path)])
+                else:
+                    from ..system import open_path
+                    open_path(folder)
             else:
                 from ..system import open_path
                 open_path(folder)

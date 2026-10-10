@@ -1,6 +1,7 @@
 """The saved-session sidebar: quick connect, a filter, the session tree (folders, Recent), editing, importing and the
 master password button. Shared by the Terminal page (every protocol) and the SCP page (SSH only), which use the same
 session store."""
+import sys
 import time
 
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
@@ -291,11 +292,12 @@ class SessionManager(QWidget):
 
     def update_protection(self):
         vault = self.store.vault
+        acct_label = "Windows account" if sys.platform == "win32" else "user account"
         if vault.enabled:
             text = "Master password " + ("unlocked" if vault.unlocked else "locked")
-            tip = "Saved passwords need your Windows account and the master password."
+            tip = f"Saved passwords need your {acct_label} and the master password."
         else:
-            text, tip = "No master password", "Saved passwords are protected by your Windows account."
+            text, tip = "No master password", f"Saved passwords are protected by your {acct_label}."
         self.protection_button.setText(text)
         self.protection_button.setToolTip(tip + " Click to manage the master password.")
 

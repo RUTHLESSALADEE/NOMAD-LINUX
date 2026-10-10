@@ -191,7 +191,7 @@ class AboutDialog(QDialog):
         header.addStretch()
         layout.addLayout(header)
 
-        description = QLabel("A friendlier front end for Windows network settings: adapters, routes, MTU, ping, "
+        description = QLabel("A friendlier front end for network settings: adapters, routes, MTU, ping, "
                              "traceroute, latency monitoring, iperf bandwidth tests, DNS lookups and subnet sweeps.")
         description.setWordWrap(True)
         layout.addWidget(description)

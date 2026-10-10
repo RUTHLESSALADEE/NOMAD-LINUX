@@ -6,7 +6,9 @@ Files dragged from one pane to the other, or from Windows Explorer, arrive throu
 import ctypes
 import json
 import os
+import stat
 import string
+import sys
 import time
 
 from PyQt5.QtCore import QEvent, QMimeData, QUrl, Qt, pyqtSignal
@@ -481,10 +483,13 @@ class LocalPane(FilePane):
 
     def list_folder(self, path, done):
         if path == "":
-            # Windows' list of drive letters: asking each drive if it exists can hang on a disconnected network drive
-            mask = ctypes.windll.kernel32.GetLogicalDrives()
-            drives = [f"{letter}:\\" for index, letter in enumerate(string.ascii_uppercase) if mask >> index & 1]
-            done("", [Entry(drive[:2], drive, is_dir=True) for drive in drives])
+            if sys.platform == "win32" and hasattr(ctypes, "windll"):
+                mask = ctypes.windll.kernel32.GetLogicalDrives()
+                drives = [f"{letter}:\\" for index, letter in enumerate(string.ascii_uppercase) if mask >> index & 1]
+                done("", [Entry(drive[:2], drive, is_dir=True) for drive in drives])
+            else:
+                # On Linux, list root / and standard mounts
+                done("", [Entry("/", "/", is_dir=True), Entry("home", os.path.expanduser("~"), is_dir=True)])
             return
         self.status.setText("Listing...")
         # Off the UI thread: a slow network share or a drive that's gone mustn't freeze the window

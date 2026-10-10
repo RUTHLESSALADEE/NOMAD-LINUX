@@ -505,7 +505,7 @@ class FileSessionView(PromptAnswers, QWidget):
                     menu.addAction("Edit\tF4", lambda: self.open_remote_file(files[0]))
                     edit_with = menu.addMenu("Edit With")
                     program = self.settings().value(EDITOR_SETTING, "", str)
-                    edit_with.addAction("Windows' Default Program", lambda: self.edit_external(files[0], ""))
+                    edit_with.addAction("Default Program", lambda: self.edit_external(files[0], ""))
                     if program:
                         edit_with.addAction(os.path.basename(program), lambda: self.edit_external(files[0], program))
                     edit_with.addAction("Choose Program...", lambda: self.choose_editor(files[0]))

@@ -402,8 +402,9 @@ class PortsTab(QWidget):
             self.window.show_status(f"Opened {url}.", "info")
         elif result.port == 3389:
             try:
-                subprocess.Popen(["mstsc.exe", f"/v:{target}"])
-            except OSError as error:
+                from ..rdp import launch_session
+                launch_session({"host": host, "port": result.port})
+            except Exception as error:
                 QMessageBox.critical(self, "Remote Desktop", f"Couldn't start Remote Desktop:\n\n{error}")
         elif result.port == 22:
             self.window.terminal_tab.open_address(host, "SSH")

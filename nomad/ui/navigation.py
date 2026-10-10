@@ -606,3 +606,6 @@ class Navigator(SidebarNavigator):
             self.page_title.setText(title)
             self.recent = [title] + [name for name in self.recent if name != title][:4]
             self.rebuild_rail()
+        # Ensure the previous widget's dirty regions are immediately redrawn on Linux/X11/Wayland
+        if self.currentWidget():
+            self.currentWidget().update()
