@@ -300,6 +300,7 @@ class NetworkResetTab(QWidget):
 
     def open_settings(self, page):
         try:
-            os.startfile(page)
+            from ..system import open_path
+            open_path(page)
         except OSError as error:
             QMessageBox.critical(self, "Windows Settings", f"Couldn't open Windows Settings:\n\n{error}")

@@ -175,7 +175,8 @@ class ReportDialog(QDialog):
                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
         if reply == QMessageBox.Yes:
             try:
-                os.startfile(path)
+                from ..system import open_path
+                open_path(path)
             except OSError as error:
                 QMessageBox.warning(self, "Open Report", f"Couldn't open the report:\n\n{error}")
 

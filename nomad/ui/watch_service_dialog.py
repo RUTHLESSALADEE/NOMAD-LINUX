@@ -66,7 +66,8 @@ class MapWatcherDialog(QDialog):
         self.stop_button.clicked.connect(lambda: self.run("Stopping the service...", lambda: service().stop(
             watch_service.spec()), "Stopped."))
         self.uninstall_button.clicked.connect(self.uninstall)
-        self.folder_button.clicked.connect(lambda: os.startfile(watch_service.watcher_dir()))
+        from ..system import open_path
+        self.folder_button.clicked.connect(lambda: open_path(watch_service.watcher_dir()))
         self.busy = False
         self.fill()
         self.refresh()

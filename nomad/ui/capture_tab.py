@@ -295,7 +295,8 @@ class CaptureTab(QWidget):
             if self.saved_path and os.path.isfile(self.saved_path):
                 subprocess.Popen(["explorer", "/select,", os.path.normpath(self.saved_path)])
             else:
-                os.startfile(folder)
+                from ..system import open_path
+                open_path(folder)
         except OSError as error:
             QMessageBox.critical(self, "Open Folder", f"Couldn't open {folder}:\n\n{error}")
 

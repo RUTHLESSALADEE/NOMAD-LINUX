@@ -93,7 +93,8 @@ class LogDialog(QDialog):
         copy_button = QPushButton("Copy All")
         copy_button.clicked.connect(lambda: QApplication.clipboard().setText(self.text.toPlainText()))
         open_button = QPushButton("Open Log Folder")
-        open_button.clicked.connect(lambda: os.startfile(log_file_path().parent))
+        from ..system import open_path
+        open_button.clicked.connect(lambda: open_path(log_file_path().parent))
         close_button = QPushButton("Close")
         close_button.clicked.connect(self.close)
         button_layout.addWidget(copy_button)

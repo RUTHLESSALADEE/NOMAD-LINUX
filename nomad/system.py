@@ -157,6 +157,16 @@ def relaunch_as_admin():
         return False
 
 
+def open_path(path):
+    """Open a file or directory with the system default application."""
+    if os.name == "nt":
+        os.startfile(str(path))
+    else:
+        opener = shutil.which("xdg-open")
+        if opener:
+            subprocess.Popen([opener, str(path)], shell=False)
+
+
 def _data_dir(environment_variable):
     """The app's folder under %APPDATA% or %LOCALAPPDATA% (or XDG base on Linux), moving over the folder from before the rename."""
     if os.name == "nt":
