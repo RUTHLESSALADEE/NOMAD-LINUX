@@ -1,15 +1,28 @@
 """ICMP echo (ping), traceroute probes and path MTU discovery.
 
-Uses the Windows IP Helper API directly instead of parsing ping.exe output, so results
-don't depend on the Windows display language.
+Uses the Windows IP Helper API directly on Windows, and system ping / raw sockets on Linux.
 """
 import ctypes
 import ipaddress
 import math
+import re
 import socket
-from ctypes import wintypes
+import subprocess
+import sys
+import time
 from dataclasses import dataclass, field
 from typing import Optional
+
+try:
+    from ctypes import wintypes
+except (ImportError, ValueError):
+    class _WinTypes:
+        HANDLE = ctypes.c_void_p
+        DWORD = ctypes.c_uint32
+        WORD = ctypes.c_uint16
+        LPVOID = ctypes.c_void_p
+        BOOL = ctypes.c_int
+    wintypes = _WinTypes()
 
 IP_SUCCESS = 0
 IP_BUF_TOO_SMALL = 11001
@@ -98,6 +111,8 @@ def _api():
     """Load iphlpapi.dll lazily so this module can be imported (and tested) anywhere."""
     global _iphlpapi
     if _iphlpapi is None:
+        if not hasattr(ctypes, "WinDLL"):
+            return None
         dll = ctypes.WinDLL("iphlpapi", use_last_error=True)
         dll.IcmpCreateFile.restype = wintypes.HANDLE
         dll.Icmp6CreateFile.restype = wintypes.HANDLE
@@ -159,10 +174,13 @@ class IcmpClient:
 
     def __init__(self, family):
         self.family = family
-        api = _api()
-        self.handle = api.IcmpCreateFile() if family == 4 else api.Icmp6CreateFile()
-        if not self.handle or self.handle == wintypes.HANDLE(-1).value:
-            raise OSError(ctypes.get_last_error(), "Could not open an ICMP handle.")
+        self.handle = None
+        if sys.platform == "win32":
+            api = _api()
+            if api:
+                self.handle = api.IcmpCreateFile() if family == 4 else api.Icmp6CreateFile()
+                if not self.handle or self.handle == wintypes.HANDLE(-1).value:
+                    raise OSError(ctypes.get_last_error(), "Could not open an ICMP handle.")
 
     def __enter__(self):
         return self
@@ -171,12 +189,17 @@ class IcmpClient:
         self.close()
 
     def close(self):
-        if self.handle:
-            _api().IcmpCloseHandle(self.handle)
+        if self.handle and sys.platform == "win32":
+            api = _api()
+            if api:
+                api.IcmpCloseHandle(self.handle)
             self.handle = None
 
     def echo(self, destination, size=32, timeout=1000, ttl=128, dont_fragment=False, source=None):
         """Send one echo request and wait for the reply (or timeout)."""
+        if sys.platform != "win32":
+            return self._linux_echo(destination, size, timeout, ttl, dont_fragment, source)
+
         payload = (PAYLOAD_PATTERN * (size // len(PAYLOAD_PATTERN) + 1))[:size]
         request = ctypes.create_string_buffer(payload, size) if size else None
         options = IP_OPTION_INFORMATION(Ttl=ttl, Flags=IP_FLAG_DF if dont_fragment else 0)
@@ -210,6 +233,63 @@ class IcmpClient:
         reply = ICMPV6_ECHO_REPLY.from_buffer(reply_buffer)
         address = str(ipaddress.IPv6Address(bytes(reply.Address.sin6_addr)))
         return EchoReply(reply.Status, address, reply.RoundTripTime)
+
+    def _linux_echo(self, destination, size, timeout, ttl, dont_fragment, source):
+        """Native Linux echo using system ping tool (which works without raw socket root permissions)."""
+        clean_dest = str(destination).split("%")[0]
+        cmd = ["ping", "-c", "1"]
+        timeout_s = max(1, math.ceil(timeout / 1000.0))
+        cmd += ["-W", str(timeout_s)]
+        if ttl:
+            cmd += ["-t", str(ttl)]
+        if size is not None:
+            cmd += ["-s", str(size)]
+        if source:
+            cmd += ["-I", str(source)]
+        if dont_fragment:
+            cmd += ["-M", "do"]
+        cmd.append(clean_dest)
+
+        start = time.perf_counter()
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s + 2)
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            output = res.stdout + res.stderr
+
+            if "Time to live exceeded" in output:
+                # Extract responding hop router IP
+                m = re.search(r"From\s+([0-9a-fA-F\.\:]+)", output)
+                from_addr = m.group(1) if m else ""
+                return EchoReply(status=IP_TTL_EXPIRED_TRANSIT, address=from_addr, rtt=elapsed_ms)
+
+            if "Destination Host Unreachable" in output or "Destination Net Unreachable" in output:
+                m = re.search(r"From\s+([0-9a-fA-F\.\:]+)", output)
+                from_addr = m.group(1) if m else ""
+                return EchoReply(status=IP_DEST_HOST_UNREACHABLE, address=from_addr)
+
+            if "Frag needed" in output or "message too long" in output:
+                return EchoReply(status=IP_PACKET_TOO_BIG)
+
+            if res.returncode == 0:
+                # Success reply
+                rtt_ms = elapsed_ms
+                m_time = re.search(r"time=([0-9\.]+)\s*ms", output)
+                if m_time:
+                    try:
+                        rtt_ms = int(round(float(m_time.group(1))))
+                    except ValueError:
+                        pass
+                m_ttl = re.search(r"ttl=([0-9]+)", output, re.IGNORECASE)
+                resp_ttl = int(m_ttl.group(1)) if m_ttl else None
+                m_from = re.search(r"from\s+([^\s:]+)", output, re.IGNORECASE)
+                resp_addr = m_from.group(1) if m_from else clean_dest
+                return EchoReply(status=IP_SUCCESS, address=resp_addr, rtt=rtt_ms, ttl=resp_ttl)
+
+            return EchoReply(status=IP_REQ_TIMED_OUT)
+        except subprocess.TimeoutExpired:
+            return EchoReply(status=IP_REQ_TIMED_OUT)
+        except Exception:
+            return EchoReply(status=IP_GENERAL_FAILURE)
 
 
 def format_reply(reply, size):
