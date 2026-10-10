@@ -69,12 +69,38 @@ QPushButton[accent="true"] {{ background: {accent}; color: {on_accent}; border: 
 QPushButton[accent="true"]:hover {{ background: {accent_hover}; }}
 QPushButton[accent="true"]:disabled {{ background: {accent_dim}; color: {panel}; }}
 
-QLineEdit, QSpinBox, QComboBox, QPlainTextEdit, QTextEdit {{
+QLineEdit, QSpinBox, QPlainTextEdit, QTextEdit {{
     background: {input}; color: {text}; border: 1px solid {border}; padding: 2px;
     selection-background-color: {accent_dim}; }}
-QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QPlainTextEdit:focus {{ border: 1px solid {accent_dim}; }}
-QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {{ color: {disabled}; }}
-QComboBox QAbstractItemView {{ background: {panel_alt}; color: {text}; selection-background-color: {accent_dim}; }}
+QLineEdit:focus, QSpinBox:focus, QPlainTextEdit:focus {{ border: 1px solid {accent_dim}; }}
+QLineEdit:disabled, QSpinBox:disabled {{ color: {disabled}; }}
+
+QComboBox {{
+    background: {input}; color: {text}; border: 1px solid {border}; padding: 3px 6px;
+    selection-background-color: {accent_dim}; min-height: 20px; }}
+QComboBox:focus {{ border: 1px solid {accent_dim}; }}
+QComboBox:disabled {{ color: {disabled}; }}
+QComboBox::drop-down {{
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 20px;
+    border-left: 1px solid {border};
+    background: {panel_alt};
+}}
+QComboBox::down-arrow {{
+    width: 0;
+    height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid {muted};
+}}
+QComboBox::down-arrow:hover {{
+    border-top: 5px solid {accent};
+}}
+QComboBox QAbstractItemView {{
+    background: {panel_alt}; color: {text}; selection-background-color: {accent_dim};
+    border: 1px solid {border}; outline: 0;
+}}
 
 QTableWidget, QTableView, QListWidget {{ background: {input}; alternate-background-color: {panel};
     color: {text}; gridline-color: {border}; border: 1px solid {border};
@@ -85,6 +111,31 @@ QAbstractItemView::indicator:indeterminate {{ background: {accent_dim}; border: 
 QAbstractItemView::indicator:disabled {{ background: {panel}; border: 1px solid {border}; }}
 QHeaderView::section {{ background: {panel_alt}; color: {muted}; border: none;
     border-right: 1px solid {border}; border-bottom: 1px solid {border}; padding: 5px; font-weight: bold; }}
+
+QScrollBar:vertical {{
+    background: {background}; width: 12px; margin: 0;
+}}
+QScrollBar::handle:vertical {{
+    background: {border}; min-height: 24px; border-radius: 4px; margin: 2px;
+}}
+QScrollBar::handle:vertical:hover {{
+    background: {muted};
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+    height: 0; background: none;
+}}
+QScrollBar:horizontal {{
+    background: {background}; height: 12px; margin: 0;
+}}
+QScrollBar::handle:horizontal {{
+    background: {border}; min-width: 24px; border-radius: 4px; margin: 2px;
+}}
+QScrollBar::handle:horizontal:hover {{
+    background: {muted};
+}}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+    width: 0; background: none;
+}}
 
 QProgressBar {{ background: {input}; border: 1px solid {border}; color: {text}; text-align: center; }}
 QProgressBar::chunk {{ background: {accent}; }}
@@ -100,6 +151,12 @@ QStatusBar {{ background: {background}; color: {muted}; }}
 def apply_theme(app):
     """Style the whole application with the dark scheme."""
     app.setStyle("Fusion")
+    if sys.platform != "win32":
+        # Default font configuration on Linux
+        font = app.font()
+        font.setFamily("DejaVu Sans, Ubuntu, Liberation Sans, sans-serif")
+        font.setPointSize(10)
+        app.setFont(font)
     palette = QPalette()
     roles = {
         QPalette.Window: "background", QPalette.WindowText: "text", QPalette.Base: "input",
@@ -135,19 +192,24 @@ def _colorref(name):
 
 def style_title_bar(window):
     """Give a window a dark title bar: exactly the app's colors on Windows 11, standard dark on Windows 10."""
-    hwnd = int(window.winId())
-    set_attribute = ctypes.windll.dwmapi.DwmSetWindowAttribute
+    if sys.platform != "win32" or not hasattr(ctypes, "windll"):
+        return
+    try:
+        hwnd = int(window.winId())
+        set_attribute = ctypes.windll.dwmapi.DwmSetWindowAttribute
 
-    def set_value(attribute, value):
-        value = ctypes.c_uint32(value)
-        return set_attribute(hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value)) == 0  # S_OK
+        def set_value(attribute, value):
+            value = ctypes.c_uint32(value)
+            return set_attribute(hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value)) == 0  # S_OK
 
-    if not set_value(DWMWA_USE_IMMERSIVE_DARK_MODE, 1):
-        set_value(DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1, 1)
-    # Custom colors fail harmlessly before Windows 11, leaving the dark mode colors
-    set_value(DWMWA_CAPTION_COLOR, _colorref("background"))
-    set_value(DWMWA_TEXT_COLOR, _colorref("text"))
-    set_value(DWMWA_BORDER_COLOR, _colorref("border"))
+        if not set_value(DWMWA_USE_IMMERSIVE_DARK_MODE, 1):
+            set_value(DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1, 1)
+        # Custom colors fail harmlessly before Windows 11, leaving the dark mode colors
+        set_value(DWMWA_CAPTION_COLOR, _colorref("background"))
+        set_value(DWMWA_TEXT_COLOR, _colorref("text"))
+        set_value(DWMWA_BORDER_COLOR, _colorref("border"))
+    except Exception:
+        pass
 
 
 class TitleBarStyler(QObject):
@@ -186,10 +248,14 @@ def set_text_scale(app, scale):
 
 
 def monospace_font(bold=False):
-    """Consolas at the app's current text size: only the family is set, so it follows set_text_scale."""
+    """Monospace font at the app's current text size: with modern Linux font fallbacks."""
     font = QFont()
-    font.setFamily("Consolas")
-    font.setStyleHint(QFont.Monospace)
+    if sys.platform != "win32":
+        font.setFamily("DejaVu Sans Mono")
+        font.setStyleHint(QFont.Monospace, QFont.PreferMatch)
+    else:
+        font.setFamily("Consolas")
+        font.setStyleHint(QFont.Monospace)
     if bold:
         font.setBold(True)
     return font

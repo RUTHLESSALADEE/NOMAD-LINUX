@@ -9,6 +9,7 @@ import ipaddress
 import os
 import shutil
 import socket
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -164,7 +165,9 @@ def putty_locations():
 
 
 def find_putty():
-    """Return the path to putty.exe from PATH or a common install location, or None."""
+    """Return the path to putty / putty.exe from PATH or a common install location, or None."""
+    if sys.platform != "win32":
+        return shutil.which("putty")
     return shutil.which("putty.exe") or next((path for path in putty_locations() if os.path.isfile(path)), None)
 
 
@@ -174,6 +177,8 @@ def _normalize(path):
 
 def add_to_user_path(directory):
     """Add a directory to the user's PATH (and this process's). Returns False if it was already there."""
+    if sys.platform != "win32":
+        return False
     import winreg
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_READ | winreg.KEY_WRITE) as key:
         try:

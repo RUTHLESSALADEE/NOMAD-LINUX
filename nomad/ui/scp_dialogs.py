@@ -112,7 +112,8 @@ class PropertiesDialog(QDialog):
         self.octal.setToolTip("Such as 644 or 0755")
         self.octal.textEdited.connect(self.octal_edited)
         self.symbolic = QLabel()
-        self.symbolic.setFont(QFont("Consolas"))
+        from .theme import monospace_font
+        self.symbolic.setFont(monospace_font())
         octal_row.addWidget(self.octal)
         octal_row.addWidget(self.symbolic)
         octal_row.addStretch(1)
@@ -221,7 +222,8 @@ class ChecksumDialog(QDialog):
         layout.addLayout(row)
         self.result = QLineEdit()
         self.result.setReadOnly(True)
-        self.result.setFont(QFont("Consolas"))
+        from .theme import monospace_font
+        self.result.setFont(monospace_font())
         copy_row = QHBoxLayout()
         copy_row.addWidget(self.result, 1)
         copy_button = QPushButton("Copy")
@@ -231,7 +233,8 @@ class ChecksumDialog(QDialog):
         layout.addLayout(copy_row)
         layout.addWidget(QLabel("Compare with (paste the expected value, such as from the vendor's download page):"))
         self.expected = QLineEdit()
-        self.expected.setFont(QFont("Consolas"))
+        from .theme import monospace_font
+        self.expected.setFont(monospace_font())
         layout.addWidget(self.expected)
         local_row = QHBoxLayout()
         local_button = QPushButton("Compare with a Local File...")

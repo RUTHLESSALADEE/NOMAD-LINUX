@@ -5,9 +5,11 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from urllib.parse import unquote
 
 from ..system import app_data_dir
@@ -717,6 +719,28 @@ def session_from_putty(name, values, folder="Imported from PuTTY"):
 
 def read_putty_sessions():
     """[(name, {value: data})] for every session PuTTY has saved for this user (not its Default Settings)."""
+    if sys.platform != "win32":
+        # PuTTY on Linux saves sessions to ~/.putty/sessions/
+        sessions_dir = Path.home() / ".putty" / "sessions"
+        sessions = []
+        if not sessions_dir.is_dir():
+            return sessions
+        for file in sessions_dir.iterdir():
+            if file.is_file():
+                name = file.name
+                if unquote(name) == "Default Settings":
+                    continue
+                values = {}
+                try:
+                    for line in file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                        if "\\" in line:
+                            k, v = line.split("\\", 1)
+                            values[k] = v
+                    sessions.append((name, values))
+                except OSError:
+                    continue
+        return sessions
+
     import winreg
     sessions = []
     try:

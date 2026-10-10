@@ -62,9 +62,9 @@ class RemoteEditor(QMainWindow):
         layout.setSpacing(0)
         self.editor = QPlainTextEdit()
         self.editor.setLineWrapMode(QPlainTextEdit.NoWrap)
-        font = QFont("Consolas")
-        font.setStyleHint(QFont.Monospace)
-        font.setPointSizeF(max(9.0, self.font().pointSizeF()))
+        from .theme import monospace_font
+        font = monospace_font()
+        font.setPointSizeF(10)
         self.editor.setFont(font)
         self.editor.setTabStopDistance(self.editor.fontMetrics().horizontalAdvance(" ") * 4)
         self.editor.setPlainText(text)
