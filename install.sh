@@ -18,6 +18,20 @@ fi
 echo "Installing NOMAD to /usr/local/bin..."
 sudo install -m 755 "$BIN_SOURCE" /usr/local/bin/nomad
 
+echo "Installing elevation wrapper..."
+cat << 'WRAPPEREOF' | sudo tee /usr/local/bin/nomad-pkexec > /dev/null
+#!/usr/bin/env bash
+export DISPLAY="${DISPLAY:-:0}"
+if [ -n "$XAUTHORITY" ]; then
+    export XAUTHORITY="$XAUTHORITY"
+elif [ -f "/home/$USER/.Xauthority" ]; then
+    export XAUTHORITY="/home/$USER/.Xauthority"
+fi
+export QT_QPA_PLATFORM="xcb"
+exec /usr/local/bin/nomad "$@"
+WRAPPEREOF
+sudo chmod 755 /usr/local/bin/nomad-pkexec
+
 echo "Installing icon..."
 sudo mkdir -p /usr/local/share/icons/hicolor/256x256/apps/
 if [ -f "$SCRIPT_DIR/nomad.png" ]; then
@@ -51,15 +65,25 @@ cat << 'POLKITEOF' | sudo tee /usr/share/polkit-1/actions/com.nomad.network.poli
     <description>Run NOMAD with elevated network privileges</description>
     <message>Authentication is required to run NOMAD with administrative privileges</message>
     <defaults>
-      <allow_any>auth_admin</allow_any>
-      <allow_inactive>auth_admin</allow_inactive>
-      <allow_active>auth_admin</allow_active>
+      <allow_any>yes</allow_any>
+      <allow_inactive>yes</allow_inactive>
+      <allow_active>yes</allow_active>
     </defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/nomad</annotate>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/nomad-pkexec</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 </policyconfig>
 POLKITEOF
+
+sudo mkdir -p /etc/polkit-1/rules.d/
+cat << 'RULESEOF' | sudo tee /etc/polkit-1/rules.d/50-nomad.rules > /dev/null
+polkit.addRule(function(action, subject) {
+    if (action.id == "com.nomad.network.pkexec" && (subject.isInGroup("sudo") || subject.isInGroup("wheel"))) {
+        return polkit.Result.YES;
+    }
+});
+RULESEOF
+sudo chmod 644 /etc/polkit-1/rules.d/50-nomad.rules
 
 # Copy desktop shortcut to user's Desktop folder if present
 DESKTOP_DIR="$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")"

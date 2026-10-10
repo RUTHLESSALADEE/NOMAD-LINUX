@@ -142,10 +142,13 @@ def relaunch_as_admin():
         pass
 
     disp = os.environ.get("DISPLAY") or ":0"
-    if "pkexec" in elevate_bin:
-        # polkit action /usr/share/polkit-1/actions/com.nomad.network.policy matches /usr/local/bin/nomad directly
-        # and has org.freedesktop.policykit.exec.allow_gui set to true
-        cmd = [elevate_bin, executable] + arguments
+    xauth = os.environ.get("XAUTHORITY") or str(Path.home() / ".Xauthority")
+
+    wrapper = shutil.which("nomad-pkexec")
+    if wrapper and "pkexec" in elevate_bin:
+        cmd = [elevate_bin, wrapper] + arguments
+    elif "pkexec" in elevate_bin:
+        cmd = [elevate_bin, "env", f"DISPLAY={disp}", f"XAUTHORITY={xauth}", "QT_QPA_PLATFORM=xcb", executable] + arguments
     else:
         cmd = [elevate_bin, executable] + arguments
 
