@@ -78,6 +78,8 @@ class ProxySettings:
 
 
 def _wininet():
+    if not hasattr(ctypes, "WinDLL"):
+        return None
     dll = ctypes.WinDLL("wininet", use_last_error=True)
     dll.InternetQueryOptionW.argtypes = [wintypes.LPVOID, wintypes.DWORD, wintypes.LPVOID,
                                          ctypes.POINTER(wintypes.DWORD)]
@@ -118,6 +120,8 @@ def _take_string(address, kernel32):
 
 
 def _kernel32():
+    if not hasattr(ctypes, "WinDLL"):
+        return None
     kernel32 = ctypes.WinDLL("kernel32")
     kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
     kernel32.GlobalFree.restype = ctypes.c_void_p
@@ -127,6 +131,8 @@ def _kernel32():
 def read_proxy():
     """The current user's proxy settings. Raises OSError if Windows won't say."""
     dll = _wininet()
+    if dll is None:
+        return ProxySettings()
     option_list, array, _buffers = _option_list([(PER_CONN_FLAGS, 0), (PER_CONN_PROXY_SERVER, None),
                                                  (PER_CONN_PROXY_BYPASS, None), (PER_CONN_AUTOCONFIG_URL, None)])
     size = wintypes.DWORD(ctypes.sizeof(option_list))
@@ -172,6 +178,8 @@ class WinHttpProxy:
 
 
 def read_winhttp_proxy():
+    if not hasattr(ctypes, "WinDLL"):
+        return WinHttpProxy()
     dll = ctypes.WinDLL("winhttp", use_last_error=True)
     dll.WinHttpGetDefaultProxyConfiguration.argtypes = [ctypes.POINTER(WINHTTP_PROXY_INFO)]
     dll.WinHttpGetDefaultProxyConfiguration.restype = wintypes.BOOL

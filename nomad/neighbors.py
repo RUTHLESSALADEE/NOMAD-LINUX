@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import socket
+import subprocess
 from dataclasses import dataclass, field
 
 from .oui import format_mac, is_multicast_mac, normalize_mac, vendor
@@ -194,6 +195,12 @@ def delete_neighbor(neighbor):
 
 def clear_neighbor_cache():
     """Empty the ARP and IPv6 neighbor caches (the same as arp -d *)."""
+    if os.name != "nt":
+        try:
+            subprocess.run(["ip", "neigh", "flush", "all"], capture_output=True)
+        except Exception as e:
+            log.warning("Could not flush neighbor cache: %s", e)
+        return
     run_command(["netsh", "interface", "ip", "delete", "arpcache"])
     run_command(["netsh", "interface", "ipv6", "delete", "neighbors"])
 
@@ -206,6 +213,8 @@ _send_arp = None
 def _send_arp_function():
     global _send_arp
     if _send_arp is None:
+        if not hasattr(ctypes, "WinDLL"):
+            return None
         function = ctypes.WinDLL("iphlpapi", use_last_error=True).SendARP
         function.restype = ctypes.c_uint32
         function.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
@@ -217,13 +226,31 @@ def arp_lookup(address, source=None):
     """Ask for an IPv4 host's MAC address with ARP (answered from the cache if it's there).
 
     Only works for hosts on a directly connected subnet. Returns the MAC as AA-BB-CC-DD-EE-FF, or None
-    if nothing answered (Windows waits about 3 seconds for a reply).
+    if nothing answered.
     """
+    if os.name != "nt":
+        # Check kernel ARP table from /proc/net/arp or ip neigh
+        try:
+            target = str(address).strip()
+            with open("/proc/net/arp", "r") as f:
+                for line in f.readlines()[1:]:
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[0] == target:
+                        mac = parts[3].replace(":", "-").upper()
+                        if normalize_mac(mac) not in ("", "000000000000", "00-00-00-00-00-00"):
+                            return mac
+        except Exception:
+            pass
+        return None
+
+    func = _send_arp_function()
+    if func is None:
+        return None
     destination = int.from_bytes(socket.inet_aton(str(address)), "little")
     source_value = int.from_bytes(socket.inet_aton(str(source)), "little") if source else 0
     buffer = (ctypes.c_ubyte * 8)()
     length = ctypes.c_ulong(6)
-    if _send_arp_function()(destination, source_value, buffer, ctypes.byref(length)) != 0 or length.value != 6:
+    if func(destination, source_value, buffer, ctypes.byref(length)) != 0 or length.value != 6:
         return None
     mac = format_mac(bytes(buffer[:6]).hex())
     return mac if normalize_mac(mac) not in ("", "000000000000") else None
