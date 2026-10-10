@@ -1,0 +1,51 @@
+# NOMAD Linux Port - Changelog & Patch Notes
+
+Date: 2026-10-09
+Repository: NOMAD (Native Linux Port v1.24.2)
+Target Location: SMB Share (`/mnt/nas-home/smb/NOMAD-LINUX`)
+
+---
+
+## Summary of Fixes
+
+### 1. Fixed Configuration Crash (`TypeError: 'NoneType' object is not iterable`)
+- **File**: `nomad/ui/navigation.py` (`restore_settings`)
+- **Problem**: When `navigation/recent` or `navigation/favorites` was empty, cleared, or contained `@Invalid()` in `NOMAD.conf`, Qt's `QSettings.value()` returned `None` instead of the fallback list. The code attempted list comprehension over `None`, throwing an unhandled `TypeError` that crashed NOMAD on startup.
+- **Fix**: Added explicit `elif recent is None: recent = []` and `elif favorites is None: favorites = []` safeguards before list comprehension.
+
+### 2. Fixed Wayland UI Ghosting, Dirty-Rectangle Bleed, & Misrendered Dropdowns
+- **Files**: `main.py`, `nomad/ui/navigation.py`, `install.sh`
+- **Problem**: In native Wayland sessions (Omarchy / Hyprland), PyInstaller-bundled Qt5 applications suffered severe sub-surface buffer retention:
+  - Previous page views (such as the green "IPv4 Settings" header, dividing lines, and adapter labels) bled through when switching to the Terminal or Network Map views.
+  - Dropdowns (like the SSH protocol picker) rendered clipped and corrupted characters.
+  - Transparent `QLabel` overlays in the `Navigator` content area allowed unmapped page titles to remain visible.
+- **Fix**:
+  - In `main.py`, added an automatic fallback on Linux under Wayland to prioritize `xcb` (XWayland) via `QT_QPA_PLATFORM="xcb;wayland"` if not explicitly set.
+  - In `nomad/ui/navigation.py`, explicitly styled and enabled `setAutoFillBackground(True)` on `page_title` and `stack` to prevent transparent widget underdraw.
+  - In `install.sh`, configured the desktop launcher (`nomad.desktop`) to run `env QT_QPA_PLATFORM=xcb nomad %F`.
+
+### 3. Fixed Master Password Button Text Truncation
+- **File**: `nomad/ui/session_manager.py`
+- **Problem**: The session sidebar had a fixed minimum width of 170px, which caused the protection status button at the bottom to aggressively truncate ("No mast...assword").
+- **Fix**: Increased `SessionManager`'s minimum width to 240px to ensure the button label and menus display cleanly without clipping.
+
+### 4. Fixed Administrator Elevation on Wayland / Omarchy (`nomad-pkexec`)
+- **Files**: `install.sh`, `/usr/local/bin/nomad-pkexec`
+- **Problem**: Ubuntu typically runs on X11 or standard GNOME with an active `.Xauthority` and `xhost` installed, allowing root to open windows via `DISPLAY=:0`. Omarchy (Arch Linux + Hyprland) runs a strict Wayland session without an `xhost` tool or `.Xauthority` file by default. When `pkexec` elevates to root, it drops user session variables (`WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`), causing Qt's X11 backend to fail with `Authorization required, but no authorization protocol specified / could not connect to display :0`.
+- **Fix**: Updated `/usr/local/bin/nomad-pkexec` to detect the invoking user's active session (`$PKEXEC_UID` / `/run/user/<uid>/wayland-*`):
+  - If a Wayland compositor is active (Omarchy / Hyprland), it exports the user's `XDG_RUNTIME_DIR` and `WAYLAND_DISPLAY`, running root directly on Wayland (`QT_QPA_PLATFORM=wayland`).
+  - If X11 is active (Ubuntu / Xorg), it falls back to standard `DISPLAY` + `.Xauthority` and `QT_QPA_PLATFORM=xcb`.
+  This allows "Restart as Administrator" to work seamlessly across both Ubuntu and Omarchy.
+
+---
+
+## Modified Files
+- `CHANGELOG.md`
+- `install.sh`
+- `main.py`
+- `nomad/ui/navigation.py`
+- `nomad/ui/session_manager.py`
+- `nomad/dhcp.py` (Linux porting adjustments)
+- `nomad/neighbors.py` (Linux porting adjustments)
+- `nomad/snapshot.py` (Linux porting adjustments)
+- `nomad/system.py` (Linux porting adjustments)
