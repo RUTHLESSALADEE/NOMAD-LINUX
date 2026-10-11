@@ -296,8 +296,9 @@ class SshShell:
         for setup in ("terminal length 0", "terminal width 511"):
             self.run(setup)
 
-    def read(self, timeout, prompt=""):
-        """What comes until the prompt (prompt, or anything that looks like one) ends it with nothing after it."""
+    def read(self, timeout, prompt="", done=None):
+        """What comes until the prompt (prompt, or anything that looks like one) ends it with nothing after it.
+        done(last line): when given, says instead whether the last line ends it (such as a Password: prompt)."""
         buffer, deadline, last = "", time.monotonic() + timeout, time.monotonic()
         while True:
             if self.should_stop():
@@ -314,7 +315,8 @@ class SshShell:
             text = clean(buffer)
             lines = text.rstrip().splitlines()
             tail = lines[-1].strip() if lines else ""
-            if (tail == prompt if prompt else PROMPT.match(tail)) and time.monotonic() - last >= QUIET:
+            ended = done(tail) if done is not None else (tail == prompt if prompt else PROMPT.match(tail))
+            if ended and time.monotonic() - last >= QUIET:
                 return text
             if time.monotonic() > deadline:
                 raise ConnectionFailed(f"No answer within {timeout} seconds.")

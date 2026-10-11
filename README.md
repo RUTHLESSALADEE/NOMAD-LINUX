@@ -18,6 +18,8 @@ Screenshots use made-up demo data; some show the earlier navigation layout.
 - [Pages](#pages)
 - [Network map](#network-map)
 - [Setting switches up for NOMAD](#setting-switches-up-for-nomad)
+- [Port mirroring](#port-mirroring)
+- [Packet capture](#packet-capture)
 - [Terminal and SCP](#terminal-and-scp)
 - [IP address management (IPAM)](#ip-address-management-ipam)
 - [Sharing IPAM with the tribe](#sharing-ipam-with-the-tribe)
@@ -56,7 +58,7 @@ Screenshots use made-up demo data; some show the earlier navigation layout.
 | **Terminal** | SSH, Telnet, serial and raw TCP sessions in tabs, tiles and pop-out windows. [More below.](#terminal-and-scp) |
 | **SCP** | A WinSCP-style file manager for SSH servers. [More below.](#terminal-and-scp) |
 | **RDP** | Saved Remote Desktop sessions in folders, with remembered credentials and display settings. Launches Windows' built-in Remote Desktop Connection. |
-| **TFTP** | A TFTP server and client for firmware and config transfers. |
+| **TFTP** | A TFTP server and client for firmware and config transfers. **Cisco TFTP Tips** shows how to make switches copy faster (a bigger block size, or SCP instead). |
 | **Wake-on-LAN** | Wake a computer by its MAC, and save the ones you wake often. |
 
 The **RDP** page has its own session folders, separate from Terminal and SCP, and uses NOMAD's shared password vault.
@@ -116,7 +118,8 @@ backups include RDP sessions, credentials and page preferences.
 
 | Page | Functions |
 | --- | --- |
-| **Packet Capture** | Captures to a pcapng file for Wireshark with Windows' built-in pktmon. Nothing to install. |
+| **Packet Capture** | Captures with Windows' built-in pktmon (nothing to install) to a pcapng file, shows the packets as they come, and looks through it (or any pcap/pcapng file) right there: Wireshark-style filters, each packet decoded, conversations and top talkers, problems found, and following a stream. Takes SPAN copies on a wired adapter, and unwraps ERSPAN sent to this PC. |
+| **Port Mirroring** | Sets up SPAN, RSPAN or ERSPAN on Cisco IOS / IOS-XE switches in a click, checks the ports first, and takes it away again (or the switches do, when the time's up). See [Port mirroring](#port-mirroring). |
 | **Syslog** | Receives syslog from network devices, colored by severity and filterable. |
 
 ### Utilities
@@ -166,6 +169,34 @@ The **SNMP Config** page (under SNMP) builds the Cisco IOS / IOS-XE configuratio
 - **Access ports:** an interface range to turn link-status logging and MAC address notifications on for. Configurations often turn link-status logging off on access ports, which hides a device being plugged in.
 - **Sending it:** **Send to Session** lists the connected terminal sessions (with the prompt each one shows), or **Open SSH Session** opens one to a switch, from your saved SSH sessions (in their folders) or a **New Session**, and waits for its prompt. NOMAD asks first, warns if the session isn't at the enable (#) prompt, then types the configuration a line at a time (150 ms apart, so older switches don't drop characters) and shows the session so you can watch the switch's answers. **Copy** and **Save As...** are there to paste it yourself. Choose **Show: Commands to take it out again** for the lines that undo it.
 - Check the result on the switch with `show snmp community`, `show snmp user`, `show snmp host` and `show logging`. The form is remembered, with its passwords encrypted for your Windows account.
+
+## Port mirroring
+
+The **Port Mirroring** page (under Capture & Logs) copies a port's traffic, or a VLAN's, to where it can be captured, on Cisco IOS / IOS-XE switches from the open Network Map, and takes it away again.
+
+- **What and where:** choose the switch and its ports (**Add Ports...**, **Add VLAN...**, or **Add Host...** by MAC, IP address or name, as the map has it), and for each whether to copy what it receives, sends, or both. Then where the copies go: **A switch port**, **This PC**, or **An address** (a capture box, over ERSPAN). On the map, right-click a port's box > **Mirror This Port...** or **Mirror to This Port...**, a switch > **Tools** > **Mirror Ports...**, or a host on the Hosts tab > **Mirror This Host's Port...**.
+- **The kind is picked for you** (or choose it under **Kind**): **SPAN** when the destination is on the same switch; **RSPAN** when the map joins the two switches by switched links: a VLAN no switch on the map has (from 999 down) is made `remote-span` on each switch along the way and added to the trunks that don't allow it (`allowed vlan add`, never replacing the list); **ERSPAN** when only routers join them, or to an address (IOS XE: Catalyst 9000, 3650/3850, ISR/ASR, CSR), from the switch's management address (**More Options** picks a loopback or VLAN interface instead, a VRF, the ERSPAN ID and the session number).
+- **Plan checks first:** it logs in to the switches over SSH (each switch's saved session, or the login chosen; the enable password when they log in at >) and reads their sessions, so a free session number is used and a port already in one isn't. A destination port stops passing normal traffic, so a link to another network device, a trunk or a port-channel is never used as one; devices on the destination port that would lose the network, and sources adding up to more than it takes, are warned about. Plan changes nothing.
+- **Set Up** sends each switch its lines over SSH (the destination first and the source last, so copies start once there's somewhere for them), then reads the switches to check they show it. If a switch refuses a line, NOMAD offers to take back what it already set up. **Send** on each switch's row types its lines into a terminal session instead (to watch, or for a switch with Telnet only); **Copy All** and **Export...** give you the lines and what undoes them. Nothing is saved to the startup configuration.
+- **Remove after** (on to begin with, 60 minutes) adds an EEM applet with a countdown to each switch: when the time's up the switch takes its part away itself, logs a syslog message and deletes the applet, even if this PC has gone. A switch that refuses the applet has NOMAD take its part away when the time's up, while NOMAD is open.
+- **Mirrors** lists every mirror set up from this PC with exactly what takes it away: **Take Away** sends it over SSH (or **Take Away in a Session** types it into a terminal session); **Check Now** reads the switches to see whether each is still there and lists every session they have, NOMAD's or not (right-click one to take it away); **Read All Switches** does that for every switch on the map.
+- **This PC:** NOMAD looks for the adapter chosen on the map. Plugged into a free port of its own (a second adapter), the copies go out of that port: **Capture Here** opens Packet Capture with **SPAN copies on** that adapter, so it takes them in. On the adapter this PC reaches the switches through, on Wi-Fi, or on a port the map doesn't have, they go to its address over ERSPAN (so a wired port keeps working): **Capture Here** opens Packet Capture ready to capture what the switch sends and, with **Unwrap ERSPAN**, saves the mirrored frames as their own capture, as if this PC were plugged into the mirrored port.
+
+## Packet capture
+
+**Packet Capture** (under Capture & Logs) records with Windows' own packet monitor, pktmon (administrator rights needed; nothing to install), shows the packets in the viewer below it as they're captured, and opens what it saved there after **Stop and Save**. **Open Capture...** opens any pcapng or pcap file, from Wireshark or tcpdump too.
+
+- **Capturing:** a filter (an address or subnet, a port, a protocol) keeps a capture small. **Capture whole packets** keeps all of each one (needed to follow streams); untick it to keep only the headers of long captures. **Stop after** stops and saves on its own.
+- **Show packets live** (on to begin with): the packets appear in the viewer about a second after they're captured, with the filter, summaries and problems kept up to date (the summaries and problems every few seconds). **Follow newest** keeps the newest in sight; scrolling up stops it and scrolling back to the bottom starts it again. NOMAD listens to the events pktmon logs for each packet while pktmon writes its file as usual, so the saved file is always the whole capture: on a very busy link (more than about 15,000 packets a second) the live view falls behind or misses some and says so, and after Stop and Save the viewer opens the saved file with everything.
+- **SPAN copies on:** a switch mirroring (SPAN or RSPAN) to this PC's wired port sends copies addressed to other machines, which an adapter normally throws away. Tick it and choose the adapter: it's held in promiscuous mode while capturing (Windows' own SIO_RCVALL; no Npcap needed). The adapter needs an IPv4 address; on a SPAN destination port it usually gets a 169.254 one. Some adapters drop 802.1Q-tagged frames (with `encapsulation replicate`) before anything sees them.
+- **Unwrap ERSPAN:** for a switch mirroring here over ERSPAN, Stop and Save also saves the mirrored frames as their own capture. The viewer unwraps them by itself too: a capture that's mostly ERSPAN opens showing the frames mirrored (**Show as Captured** shows the GRE packets).
+- **Packets:** the list (colored as Wireshark colors them: resent and reset in red, ARP, spanning tree and CDP/LLDP, names, routing protocols), the selected packet decoded line by line, and its bytes, with the part a line is about highlighted. Right-click a packet to follow its stream, show only its conversation or address, or hide its protocol. A packet captured twice (pktmon sees some at more than one point) is hidden; untick **Hide duplicates** to see them.
+- **Filters** are written as in Wireshark: `ip.addr == 10.0.0.5 && tcp.port == 443`, `dns`, `!arp`, `ip.src == 10.1.0.0/16`, `eth.addr == 00:11:22:33:44:55`, `tcp.port in {80 443}`, `dns.qry.name contains "corp"`, `tcp.analysis.retransmission`, `frame contains "password"`. Just an address, a subnet, a MAC address or a port number works too. Field names complete as you type, and the box turns red with the reason while a filter doesn't make sense. **Open in Wireshark** opens the file there with the same filter.
+- **Decoded:** Ethernet, 802.1Q, ARP, IPv4/IPv6, ICMP, TCP (with Wireshark's analysis: relative sequence numbers, retransmissions, duplicate ACKs, zero windows, gaps), UDP, DNS, DHCP, TLS (the server name asked for), HTTP, SMB2, SNMP, syslog, NTP, TFTP, RADIUS, 802.1X, CDP, LLDP, STP/RSTP/PVST+, LACP, DTP, VTP, HSRP, VRRP, OSPF, EIGRP, IGMP, PIM, BGP, GRE, ERSPAN and VXLAN; anything else is named by its port.
+- **Summaries:** conversations (IP, TCP, UDP, Ethernet) and top talkers, with names learned from DNS answers and DHCP; the protocols; traffic over time (click a bar for its packets); and the devices heard announcing themselves (CDP/LLDP: which switch and port this is). Double-click a row to see its packets.
+- **Problems:** what's worth a look, worst first: TCP resends, connections refused or unanswered, slow handshakes, zero windows, packets missing from the capture (on a mirror, usually the mirror dropping copies: the ports mirrored carry more than the destination takes), only one direction captured (a mirror of rx or tx only, or replies taking another path), DNS failures and slow answers, DHCP with no offer or from two servers (a rogue one?), duplicate IP addresses, ARP nobody answers, spanning tree topology changes and root changes, broadcast storms, ICMP unreachables, two HSRP or VRRP routers active, half duplex, 802.1X and RADIUS rejections, SMB, TLS and HTTP errors, SNMP with no answer. Double-click one (or **Show These Packets**) to see its packets.
+- **Follow Stream** (double-click a TCP or UDP packet) shows what each side sent, in order and once, as text or a hex dump, with gaps marked; **Save As...** saves it.
+- A big capture file (hundreds of thousands of packets) takes some seconds to open.
 
 ## Terminal and SCP
 
@@ -361,6 +392,7 @@ An advertised subnet (one other routers have a route to) can be in only one plac
 ## Good to know
 
 - **Administrator rights:** NOMAD starts without them, so viewing and testing work straight away. When a change needs them, it offers to restart as administrator (or use File > Restart as Administrator).
+- **What's new:** Help > What's New... lists what each version added and fixed, newest first, with the version running marked.
 - **Diagnostics report:** Tools > Run Diagnostics Report (Ctrl+R) checks the adapter, gateway, DNS, internet access, route, path MTU and ARP table in about half a minute. It saves the findings as a web page to attach to a ticket.
 - **Updating the MAC vendor list:** download https://standards-oui.ieee.org/oui/oui.csv and run `python -m nomad.oui build oui.csv`.
 
@@ -411,7 +443,7 @@ Tests, and a standalone exe (`dist\NOMAD-<version>.exe`):
     python -m pytest
     .\build.ps1
 
-**Releases:** the version lives in `nomad\__init__.py`. Note changes under Unreleased in `CHANGELOG.md` as you go, then:
+**Releases:** the version lives in `nomad\__init__.py`. Note changes under Unreleased in `CHANGELOG.md` as you go, and a line or two for users in `nomad\data\whats_new.md` (shown under Help > What's New; the tests check every version has an entry), then:
 
     python -m nomad.version bump patch     (or minor / major)
     git add -A

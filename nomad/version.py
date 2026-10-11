@@ -2,7 +2,7 @@
 
 Run as a script:
     python -m nomad.version                           print the current version
-    python -m nomad.version bump patch|minor|major    raise the version and date its CHANGELOG entry
+    python -m nomad.version bump patch|minor|major    raise the version and date its CHANGELOG and What's New entries
     python -m nomad.version resource build\\version.txt  write the Windows version resource for the packaged exe
     python -m nomad.version exe-name                  print the packaged exe's name without .exe (e.g. NOMAD-1.2.3)
 """
@@ -13,6 +13,7 @@ from pathlib import Path
 
 from . import __version__
 from .system import APP_FULL_NAME, APP_NAME
+from .whats_new import WHATS_NEW
 
 PACKAGE_INIT = Path(__file__).with_name("__init__.py")
 CHANGELOG = Path(__file__).parent.parent / "CHANGELOG.md"
@@ -91,6 +92,7 @@ def main(args):
         new_version = bumped(__version__, args[1])
         set_version(new_version)
         release_changelog(new_version)
+        release_changelog(new_version, WHATS_NEW)
         print(f"{__version__} -> {new_version}\n"
               f"Next:\n  git add -A\n  git commit -m \"Release {new_version}\"\n  git tag v{new_version}\n  .\\build.ps1")
     elif args[0] == "exe-name" and len(args) == 1:

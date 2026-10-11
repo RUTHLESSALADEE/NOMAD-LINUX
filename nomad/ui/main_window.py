@@ -18,7 +18,7 @@ from .capture_tab import CaptureTab
 from .common import add_action, run_in_background
 from .connections_tab import ConnectionsTab
 from .dhcp_tab import DhcpTab
-from .dialogs import AboutDialog, LogDialog
+from .dialogs import AboutDialog, LogDialog, WhatsNewDialog
 from .dns_servers_tab import DnsServersTab
 from .iperf_tab import IperfTab
 from .integration import Integration
@@ -46,6 +46,7 @@ from .subnet_tab import SubnetTab
 from .sweep_tab import SweepTab
 from .switch_tab import SwitchTab
 from .mac_finder_tab import MacFinderTab
+from .mirror_tab import MirrorTab
 from .syslog_tab import SyslogTab
 from .tftp_tab import TftpTab
 from .theme import COLORS, DEFAULT_TEXT_SCALE, TEXT_SCALES, set_text_scale
@@ -167,6 +168,7 @@ class MainWindow(QMainWindow):
         self.dns_servers_tab = DnsServersTab(self)
         self.web_check_tab = WebCheckTab(self)
         self.capture_tab = CaptureTab(self)
+        self.mirror_tab = MirrorTab(self)  # The Network Map's switches, saved sessions' SSH logins, Packet Capture
         self.syslog_tab = SyslogTab(self)
         self.tftp_tab = TftpTab(self)
         self.subnet_tab = SubnetTab(self)
@@ -199,7 +201,8 @@ class MainWindow(QMainWindow):
             ("Network Management", [(self.netmap_tab, "Network Map"), (self.ipam_tab, "IP Addresses"),
                 (self.vlan_tab, "VLANs"), (self.placement_tab, "Subnet Placement"),
                 (self.snmp_config_tab, "SNMP Config"), (self.inventory_tab, "Ansible Inventory")]),
-            ("Capture & Logs", [(self.capture_tab, "Packet Capture"), (self.syslog_tab, "Syslog")]),
+            ("Capture & Logs", [(self.capture_tab, "Packet Capture"), (self.mirror_tab, "Port Mirroring"),
+                                (self.syslog_tab, "Syslog")]),
             ("Utilities", [(self.subnet_tab, "Subnet Calculator")]),
         ]
         self.all_tabs = []
@@ -343,6 +346,7 @@ class MainWindow(QMainWindow):
 
         help_menu = self.menuBar().addMenu("&Help")
         help_menu.addAction("&Keyboard Shortcuts", self.show_shortcuts)
+        help_menu.addAction("What's &New...", self.show_whats_new)
         help_menu.addAction("&About", self.show_about)
 
     def show_terminal(self, then):
@@ -355,6 +359,15 @@ class MainWindow(QMainWindow):
         Map's credentials."""
         self.navigator.setCurrentWidget(self.snmp_config_tab)
         self.snmp_config_tab.prefill(destination, credential, from_map)
+
+    def show_mirror(self, source=None, ports=(), vlan=0, dest=None, dest_port="", host=""):
+        """The Port Mirroring page, filled in from the Network Map: mirror ports (or a VLAN, or a host's port) of
+        source, or to dest's dest_port."""
+        self.navigator.setCurrentWidget(self.mirror_tab)
+        if host:
+            self.mirror_tab.mirror_host(host)
+        else:
+            self.mirror_tab.prefill(source, ports, vlan, dest, dest_port)
 
     # ----------------------------------------------------------------- Settings
 
@@ -686,3 +699,6 @@ class MainWindow(QMainWindow):
 
     def show_about(self):
         AboutDialog(self).exec_()
+
+    def show_whats_new(self):
+        WhatsNewDialog(self).exec_()

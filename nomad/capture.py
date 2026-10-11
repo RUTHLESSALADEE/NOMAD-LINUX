@@ -8,6 +8,9 @@ import time
 from dataclasses import dataclass
 
 from . import pktmon
+from .etw import EtwError
+from .pktmon_live import LiveFeed
+from .promisc import Promiscuous, PromiscuousError
 
 PROTOCOLS = ["Any", "TCP", "UDP", "ICMP", "ICMPv6", "ARP"]
 FILTER_NAME = "NOMAD-Capture"
@@ -89,8 +92,16 @@ def find_wireshark():
 class Capture:
     """One capture: start() it, then stop() and save() it. Holds the pktmon lock in between."""
 
-    def __init__(self, capture_filter, whole_packets=True, file_size_mb=DEFAULT_FILE_SIZE_MB):
+    def __init__(self, capture_filter, whole_packets=True, file_size_mb=DEFAULT_FILE_SIZE_MB, promiscuous_address="",
+                 live=False):
         self.filter, self.whole_packets, self.file_size_mb = capture_filter, whole_packets, file_size_mb
+        # The packets as they're captured, for the live view (pktmon's file stays the complete record)
+        self.feed = LiveFeed() if live else None
+        self.live_problem = ""
+        # An adapter on a SPAN port: held in promiscuous mode while capturing, so the copies (addressed to other
+        # machines) get through to pktmon
+        self.promiscuous = Promiscuous(promiscuous_address) if promiscuous_address else None
+        self.promiscuous_problem = ""
         self.folder = None
         self.etl = None
         self.started = None
@@ -110,12 +121,33 @@ class Capture:
             arguments = filter_arguments(self.filter)
             if arguments:
                 pktmon.add_filter(FILTER_NAME, *arguments)
+            self.start_feed()
             pktmon.start(self.etl, 0 if self.whole_packets else HEADERS_ONLY_BYTES, self.file_size_mb)
         except BaseException:
             self.cleanup()
             raise
+        if self.promiscuous is not None:
+            try:
+                self.promiscuous.start()
+            except PromiscuousError as error:  # Capture anyway: this PC's own traffic still comes through
+                self.promiscuous_problem = str(error)
         self.started = time.monotonic()
         self.running = True
+
+    def start_feed(self):
+        """Start listening for the live view (before pktmon starts, so it sees the first packets)."""
+        if self.feed is None:
+            return
+        try:
+            self.feed.start()
+        except (EtwError, OSError) as error:  # Capture anyway: the packets open after Stop and Save
+            self.live_problem = str(error)
+            self.feed = None
+
+    @property
+    def live(self):
+        """Whether the live view gets the packets."""
+        return self.feed is not None
 
     def size(self):
         """Bytes captured so far (pktmon writes the file as it goes)."""
@@ -134,6 +166,10 @@ class Capture:
         if self.running:
             self.running = False
             pktmon.stop()
+        if self.promiscuous is not None:
+            self.promiscuous.stop()
+        if self.feed is not None:
+            self.feed.stop()
 
     def save(self, output_path):
         """Convert the capture to pcapng at output_path. Raises CommandError or OSError."""
@@ -147,6 +183,10 @@ class Capture:
     def cleanup(self):
         """Stop pktmon if still running, remove its filters and the temporary files, and release the lock."""
         try:
+            if self.promiscuous is not None:
+                self.promiscuous.stop()
+            if self.feed is not None:
+                self.feed.stop()
             if self.running:
                 self.running = False
                 pktmon.quietly("stop")

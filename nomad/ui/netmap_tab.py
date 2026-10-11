@@ -2397,6 +2397,10 @@ class NetworkMapTab(QWidget):
         menu.addSeparator()
         if device.mgmt_ip:
             actions[menu.addAction("Crawl from Here")] = lambda: self.crawl_from(device.mgmt_ip)
+        if device.kind == SWITCH and hasattr(self.window, "show_mirror"):  # In Tools, beside Ping and the rest
+            tools = next((action.menu() for action in menu.actions() if action.menu() is not None
+                          and action.text() == "Tools"), menu)
+            actions[tools.addAction("Mirror Ports...")] = lambda: self.window.show_mirror(source=key)
         if self.worker is None:
             actions[menu.addAction("Put at the Top")] = lambda: self.put_at_top(key)
         if self.current_view() is self.view and self.worker is None:
@@ -2579,6 +2583,9 @@ class NetworkMapTab(QWidget):
                                                    leave_out=("Show on Map",))  # The page's own is below
                 menu.addSeparator()
             actions[menu.addAction("Show on Map")] = lambda: self.show_on_map("host", item.row())
+            if host.device in self.network_map.devices and hasattr(self.window, "show_mirror"):
+                actions[menu.addAction("Mirror This Host's Port...")] = \
+                    lambda: self.window.show_mirror(source=host.device, ports=[host.port])
             self.add_address_link(menu, actions, host.ip)
         addresses = [host.ip for host in hosts if host.ip]
         if addresses and hub(self.window) is not None:
@@ -2624,6 +2631,7 @@ class NetworkMapTab(QWidget):
             self.add_vlan_link(menu, actions, number, domain or "")
         if device is not None and device.kind == SWITCH and key in self.network_map.devices:
             actions[menu.addAction("Carry a VLAN Here...")] = lambda: self.carry_vlan(b=key, port=port)
+            self.add_mirror_actions(menu, actions, key, port, hosts)
         if len(hosts) == 1:
             self.add_address_link(menu, actions, hosts[0].ip)
         if actions:
@@ -2637,6 +2645,14 @@ class NetworkMapTab(QWidget):
         chosen = menu.exec_(position)
         if chosen in actions:
             actions[chosen]()
+
+    def add_mirror_actions(self, menu, actions, key, port, hosts):
+        """Mirror This Port... (to Port Mirroring, as a source) and Mirror to This Port... (as the destination)."""
+        if not hasattr(self.window, "show_mirror"):
+            return
+        label = "Mirror This Host's Port..." if len(hosts) == 1 else "Mirror This Port..."
+        actions[menu.addAction(label)] = lambda: self.window.show_mirror(source=key, ports=[port])
+        actions[menu.addAction("Mirror to This Port...")] = lambda: self.window.show_mirror(dest=key, dest_port=port)
 
     def add_host(self, device=None, port=""):
         if self.network_map is None or not self.network_map.devices:

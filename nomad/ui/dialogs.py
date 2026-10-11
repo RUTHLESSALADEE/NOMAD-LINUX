@@ -1,4 +1,4 @@
-"""Dialogs: keep/revert countdown, log viewer, save profile, and about."""
+"""Dialogs: keep/revert countdown, log viewer, save profile, about, and what's new."""
 import os
 import platform
 import sys
@@ -6,11 +6,12 @@ import sys
 from PyQt5.QtCore import PYQT_VERSION_STR, QT_VERSION_STR, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import QApplication, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, \
-    QLineEdit, QPlainTextEdit, QPushButton, QVBoxLayout
+    QLineEdit, QPlainTextEdit, QPushButton, QTextBrowser, QVBoxLayout
 
 from .. import __version__
 from ..logs import log_file_path
 from ..system import APP_FULL_NAME, APP_NAME
+from ..whats_new import entries_html, read_entries
 from .icon import app_icon
 from .theme import COLORS, monospace_font
 
@@ -207,6 +208,28 @@ class AboutDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         self.setMinimumWidth(460)
+
+
+class WhatsNewDialog(QDialog):
+    """Help > What's New: the short changelog, newest first, with the version running marked."""
+
+    def __init__(self, parent, entries=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"What's New in {APP_NAME}")
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+
+        layout = QVBoxLayout(self)
+        heading = QLabel(f"You're running {APP_NAME} {__version__}. New features and fixes in each version:")
+        heading.setWordWrap(True)
+        layout.addWidget(heading)
+        self.notes = QTextBrowser()
+        self.notes.setHtml(entries_html(read_entries() if entries is None else entries, __version__, COLORS))
+        layout.addWidget(self.notes, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.resize(640, 560)
 
 
 def version_details():
