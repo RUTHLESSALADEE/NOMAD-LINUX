@@ -12,7 +12,7 @@ import struct
 
 from .. import oui
 
-ETHERNET, LINUX_SLL = 1, 113
+ETHERNET, LINUX_SLL, LINUX_SLL2 = 1, 113, 276
 RAW_IP_TYPES = {12, 14, 101, 228, 229}
 VLAN_TYPES = {0x8100, 0x88A8, 0x9100}
 BROADCAST = "ff:ff:ff:ff:ff:ff"
@@ -349,6 +349,8 @@ def dissect(raw, link_type=ETHERNET, tree=False, packet=None, tracker=None, inde
             ip_any(d, data, 0)
         elif link_type == LINUX_SLL:
             linux_sll(d, data)
+        elif link_type == LINUX_SLL2:
+            linux_sll2(d, data)
         else:
             d.columns(f"Link {link_type}", f"Link type {link_type} isn't one NOMAD decodes")
     except (struct.error, IndexError, ValueError) as error:
@@ -365,6 +367,15 @@ def linux_sll(d, data):
     protocol = u16(data, 14)
     node.add(f"Protocol: {ETHERTYPES.get(protocol, hex(protocol))} (0x{protocol:04x})", 14, 16)
     next_ethertype(d, data, 16, protocol)
+
+
+def linux_sll2(d, data):
+    if len(data) < 20:
+        return d.bad("Linux cooked v2 header")
+    node = d.layer("sll2", "Linux cooked capture v2", 0, 20)
+    protocol = u16(data, 0)
+    node.add(f"Protocol: {ETHERTYPES.get(protocol, hex(protocol))} (0x{protocol:04x})", 0, 2)
+    next_ethertype(d, data, 20, protocol)
 
 
 def ethernet(d, data, offset):

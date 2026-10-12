@@ -1,7 +1,8 @@
 """Switch Port tab: which switch, port and VLAN this computer is plugged into, from LLDP and CDP announcements."""
 import logging
 
-from PyQt5.QtCore import pyqtSignal
+import os
+from PyQt5.QtCore import QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import QApplication, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QProgressBar, QPushButton, QSpinBox, \
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
 
@@ -134,8 +135,11 @@ class SwitchTab(QWidget):
         if self.worker is not None:
             return
         if not find_pktmon():
-            set_hint(self.status_label, "This version of Windows doesn't have pktmon (it arrived in Windows 10 "
-                                        "version 1809), so switch discovery isn't available.", "error")
+            if os.name == "nt":
+                set_hint(self.status_label, "This version of Windows doesn't have pktmon (it arrived in Windows 10 "
+                                            "version 1809), so Switch Port isn't available.", "error")
+            else:
+                set_hint(self.status_label, "tcpdump is required for Switch Port on Linux.", "error")
             return
         if not self.window.require_admin("Listening for switch announcements"):
             return

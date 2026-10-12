@@ -44,11 +44,11 @@ class CaptureTab(QWidget):
 
     def init_ui(self):
         layout = QVBoxLayout(self)
-        intro = QLabel("Capture network traffic on every adapter with Windows' built-in packet monitor (pktmon), "
+        tool_name = "Windows' built-in packet monitor (pktmon)" if os.name == "nt" else "native packet capture (tcpdump)"
+        intro = QLabel(f"Capture network traffic on every adapter with {tool_name}, "
                        "watch it below as it comes, save it as a pcapng file, and look through it: filters, "
                        "conversations, problems found, streams. Needs administrator rights. A filter keeps the "
-                       "capture small; leave the fields blank to capture everything. Starting a capture clears any "
-                       "packet filters you've set in pktmon yourself.")
+                       "capture small; leave the fields blank to capture everything.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
@@ -294,10 +294,14 @@ class CaptureTab(QWidget):
     # ----------------------------------------------------------------- Capture
 
     def browse(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save Capture As", self.output_input.text(),
-                                              "Wireshark captures (*.pcapng);;All files (*)")
+        patterns = "Wireshark captures (*.pcapng);;All files (*)" if os.name == "nt" else \
+                   "Captures (*.pcap *.pcapng);;All files (*)"
+        path, _ = QFileDialog.getSaveFileName(self, "Save Capture As", self.output_input.text(), patterns)
         if path:
-            self.output_input.setText(path if path.lower().endswith(".pcapng") else path + ".pcapng")
+            default_ext = ".pcapng" if os.name == "nt" else ".pcap"
+            if not (path.lower().endswith(".pcapng") or path.lower().endswith(".pcap")):
+                path += default_ext
+            self.output_input.setText(path)
 
     def start(self):
         if self.capture is not None or self.busy:
@@ -317,8 +321,12 @@ class CaptureTab(QWidget):
         if os.path.exists(output):
             self.output_input.setText(default_output_path(os.path.dirname(output)))
         if not find_pktmon():
-            set_hint(self.status_label, "This version of Windows doesn't have pktmon (it arrived in Windows 10 "
-                                        "version 1809), so packet capture isn't available.", "error")
+            if os.name == "nt":
+                set_hint(self.status_label, "This version of Windows doesn't have pktmon (it arrived in Windows 10 "
+                                            "version 1809), so packet capture isn't available.", "error")
+            else:
+                set_hint(self.status_label, "tcpdump is required for packet capture on Linux. "
+                                            "Install it with: sudo apt install tcpdump (or pacman -S tcpdump).", "error")
             return
         promiscuous = ""
         if self.span_check.isChecked():

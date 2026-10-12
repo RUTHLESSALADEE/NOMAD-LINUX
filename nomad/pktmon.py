@@ -3,6 +3,7 @@
 pktmon is one system-wide capture, so only one NOMAD feature can use it at a time: take `lock` first.
 Everything here needs administrator rights.
 """
+import os
 import shutil
 import threading
 
@@ -16,7 +17,9 @@ class PktmonBusy(Exception):
 
 
 def find_pktmon():
-    return shutil.which("pktmon.exe")
+    if os.name == "nt":
+        return shutil.which("pktmon.exe") or shutil.which("pktmon")
+    return shutil.which("tcpdump")
 
 
 def pktmon(*arguments, timeout=120):

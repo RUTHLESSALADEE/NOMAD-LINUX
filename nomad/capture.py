@@ -3,6 +3,7 @@ import glob
 import ipaddress
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
@@ -76,16 +77,41 @@ def filter_arguments(capture_filter):
     return arguments
 
 
+def bpf_filter_expression(capture_filter):
+    """Convert a CaptureFilter into a standard tcpdump / pcap BPF filter expression."""
+    if capture_filter.empty:
+        return ""
+    terms = []
+    if capture_filter.protocol and capture_filter.protocol != "Any":
+        proto = capture_filter.protocol.lower()
+        if proto == "icmpv6":
+            proto = "icmp6"
+        terms.append(proto)
+    if capture_filter.address:
+        addr = capture_filter.address
+        if "/" in addr:
+            terms.append(f"net {addr}")
+        else:
+            terms.append(f"host {addr}")
+    if capture_filter.port:
+        terms.append(f"port {capture_filter.port}")
+    return " and ".join(terms)
+
+
 def default_output_path(folder=None):
     folder = folder or os.path.join(os.path.expanduser("~"), "Documents")
     if not os.path.isdir(folder):
         folder = os.path.expanduser("~")
-    return os.path.join(folder, f"NOMAD capture {time.strftime('%Y-%m-%d %H%M%S')}.pcapng")
+    ext = "pcapng" if os.name == "nt" else "pcap"
+    return os.path.join(folder, f"NOMAD capture {time.strftime('%Y-%m-%d %H%M%S')}.{ext}")
 
 
 def find_wireshark():
-    candidates = [shutil.which("Wireshark.exe"), r"C:\Program Files\Wireshark\Wireshark.exe",
-                  r"C:\Program Files (x86)\Wireshark\Wireshark.exe"]
+    candidates = [
+        shutil.which("wireshark"), shutil.which("Wireshark"),
+        shutil.which("Wireshark.exe"), r"C:\Program Files\Wireshark\Wireshark.exe",
+        r"C:\Program Files (x86)\Wireshark\Wireshark.exe"
+    ]
     return next((path for path in candidates if path and os.path.isfile(path)), None)
 
 
@@ -104,6 +130,8 @@ class Capture:
         self.promiscuous_problem = ""
         self.folder = None
         self.etl = None
+        self.pcap = None
+        self.process = None
         self.started = None
         self.running = False
         self.holds_lock = False
@@ -111,18 +139,40 @@ class Capture:
     def start(self):
         """Raises pktmon.PktmonBusy, CommandError (e.g. without administrator rights) or OSError."""
         if not pktmon.find_pktmon():
-            raise OSError("pktmon isn't available. It comes with Windows 10 version 1809 and later.")
+            tool = "pktmon" if os.name == "nt" else "tcpdump"
+            raise OSError(f"{tool} isn't available for packet capture.")
         pktmon.acquire("capturing")
         self.holds_lock = True
         try:
-            self.folder = tempfile.mkdtemp(prefix="nomad-capture-")
-            self.etl = os.path.join(self.folder, "capture.etl")
-            pktmon.reset()
-            arguments = filter_arguments(self.filter)
-            if arguments:
-                pktmon.add_filter(FILTER_NAME, *arguments)
-            self.start_feed()
-            pktmon.start(self.etl, 0 if self.whole_packets else HEADERS_ONLY_BYTES, self.file_size_mb)
+            is_nt = os.name == "nt" or "pktmon" in (pktmon.find_pktmon() or "")
+            if is_nt:
+                self.folder = tempfile.mkdtemp(prefix="nomad-capture-")
+                self.etl = os.path.join(self.folder, "capture.etl")
+                pktmon.reset()
+                arguments = filter_arguments(self.filter)
+                if arguments:
+                    pktmon.add_filter(FILTER_NAME, *arguments)
+                self.start_feed()
+                pktmon.start(self.etl, 0 if self.whole_packets else HEADERS_ONLY_BYTES, self.file_size_mb)
+            else:
+                self.folder = tempfile.mkdtemp(prefix="nomad-capture-", dir="/tmp")
+                os.chmod(self.folder, 0o777)
+                self.pcap = os.path.join(self.folder, "capture.pcap")
+                self.start_feed()
+                snaplen = "0" if self.whole_packets else str(HEADERS_ONLY_BYTES)
+                cmd = ["tcpdump", "-i", "any", "-U", "-s", snaplen, "-w", self.pcap]
+                bpf = bpf_filter_expression(self.filter)
+                if bpf:
+                    cmd.extend(["--", bpf])
+                self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                # Wait briefly to confirm tcpdump started and created the pcap file
+                for _ in range(20):
+                    time.sleep(0.05)
+                    if os.path.exists(self.pcap):
+                        break
+                    if self.process.poll() is not None:
+                        err = self.process.stderr.read().decode("utf-8", "replace") if self.process.stderr else ""
+                        raise OSError(f"tcpdump failed to start: {err.strip()}")
         except BaseException:
             self.cleanup()
             raise
@@ -138,6 +188,10 @@ class Capture:
         """Start listening for the live view (before pktmon starts, so it sees the first packets)."""
         if self.feed is None:
             return
+        if os.name != "nt":
+            self.live_problem = "Live view requires Windows ETW. The packets open below after Stop and Save."
+            self.feed = None
+            return
         try:
             self.feed.start()
         except (EtwError, OSError) as error:  # Capture anyway: the packets open after Stop and Save
@@ -151,6 +205,11 @@ class Capture:
 
     def size(self):
         """Bytes captured so far (pktmon writes the file as it goes)."""
+        if self.pcap and os.path.exists(self.pcap):
+            try:
+                return os.path.getsize(self.pcap)
+            except OSError:
+                return 0
         total = 0
         for path in glob.glob(os.path.join(self.folder or "", "capture*.etl")):
             try:
@@ -165,7 +224,18 @@ class Capture:
     def stop(self):
         if self.running:
             self.running = False
-            pktmon.stop()
+            if self.process is not None:
+                try:
+                    self.process.terminate()
+                    self.process.wait(timeout=5)
+                except Exception:
+                    try:
+                        self.process.kill()
+                    except Exception:
+                        pass
+                self.process = None
+            else:
+                pktmon.stop()
         if self.promiscuous is not None:
             self.promiscuous.stop()
         if self.feed is not None:
@@ -175,13 +245,17 @@ class Capture:
         """Convert the capture to pcapng at output_path. Raises CommandError or OSError."""
         folder = os.path.dirname(os.path.abspath(output_path))
         os.makedirs(folder, exist_ok=True)
-        pktmon.to_pcapng(self.etl, output_path)
+        if self.pcap and os.path.isfile(self.pcap) and not self.etl:
+            # On Linux: copy or convert the recorded pcap to output_path
+            shutil.copyfile(self.pcap, output_path)
+        else:
+            pktmon.to_pcapng(self.etl, output_path)
         if not os.path.isfile(output_path):
-            raise OSError("pktmon didn't write the capture file. The capture may have been empty.")
+            raise OSError("Packet capture didn't write the capture file. The capture may have been empty.")
         return os.path.getsize(output_path)
 
     def cleanup(self):
-        """Stop pktmon if still running, remove its filters and the temporary files, and release the lock."""
+        """Stop pktmon/tcpdump if still running, remove its filters and the temporary files, and release the lock."""
         try:
             if self.promiscuous is not None:
                 self.promiscuous.stop()
@@ -189,8 +263,20 @@ class Capture:
                 self.feed.stop()
             if self.running:
                 self.running = False
-                pktmon.quietly("stop")
-            pktmon.quietly("filter", "remove")
+                if self.process is not None:
+                    try:
+                        self.process.terminate()
+                        self.process.wait(timeout=2)
+                    except Exception:
+                        try:
+                            self.process.kill()
+                        except Exception:
+                            pass
+                    self.process = None
+                elif os.name == "nt" or self.etl:
+                    pktmon.quietly("stop")
+            if os.name == "nt" or self.etl:
+                pktmon.quietly("filter", "remove")
         finally:
             if self.folder:
                 shutil.rmtree(self.folder, ignore_errors=True)

@@ -36,8 +36,10 @@ def run_command(command, timeout=120):
     command_line = subprocess.list2cmdline(command)
     log.debug("Running: %s", command_line)
     try:
-        result = subprocess.run(command, capture_output=True, text=True, encoding="oem", errors="replace",
-                                timeout=timeout, creationflags=CREATE_NO_WINDOW)
+        encoding = "oem" if os.name == "nt" else "utf-8"
+        creationflags = CREATE_NO_WINDOW if os.name == "nt" else 0
+        result = subprocess.run(command, capture_output=True, text=True, encoding=encoding, errors="replace",
+                                timeout=timeout, creationflags=creationflags)
     except subprocess.TimeoutExpired:
         raise CommandError(command, f"'{command_line}' did not finish within {timeout} seconds.") from None
     output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part and part.strip())
