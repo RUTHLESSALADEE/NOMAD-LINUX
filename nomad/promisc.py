@@ -31,6 +31,11 @@ class Promiscuous:
         """Raises PromiscuousError (e.g. without administrator rights, or an address this PC doesn't have)."""
         if self.sock is not None:
             return
+        if not hasattr(socket, "SIO_RCVALL"):
+            # SIO_RCVALL is Windows-specific; on Linux/POSIX, raw packet socket or promiscuous mode
+            # is typically managed at the interface level via AF_PACKET/libpcap.
+            log.info("Promiscuous mode via SIO_RCVALL is not supported on this platform (%s)", self.address)
+            return
         sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
@@ -49,10 +54,13 @@ class Promiscuous:
         sock, self.sock = self.sock, None
         if sock is None:
             return
-        try:
-            sock.ioctl(socket.SIO_RCVALL, socket.RCVALL_OFF)
-        except OSError as error:
-            log.warning("Couldn't switch promiscuous mode off for %s: %s", self.address, error)
-        finally:
+        if hasattr(socket, "SIO_RCVALL"):
+            try:
+                sock.ioctl(socket.SIO_RCVALL, socket.RCVALL_OFF)
+            except OSError as error:
+                log.warning("Couldn't switch promiscuous mode off for %s: %s", self.address, error)
+            finally:
+                sock.close()
+        else:
             sock.close()
         log.info("Promiscuous mode off for %s", self.address)

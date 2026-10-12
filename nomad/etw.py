@@ -6,8 +6,13 @@ outlives the process that started it, so one left by a crash is stopped before s
 """
 import ctypes
 import logging
+import os
+import sys
 import threading
-from ctypes import wintypes
+try:
+    from ctypes import wintypes
+except (ImportError, ValueError):
+    wintypes = None
 
 log = logging.getLogger(__name__)
 
@@ -128,7 +133,7 @@ class EVENT_RECORD(ctypes.Structure):
                 ("UserContext", ctypes.c_void_p)]
 
 
-EVENT_RECORD_CALLBACK = ctypes.WINFUNCTYPE(None, ctypes.POINTER(EVENT_RECORD))
+EVENT_RECORD_CALLBACK = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)(None, ctypes.POINTER(EVENT_RECORD))
 
 
 class EVENT_TRACE_LOGFILEW(ctypes.Structure):
