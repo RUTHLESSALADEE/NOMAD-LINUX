@@ -1,51 +1,27 @@
 # NOMAD Linux Port - Changelog & Patch Notes
 
-Date: 2026-10-09
-Repository: NOMAD (Native Linux Port v1.24.2)
-Target Location: SMB Share (`/mnt/nas-home/smb/NOMAD-LINUX`)
+Date: 2026-10-12
+Repository: NOMAD (Native Linux Port v1.27.0)
+Target Location: SMB Share (`/mnt/nas-home/smb/NOMAD-LINUX/1.27.0`)
 
 ---
 
-## Summary of Fixes
+## What's New in NOMAD 1.27.0 (Linux Port)
 
-### 1. Fixed Configuration Crash (`TypeError: 'NoneType' object is not iterable`)
-- **File**: `nomad/ui/navigation.py` (`restore_settings`)
-- **Problem**: When `navigation/recent` or `navigation/favorites` was empty, cleared, or contained `@Invalid()` in `NOMAD.conf`, Qt's `QSettings.value()` returned `None` instead of the fallback list. The code attempted list comprehension over `None`, throwing an unhandled `TypeError` that crashed NOMAD on startup.
-- **Fix**: Added explicit `elif recent is None: recent = []` and `elif favorites is None: favorites = []` safeguards before list comprehension.
+Merged official upstream v1.27.0 release features into the Linux port:
+- **Port Mirroring**: Cisco IOS / IOS-XE SPAN, RSPAN, and ERSPAN configuration planning and deployment via SSH.
+- **Packet Capture Viewer**: Integrated Wireshark-compatible packet dissector, display filters, stream following, and network issue analysis.
+- **ERSPAN Unwrapping & Parsing**: Pure-Python decoding of GRE / ERSPAN Type I, II, and III packets.
+- **What's New Dialog**: In-app changelog display under Help > What's New.
+- **Tribe Server Move / Migration**: Move IPAM & map database to new host with encrypted export files.
 
-### 2. Fixed Wayland UI Ghosting, Dirty-Rectangle Bleed, & Misrendered Dropdowns
-- **Files**: `main.py`, `nomad/ui/navigation.py`, `install.sh`
-- **Problem**: In native Wayland sessions (Omarchy / Hyprland), PyInstaller-bundled Qt5 applications suffered severe sub-surface buffer retention:
-  - Previous page views (such as the green "IPv4 Settings" header, dividing lines, and adapter labels) bled through when switching to the Terminal or Network Map views.
-  - Dropdowns (like the SSH protocol picker) rendered clipped and corrupted characters.
-  - Transparent `QLabel` overlays in the `Navigator` content area allowed unmapped page titles to remain visible.
-- **Fix**:
-  - In `main.py`, added an automatic fallback on Linux under Wayland to prioritize `xcb` (XWayland) via `QT_QPA_PLATFORM="xcb;wayland"` if not explicitly set.
-  - In `nomad/ui/navigation.py`, explicitly styled and enabled `setAutoFillBackground(True)` on `page_title` and `stack` to prevent transparent widget underdraw.
-  - In `install.sh`, configured the desktop launcher (`nomad.desktop`) to run `env QT_QPA_PLATFORM=xcb nomad %F`.
+## Summary of Linux Port Compatibility & Fixes
 
-### 3. Fixed Master Password Button Text Truncation
-- **File**: `nomad/ui/session_manager.py`
-- **Problem**: The session sidebar had a fixed minimum width of 170px, which caused the protection status button at the bottom to aggressively truncate ("No mast...assword").
-- **Fix**: Increased `SessionManager`'s minimum width to 240px to ensure the button label and menus display cleanly without clipping.
+### 1. Guarded Windows SIO_RCVALL & ETW Tracing for POSIX (`nomad/promisc.py`, `nomad/etw.py`)
+- Upstream introduced Windows ETW real-time event tracing and `socket.SIO_RCVALL` promiscuous mode ioctls.
+- On Linux, guarded ctypes `WINFUNCTYPE` and `SIO_RCVALL` socket ioctls so NOMAD imports and executes without raising `AttributeError` or crashing.
 
-### 4. Fixed Administrator Elevation on Wayland / Omarchy (`nomad-pkexec`)
-- **Files**: `install.sh`, `/usr/local/bin/nomad-pkexec`
-- **Problem**: Ubuntu typically runs on X11 or standard GNOME with an active `.Xauthority` and `xhost` installed, allowing root to open windows via `DISPLAY=:0`. Omarchy (Arch Linux + Hyprland) runs a strict Wayland session without an `xhost` tool or `.Xauthority` file by default. When `pkexec` elevates to root, it drops user session variables (`WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`), causing Qt's X11 backend to fail with `Authorization required, but no authorization protocol specified / could not connect to display :0`.
-- **Fix**: Updated `/usr/local/bin/nomad-pkexec` to detect the invoking user's active session (`$PKEXEC_UID` / `/run/user/<uid>/wayland-*`):
-  - If a Wayland compositor is active (Omarchy / Hyprland), it exports the user's `XDG_RUNTIME_DIR` and `WAYLAND_DISPLAY`, running root directly on Wayland (`QT_QPA_PLATFORM=wayland`).
-  - If X11 is active (Ubuntu / Xorg), it falls back to standard `DISPLAY` + `.Xauthority` and `QT_QPA_PLATFORM=xcb`.
-  This allows "Restart as Administrator" to work seamlessly across both Ubuntu and Omarchy.
-
----
-
-## Modified Files
-- `CHANGELOG.md`
-- `install.sh`
-- `main.py`
-- `nomad/ui/navigation.py`
-- `nomad/ui/session_manager.py`
-- `nomad/dhcp.py` (Linux porting adjustments)
-- `nomad/neighbors.py` (Linux porting adjustments)
-- `nomad/snapshot.py` (Linux porting adjustments)
-- `nomad/system.py` (Linux porting adjustments)
+### 2. Preserved Native Linux Wayland & X11 Compatibility
+- Automatic Wayland session detection favoring XWayland (`xcb;wayland`) for sub-surface rendering stability.
+- Desktop integration wrapper (`nomad-pkexec`) for PolicyKit elevation supporting both Omarchy (Hyprland / Wayland) and Ubuntu (X11 / GNOME).
+- Monospace font detection fallback for Linux terminals.

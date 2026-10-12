@@ -2,16 +2,16 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN_SOURCE="$SCRIPT_DIR/dist/NOMAD-1.24.2-linux-x86_64"
+BIN_SOURCE="$SCRIPT_DIR/dist/NOMAD-1.27.0-linux-x86_64"
 
 if [ ! -f "$BIN_SOURCE" ]; then
     # Check current directory
-    if [ -f "$SCRIPT_DIR/NOMAD-1.24.2-linux-x86_64" ]; then
-        BIN_SOURCE="$SCRIPT_DIR/NOMAD-1.24.2-linux-x86_64"
+    if [ -f "$SCRIPT_DIR/NOMAD-1.27.0-linux-x86_64" ]; then
+        BIN_SOURCE="$SCRIPT_DIR/NOMAD-1.27.0-linux-x86_64"
     else
         echo "Building standalone binary with PyInstaller..."
-        python3 -m PyInstaller --noconfirm --clean --onefile --name NOMAD-1.24.2-linux-x86_64 --add-data "nomad/data:nomad/data" main.py
-        BIN_SOURCE="$SCRIPT_DIR/dist/NOMAD-1.24.2-linux-x86_64"
+        ./build.sh
+        BIN_SOURCE="$SCRIPT_DIR/dist/NOMAD-1.27.0-linux-x86_64"
     fi
 fi
 
