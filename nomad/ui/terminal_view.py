@@ -108,10 +108,9 @@ class TerminalView(QWidget):
         self.fonts = {}
         for bold in (False, True):
             for italic in (False, True):
-                font = QFont("Consolas")
-                font.setStyleHint(QFont.Monospace)
+                from .theme import monospace_font
+                font = monospace_font(bold=bold)
                 font.setPointSizeF(max(5.0, size))
-                font.setBold(bold)
                 font.setItalic(italic)
                 self.fonts[(bold, italic)] = font
         metrics = QFontMetricsF(self.fonts[(False, False)])
