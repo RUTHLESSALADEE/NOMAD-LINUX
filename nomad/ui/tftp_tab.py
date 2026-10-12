@@ -1,12 +1,14 @@
 """TFTP page: serve a folder to switches, phones and access points (firmware, configs), and fetch or send files."""
+import html
 import logging
 import os
 import time
 
 from PyQt5.QtCore import QObject, Qt, pyqtSignal
 from PyQt5.QtGui import QColor
-from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, \
-    QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QSpinBox, QSplitter, QTableWidget, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, \
+    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QSpinBox, QSplitter, \
+    QTableWidget, QTextBrowser, QVBoxLayout, QWidget
 
 from ..system import allow_inbound_port
 from ..tftp import CLIENT_BLOCK_SIZE, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE, TFTP_PORT, TftpError, TftpServer, download, \
@@ -24,6 +26,48 @@ MAX_TRANSFER_ROWS = 500
 
 def default_folder():
     return os.path.join(os.path.expanduser("~"), "Documents", "NOMAD TFTP")
+
+
+def cisco_tips_html(server, filename):
+    """The Cisco TFTP Tips text, with this server's address and a file from its folder in the example commands."""
+    url = html.escape(f"tftp://{server}/{filename}")
+    name = html.escape(filename)
+    return f"""
+<h3>Faster TFTP: raise the block size</h3>
+<p>TFTP sends one block and waits for the switch to answer before sending the next, so the block size sets the
+speed. Cisco IOS asks for 512-byte blocks unless told otherwise. NOMAD's server uses whatever size the switch asks
+for, so raising it on the switch makes copies many times faster:</p>
+<pre>configure terminal
+ ip tftp blocksize 8192
+end
+copy {url} flash:</pre>
+<p>8192 is the largest size IOS accepts. The command is in IOS 12.4 and later and IOS-XE; it can stay in the
+configuration (<code>no ip tftp blocksize</code> puts it back). Watch the Speed column above to see the
+difference.</p>
+<p>If the switch has more than one route to this computer, <code>ip tftp source-interface Vlan1</code> (or the
+interface facing this computer) makes it use the right address.</p>
+
+<h3>Faster still: copy with SCP</h3>
+<p>SCP runs over SSH and TCP, which keeps many packets in flight instead of one, so big images usually copy faster
+than over TFTP, and the copy is encrypted. Turn on the switch's SCP server:</p>
+<pre>configure terminal
+ aaa new-model
+ aaa authentication login default local
+ aaa authorization exec default local
+ ip scp server enable
+end</pre>
+<p>SCP needs SSH working on the switch and a user who lands at privilege 15, for example
+<code>username admin privilege 15 secret &lt;password&gt;</code>. Check that <code>aaa new-model</code> won't change how
+existing logins work before adding it to a switch that already uses AAA or RADIUS.</p>
+<p>Then open NOMAD's <b>SCP</b> page, connect to the switch, and upload the image to <code>flash:</code>. Newer
+IOS-XE releases also have <code>ip ssh bulk-mode</code>, which speeds up large SCP copies further.</p>
+<p>When you're done, <code>no ip scp server enable</code> turns it off again.</p>
+
+<h3>After copying</h3>
+<p>Check the image arrived intact before booting it, and compare the result with the MD5 on Cisco's download
+page:</p>
+<pre>verify /md5 flash:{name}</pre>
+"""
 
 
 class _ServerEvents(QObject):
@@ -59,6 +103,23 @@ class ClientThread(StoppableThread):
             return
         elapsed = max(time.monotonic() - started, 0.001)
         self.finished_transfer.emit(f"{what} in {elapsed:.1f} s ({format_size(size / elapsed)}/s).", "success")
+
+
+class CiscoTipsDialog(QDialog):
+    """TFTP page > Cisco TFTP Tips: how to speed up copies with a bigger block size, or SCP instead."""
+
+    def __init__(self, parent, server, filename):
+        super().__init__(parent)
+        self.setWindowTitle("Cisco TFTP Tips")
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        layout = QVBoxLayout(self)
+        self.text = QTextBrowser()
+        self.text.setHtml(cisco_tips_html(server, filename))
+        layout.addWidget(self.text, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.resize(640, 600)
 
 
 class TftpTab(QWidget):
@@ -126,11 +187,14 @@ class TftpTab(QWidget):
         buttons = QHBoxLayout()
         self.server_start = accent_button("Start Server")
         self.server_stop = QPushButton("Stop Server")
+        self.tips_button = QPushButton("Cisco TFTP Tips")
+        self.tips_button.setToolTip("How to make Cisco switches copy faster: a bigger TFTP block size, or SCP instead.")
         self.firewall_button = QPushButton("Open Firewall Port")
         self.firewall_button.setToolTip("Allow TFTP requests (UDP port 69) in through Windows Firewall.")
         self.clear_button = QPushButton("Clear List")
         buttons.addWidget(self.server_start)
         buttons.addWidget(self.server_stop)
+        buttons.addWidget(self.tips_button)
         buttons.addStretch()
         buttons.addWidget(self.clear_button)
         buttons.addWidget(self.firewall_button)
@@ -152,6 +216,7 @@ class TftpTab(QWidget):
         self.folder_open.clicked.connect(self.open_folder)
         self.server_start.clicked.connect(self.start_server)
         self.server_stop.clicked.connect(self.stop_server)
+        self.tips_button.clicked.connect(self.show_cisco_tips)
         self.firewall_button.clicked.connect(self.open_firewall)
         self.clear_button.clicked.connect(self.clear_transfers)
         self.upload_check.toggled.connect(self.update_server_options)
@@ -222,6 +287,27 @@ class TftpTab(QWidget):
         self.window.clear_busy("tftp")
         set_hint(self.server_status, "Server stopped.", "info")
         self.update_buttons()
+
+    def show_cisco_tips(self):
+        CiscoTipsDialog(self, self.tips_server_address(), self.tips_file_name()).exec_()
+
+    def tips_server_address(self):
+        """The address switches would reach this server on: the one it listens on, else this computer's first."""
+        address = self.address_combo.currentData()
+        if address and address != "0.0.0.0":
+            return address
+        for adapter in self.window.snapshot.real_adapters():
+            for interface in adapter.ipv4:
+                return str(interface.ip)
+        return "<this computer>"
+
+    def tips_file_name(self):
+        """A firmware image from the served folder for the example commands, else a placeholder."""
+        try:
+            files = sorted(entry.name for entry in os.scandir(self.folder_input.text().strip()) if entry.is_file())
+        except OSError:
+            files = []
+        return next((name for name in files if name.lower().endswith(".bin")), "image.bin")
 
     def update_server_options(self):
         if self.server is not None:
@@ -362,7 +448,7 @@ class TftpTab(QWidget):
             return
         if direction == "download" and os.path.exists(local):
             reply = QMessageBox.question(self, "Replace File", f"{local} already exists. Replace it?",
-                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                                         QMessageBox.Yes | QMessageBox.No)
             if reply != QMessageBox.Yes:
                 return
         self.client_progress.setRange(0, 0)

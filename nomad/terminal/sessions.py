@@ -1,4 +1,4 @@
-"""Saved terminal sessions (SSH, Telnet, serial, raw TCP), organised in folders, plus importing PuTTY's sessions."""
+"""Saved terminal sessions (SSH, Telnet, serial, raw TCP), organized in folders, plus importing PuTTY's sessions."""
 import dataclasses
 import ipaddress
 import json
@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import unquote
 
-from ..system import app_data_dir
+from ..system import app_data_dir, replace_file
 from .vault import Vault
 
 log = logging.getLogger(__name__)
@@ -400,7 +400,7 @@ class SessionStore:
         temporary = self.path + ".tmp"
         with open(temporary, "w", encoding="utf-8") as file:
             json.dump(data, file, indent=2)
-        os.replace(temporary, self.path)  # Never leave a half-written file behind
+        replace_file(temporary, self.path)  # Never leave a half-written file behind
         for listener in list(self.listeners):
             listener()
 

@@ -15,10 +15,10 @@ from ..system import APP_FULL_NAME, APP_NAME, is_admin, relaunch_as_admin
 from ..terminal.sessions import SessionFolderStore, SessionStore, TERMINAL_PROTOCOLS
 from .adapter_tab import AdapterTab
 from .capture_tab import CaptureTab
-from .common import run_in_background
+from .common import add_action, run_in_background
 from .connections_tab import ConnectionsTab
 from .dhcp_tab import DhcpTab
-from .dialogs import AboutDialog, LogDialog
+from .dialogs import AboutDialog, LogDialog, WhatsNewDialog
 from .dns_servers_tab import DnsServersTab
 from .iperf_tab import IperfTab
 from .integration import Integration
@@ -46,6 +46,7 @@ from .subnet_tab import SubnetTab
 from .sweep_tab import SweepTab
 from .switch_tab import SwitchTab
 from .mac_finder_tab import MacFinderTab
+from .mirror_tab import MirrorTab
 from .syslog_tab import SyslogTab
 from .tftp_tab import TftpTab
 from .theme import COLORS, DEFAULT_TEXT_SCALE, TEXT_SCALES, set_text_scale
@@ -159,6 +160,7 @@ class MainWindow(QMainWindow):
         self.sweep_tab = SweepTab(self)
         self.netmap_tab = NetworkMapTab(self)
         self.switch_tab = SwitchTab(self)
+        self.session_store = SessionStore()  # Shared by Terminal, SCP and RDP (and MAC Finder's SSH logins)
         self.mac_finder_tab = MacFinderTab(self)  # Searches the Network Map's crawls
         self.dhcp_tab = DhcpTab(self)
         self.snmp_tab = SnmpTab(self)
@@ -166,13 +168,13 @@ class MainWindow(QMainWindow):
         self.dns_servers_tab = DnsServersTab(self)
         self.web_check_tab = WebCheckTab(self)
         self.capture_tab = CaptureTab(self)
+        self.mirror_tab = MirrorTab(self)  # The Network Map's switches, saved sessions' SSH logins, Packet Capture
         self.syslog_tab = SyslogTab(self)
         self.tftp_tab = TftpTab(self)
         self.subnet_tab = SubnetTab(self)
         self.snmp_config_tab = SnmpConfigTab(self)
         self.inventory_tab = InventoryTab(self)  # The Network Map's devices and the saved sessions
         self.wake_tab = WakeTab(self)
-        self.session_store = SessionStore()  # Shared by Terminal, SCP and RDP
         terminal_store = SessionFolderStore(self.session_store, TERMINAL_PROTOCOLS)
         self.terminal_tab = TerminalTab(self, terminal_store)
         self.scp_tab = ScpTab(self, terminal_store)
@@ -199,7 +201,8 @@ class MainWindow(QMainWindow):
             ("Network Management", [(self.netmap_tab, "Network Map"), (self.ipam_tab, "IP Addresses"),
                 (self.vlan_tab, "VLANs"), (self.placement_tab, "Subnet Placement"),
                 (self.snmp_config_tab, "SNMP Config"), (self.inventory_tab, "Ansible Inventory")]),
-            ("Capture & Logs", [(self.capture_tab, "Packet Capture"), (self.syslog_tab, "Syslog")]),
+            ("Capture & Logs", [(self.capture_tab, "Packet Capture"), (self.mirror_tab, "Port Mirroring"),
+                                (self.syslog_tab, "Syslog")]),
             ("Utilities", [(self.subnet_tab, "Subnet Calculator")]),
         ]
         self.all_tabs = []
@@ -279,10 +282,10 @@ class MainWindow(QMainWindow):
             layout_group.addAction(action)
         layout_menu.aboutToShow.connect(lambda: [action.setChecked(action.data() == self.terminal_tab.tabs.layout_key)
                                                  for action in layout_group.actions()])
-        self.buttons_action = view_menu.addAction("Terminal Command &Buttons", self.toggle_command_buttons)
+        self.buttons_action = add_action(view_menu, "Terminal Command &Buttons", self.toggle_command_buttons)
         self.buttons_action.setCheckable(True)
-        self.highlight_action = view_menu.addAction(
-            "&Highlight Terminal Keywords", lambda checked: self.terminal_tab.highlights.set_enabled(checked))
+        self.highlight_action = add_action(
+            view_menu, "&Highlight Terminal Keywords", lambda checked: self.terminal_tab.highlights.set_enabled(checked))
         self.highlight_action.setCheckable(True)
         view_menu.addAction("Terminal &Keyword Highlighting...",
                             lambda: HighlightDialog(self, self.terminal_tab.highlights).exec_())
@@ -343,6 +346,7 @@ class MainWindow(QMainWindow):
 
         help_menu = self.menuBar().addMenu("&Help")
         help_menu.addAction("&Keyboard Shortcuts", self.show_shortcuts)
+        help_menu.addAction("What's &New...", self.show_whats_new)
         help_menu.addAction("&About", self.show_about)
 
     def show_terminal(self, then):
@@ -350,11 +354,20 @@ class MainWindow(QMainWindow):
         self.navigator.setCurrentWidget(self.terminal_tab)
         then()
 
-    def show_snmp_config(self, destination="", credential=None):
-        """The SNMP Config page, sending traps and syslog to destination, with credential (from the map's Watch
-        tab)."""
+    def show_snmp_config(self, destination="", credential=None, from_map=False):
+        """The SNMP Config page, sending traps and syslog to destination, with credential or (from_map) the Network
+        Map's credentials."""
         self.navigator.setCurrentWidget(self.snmp_config_tab)
-        self.snmp_config_tab.prefill(destination, credential)
+        self.snmp_config_tab.prefill(destination, credential, from_map)
+
+    def show_mirror(self, source=None, ports=(), vlan=0, dest=None, dest_port="", host=""):
+        """The Port Mirroring page, filled in from the Network Map: mirror ports (or a VLAN, or a host's port) of
+        source, or to dest's dest_port."""
+        self.navigator.setCurrentWidget(self.mirror_tab)
+        if host:
+            self.mirror_tab.mirror_host(host)
+        else:
+            self.mirror_tab.prefill(source, ports, vlan, dest, dest_port)
 
     # ----------------------------------------------------------------- Settings
 
@@ -562,33 +575,10 @@ class MainWindow(QMainWindow):
             self.ipam_tab.connect_team()
 
     def confirm_leave_tribe(self, parent):
-        """Ask, then stop using the tribe on this computer (Tools > Tribe Management is the one place to leave).
-        Returns whether it left."""
-        self.ipam_tab.open_store()  # Open both copies, so changes waiting in them are counted and then emptied
-        self.netmap_tab.tribe.ensure()
-        warning = ""
-        for unsent, what in ((self.ipam_tab.unsent_tribe_changes(), "made offline to tribe networks and VLANs"),
-                             (self.netmap_tab.unsent_tribe_changes(), "to tribe maps")):
-            if unsent:
-                warning += (f"\n\n{unsent} change{'s' if unsent != 1 else ''} {what} haven't reached the server "
-                            "and will be lost.")
-        if QMessageBox.question(parent, "Disconnect from the Tribe",
-                                "Stop using the tribe on this computer? The saved tribe key and the copies of the "
-                                "tribe's networks and maps are removed (a tribe map open is kept as a file); your "
-                                "own networks and maps are kept." + warning) != QMessageBox.Yes:
-            return False
-        self.leave_tribe()
-        return True
-
-    def leave_tribe(self):
-        """Stop using the tribe on this computer: forget the key and the copies of its maps and IPAM data."""
-        from ..ipam.client import forget_key
-        forget_key()
-        self.ipam_tab.forget_team_copy()
-        self.netmap_tab.tribe_key_changed(forget=True)
-        if self.ipam_tab.local_store is not None:
-            self.ipam_tab.connect_team()
-            self.ipam_tab.fill_networks()
+        """Ask, then stop using the tribe on this computer, showing the steps (Tools > Tribe Management is the one
+        place to leave). Returns whether it left."""
+        from .tribe_leave_dialog import disconnect_from_tribe
+        return disconnect_from_tribe(parent, self)
 
     def show_map_watcher(self):
         from .watch_service_dialog import MapWatcherDialog  # Loads pywin32 only when it's needed
@@ -717,3 +707,6 @@ class MainWindow(QMainWindow):
 
     def show_about(self):
         AboutDialog(self).exec_()
+
+    def show_whats_new(self):
+        WhatsNewDialog(self).exec_()

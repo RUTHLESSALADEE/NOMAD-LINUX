@@ -270,7 +270,7 @@ class SweepTab(QWidget):
         if len(hosts) > LARGE_SWEEP_HOSTS:
             reply = QMessageBox.question(self, "Large Sweep",
                                          f"{network} has {len(hosts):,} addresses, which will take a while.\n\n"
-                                         "Sweep it anyway?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                                         "Sweep it anyway?", QMessageBox.Yes | QMessageBox.No)
             if reply != QMessageBox.Yes:
                 return
 
@@ -473,10 +473,9 @@ class SweepTab(QWidget):
 
         menu = QMenu(self)
         actions = self.host_actions.add_to(menu, host)
-        menu.addSeparator()
-        actions[menu.addAction("Copy Address")] = lambda: QApplication.clipboard().setText(host)
-        mac = self.table.item(item.row(), COL_MAC).text()
+        mac = self.table.item(item.row(), COL_MAC).text()  # Copy IP Address is among the host's actions
         if mac:
+            menu.addSeparator()
             actions[menu.addAction("Copy MAC Address")] = lambda: QApplication.clipboard().setText(mac)
             name = self.table.item(item.row(), COL_NAME).text().replace(" (this computer)", "")
             actions[menu.addAction("Wake-on-LAN...")] = lambda: self.window.wake_device(mac, name)

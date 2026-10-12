@@ -39,7 +39,7 @@ from nomad.ui.subnet_tab import SubnetTab
 from nomad.ui.switch_tab import SwitchTab
 from nomad.ui.mac_finder_tab import MacFinderTab
 from nomad.ui.inventory_tab import InventoryTab
-from nomad.ui.tftp_tab import TftpTab
+from nomad.ui.tftp_tab import TftpTab, cisco_tips_html
 from nomad.ui.traceroute_tab import TracerouteTab
 from nomad.ui.wake_tab import WakeTab
 from nomad.ui.web_check_tab import WebCheckTab
@@ -186,6 +186,23 @@ def test_tftp_find_stays_in_active_section(window, section):
     source = page.port_input if section == "server" else page.remote_input
     target = page.folder_input if section == "server" else page.client_host
     press_find(window, page, source, target)
+
+
+def test_cisco_tips_fill_in_this_server_and_a_served_image(window, tmp_path):
+    page = TftpTab(window)
+    (tmp_path / "notes.txt").write_text("x")
+    (tmp_path / "c9300-universalk9.bin").write_bytes(b"x")
+    page.folder_input.setText(str(tmp_path))
+    page.address_combo.addItem("10.1.1.5", "10.1.1.5")
+    page.address_combo.setCurrentIndex(page.address_combo.count() - 1)
+    assert page.tips_file_name() == "c9300-universalk9.bin"
+    assert page.tips_server_address() == "10.1.1.5"
+    text = cisco_tips_html(page.tips_server_address(), page.tips_file_name())
+    assert "ip tftp blocksize 8192" in text and "ip scp server enable" in text
+    assert "copy tftp://10.1.1.5/c9300-universalk9.bin flash:" in text
+    page.folder_input.setText(str(tmp_path / "missing"))
+    assert page.tips_file_name() == "image.bin"
+    assert "tftp://&lt;this computer&gt;/" in cisco_tips_html("<this computer>", "image.bin")
 
 
 def test_reset_output_search_wraps_and_reports_missing_text(window):
