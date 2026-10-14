@@ -184,7 +184,8 @@ def impact(network_map, device=None, links=()):
         elif link.a in lost or link.b in lost:
             overlay.links[id(link)] = Mark("error", "Cut off from the rest")
     for key in lost:
-        overlay.devices[key] = Mark("error", f"Cut off{f' ({count_text(hosts[key], 'host')})' if key in hosts else ''}")
+        host_suffix = f" ({count_text(hosts[key], 'host')})" if key in hosts else ""
+        overlay.devices[key] = Mark("error", f"Cut off{host_suffix}")
     if known_by and known_by not in lost:
         overlay.devices[known_by] = Mark("success", "Still connected: where the rest of the network is measured from")
     lost_hosts = sum(hosts.get(key, 0) for key in lost) + (hosts.get(device, 0) if device is not None else 0)

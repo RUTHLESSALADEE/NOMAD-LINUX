@@ -1,8 +1,29 @@
 # NOMAD Linux Port - Changelog & Patch Notes
 
-Date: 2026-10-12
-Repository: NOMAD (Native Linux Port v1.27.0)
-Target Location: SMB Share (`/mnt/nas-home/smb/NOMAD-LINUX/1.27.0`)
+Date: 2026-10-14
+Repository: NOMAD (Native Linux Port v1.27.1)
+Target Location: SMB Share (`/mnt/nas-home/smb/NOMAD-LINUX/1.27.1`)
+
+---
+
+## What's New in NOMAD 1.27.1 (Linux Port)
+
+### 1. Guard Against Missing pywintypes / win32service on Linux (`nomad/ipam/service.py`, `nomad/netmap/watch_service.py`)
+- In `nomad/ipam/service.py`, guarded `status()`, `register()`, `install()`, `start()`, `stop()`, and `remove()` with `sys.platform != "win32"` checks.
+- `status()` cleanly returns `NOT_INSTALLED` on non-Windows systems so opening Tools > Tribe Management does not crash with `ModuleNotFoundError: No module named 'pywintypes'`.
+- In `nomad/netmap/watch_service.py`, guarded service management functions and return `NOT_INSTALLED` for `status()` on non-Windows platforms.
+
+### 2. Paramiko Backwards Compatibility for Ubuntu 22.04 LTS (`nomad/terminal/legacy_ssh.py`)
+- Used `try/except` when importing `AuthOnlyHandler` from `paramiko.auth_handler`, falling back to `AuthHandler` for older Paramiko versions (<3.2) packaged in Ubuntu 22.04 LTS repositories.
+- Restores full SSH terminal functionality on Ubuntu 22.04 LTS and other systems with older Paramiko installations.
+
+### 3. Dynamic Architecture Detection & Dell GB10 ARM64 Support (`build.sh`, `install.sh`, `install_nomad_ubuntu.sh`)
+- Updated `build.sh`, `install.sh`, and `install_nomad_ubuntu.sh` to dynamically detect architecture (`ARCH=$(uname -m)`).
+- Generates `NOMAD-1.27.1-linux-${ARCH}` binaries, enabling native builds and deployments on ARM64 platforms (e.g. Dell GB10 / Linux ARM64) alongside x86_64.
+
+### 4. QtSvg Packaging & Dependencies (`build.sh`, `install_nomad_ubuntu.sh`)
+- Added `--hidden-import "PyQt5.QtSvg"` to PyInstaller arguments in `build.sh`.
+- Added `python3-pyqt5.qtsvg` and `libqt5svg5` to `install_nomad_ubuntu.sh` apt package list to guarantee vector icons and SVG UI elements render properly out-of-the-box.
 
 ---
 
@@ -25,3 +46,21 @@ Merged official upstream v1.27.0 release features into the Linux port:
 - Automatic Wayland session detection favoring XWayland (`xcb;wayland`) for sub-surface rendering stability.
 - Desktop integration wrapper (`nomad-pkexec`) for PolicyKit elevation supporting both Omarchy (Hyprland / Wayland) and Ubuntu (X11 / GNOME).
 - Monospace font detection fallback for Linux terminals.
+
+### 3. Wayland & Tiling Window Manager UI Bleed-Through / Ghosting Fixes
+- **Tool Drawer Transparency Fix (`nomad/ui/navigation.py`)**: Enabled `Qt.WA_StyledBackground` and `setAutoFillBackground(True)` with explicit opaque background styling on `self.panel` (`#toolDrawer`). Prevents underlying Network Map search bars and action buttons from ghosting through the drawer.
+- **Stack Page Background Fill & Accent Button Styling (`nomad/ui/navigation.py`, `nomad/ui/theme.py`)**: Replaced inline widget stylesheet with `QPalette.Window` color assignment and `setAutoFillBackground(True)` on page widgets. Prevents inline background styling from cascading into child controls, restoring proper green `#35f28b` background rendering on `accent_button` ("Start", etc.) across all tools.
+- **Environment QPA Override Robustness (`main.py`)**: Enhanced platform check to override system-default `wayland;xcb` to `xcb;wayland` when `DISPLAY` is available, ensuring consistent behavior across terminal and desktop launches.
+
+### 4. Layout Clipping, Item Overlap & Form Stretches Fixes
+- **Drawer Bleed-Through Elimination (`nomad/ui/navigation.py`)**: Reparented the hidden internal sidebar registry widget to a detached container (`self.dummy_registry`), preventing its items (e.g. "SNMP Walk") from rendering unmanaged at `(0, 0)` underneath the drawer search bar.
+- **Rail Icon Geometry Fix (`nomad/ui/navigation.py`)**: Implemented `sizeHint(QSize(48, 44))` on `FavoriteIconDelegate`, preventing vertical icon compression, squishing, and overlapping on the navigation rail.
+- **Drawer Dynamic Content Offset (`nomad/ui/navigation.py`)**: Adjusted `apply_navigation()` to apply margin offset whenever `(drawer_open or sidebar_visible)`, shifting underlying page content rather than floating over and occluding adapter and form controls.
+- **Top Banner Redundancy Removal (`nomad/ui/navigation.py`)**: Removed superfluous `page_title` header bar, preventing title clashes and toolbar collisions on Network Map and other tabs.
+- **Spinbox & Form Sizing Constraints (`nomad/ui/sweep_tab.py`, `nomad/ui/ports_tab.py`)**: Applied `QFormLayout.FieldsStayAtSizeHint` and width constraints (120px) on numeric spinbox inputs (`Timeout (ms)`, `Parallel pings`), preventing excessive full-window horizontal stretching.
+- **Toolbar Deferred Deletion Cleanup (`nomad/ui/netmap_tab.py`)**: Added explicit `widget.hide()` prior to `widget.deleteLater()` in `lay_out_top_bar()` so replaced toolbar rows disappear immediately.
+
+### 5. Automatic Elevation & Seamless XWayland Rendering
+- **Startup Auto-Elevation (`main.py`)**: Added check in `main()` so NOMAD automatically invokes `relaunch_as_admin()` via PolicyKit on Linux if started unprivileged (`os.geteuid() != 0`). Eliminates the need to ever click "Restart as Administrator". Can be bypassed with `--no-elevate` or `--help`.
+- **xhost Root Display Access (`install.sh`, `nomad-pkexec`)**: Configured wrapper to grant root access to the user's XWayland display (`xhost +si:localuser:root`), ensuring elevated runs execute under `QT_QPA_PLATFORM=xcb` without Wayland fractional scaling expansion or rendering glitches.
+- **Desktop Launcher Defaults (`install.sh`)**: Configured `nomad.desktop` to execute `pkexec /usr/local/bin/nomad-pkexec %F` by default across all Linux environments.

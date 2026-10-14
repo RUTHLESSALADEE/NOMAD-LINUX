@@ -15,6 +15,7 @@ import logging
 import logging.handlers
 import os
 import socket
+import sys
 import threading
 import time
 from pathlib import Path
@@ -387,6 +388,8 @@ def _service_class():
 
 def run_service_dispatcher():
     """Hand this process to Windows' service manager (NOMAD.exe --map-watcher-service, started by Windows)."""
+    if sys.platform != "win32":
+        return
     import servicemanager
     servicemanager.Initialize()
     servicemanager.PrepareToHostSingle(_service_class())
@@ -395,6 +398,8 @@ def run_service_dispatcher():
 
 def install(config):
     """Install (or update) and start the service with this config (needs administrator rights)."""
+    if sys.platform != "win32":
+        return
     from ..ipam import service
     directory = watcher_dir()
     directory.mkdir(parents=True, exist_ok=True)
@@ -407,6 +412,8 @@ def install(config):
 
 
 def uninstall():
+    if sys.platform != "win32":
+        return
     from ..ipam import service
     service.remove(spec())
     for rule in FIREWALL_RULES:
@@ -414,6 +421,9 @@ def uninstall():
 
 
 def status():
+    if sys.platform != "win32":
+        from ..ipam.service import NOT_INSTALLED
+        return NOT_INSTALLED
     from ..ipam import service
     return service.status(spec())
 

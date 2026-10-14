@@ -6,13 +6,14 @@ Add changes under Unreleased as you go; `python -m nomad.version bump <part>` da
 
 ## [Unreleased]
 
+## [1.27.1] - 2026-10-14
+
 ### Fixed
 
-- **Navigation Settings (`nomad/ui/navigation.py`)**: Fixed crash `TypeError: 'NoneType' object is not iterable` during `restore_settings` when `navigation/recent` or `navigation/favorites` is stored as `@Invalid()` or `None` in `NOMAD.conf`.
-- **Linux / Wayland Rendering (`main.py`, `nomad/ui/navigation.py`)**:
-  - Automatically fallback/prefer `xcb` (XWayland) when running under Wayland sessions (`QT_QPA_PLATFORM="xcb;wayland"`) if not explicitly overridden, resolving sub-surface buffer ghosting, unmapping glitches, and dropdown label truncation on Wayland compositors (Hyprland, Sway).
-  - Explicitly filled background on `page_title` and page stack to eliminate transparent widget underdraw and ghosted section headers.
-- **Session Manager (`nomad/ui/session_manager.py`)**: Increased sidebar minimum width from 170px to 240px to prevent text truncation ("No mast...assword") in the master password protection button.
+- **Linux Service Guards (`nomad/ipam/service.py`, `nomad/netmap/watch_service.py`)**: Guarded `pywintypes` and `win32service` calls so `status()` returns `NOT_INSTALLED` on non-Windows platforms. Prevents crashing when opening Tools > Tribe Management and Map Watcher Service on Linux.
+- **Paramiko Backwards Compatibility (`nomad/terminal/legacy_ssh.py`)**: Added fallback import of `AuthOnlyHandler` to `AuthHandler` for older Paramiko (<3.2) releases, ensuring full compatibility with Ubuntu 22.04 LTS.
+- **QtSvg Support & Packaging (`build.sh`, `install_nomad_ubuntu.sh`)**: Added `--hidden-import "PyQt5.QtSvg"` to PyInstaller arguments in `build.sh` and included `python3-pyqt5.qtsvg` and `libqt5svg5` in Ubuntu package installation dependencies.
+- **Architecture Detection & ARM64 Support (`build.sh`, `install.sh`, `install_nomad_ubuntu.sh`)**: Added dynamic architecture detection (`ARCH=$(uname -m)`) across build and installer scripts, supporting automated build and deployment workflows on ARM64 platforms (e.g. Dell GB10 / Linux ARM64) alongside x86_64.
 
 ## [1.27.0] - 2026-10-11
 

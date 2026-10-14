@@ -4,6 +4,13 @@ The short version of CHANGELOG.md, shown in NOMAD under Help > What's New. Keep 
 
 ## [Unreleased]
 
+## [1.27.1] - 2026-10-14
+
+- **Fixed:** Linux: Tools > Tribe Management and Map Watcher no longer crash when checking Windows service status.
+- **Fixed:** SSH terminal: restored backwards compatibility with older Paramiko releases (<3.2) on Ubuntu 22.04 LTS.
+- **New:** Linux builds and installers dynamically detect system architecture (x86_64 and ARM64 / Dell GB10).
+- **Fixed:** Bundled and required QtSvg modules to ensure vector icons render reliably on all Linux distributions.
+
 ## [1.27.0] - 2026-10-11
 
 - **New:** Help > What's New lists what each version added and fixed.

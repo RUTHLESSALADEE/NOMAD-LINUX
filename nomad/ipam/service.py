@@ -117,6 +117,8 @@ def run_service_dispatcher():
 
 def status(spec=IPAM):
     """NOT_INSTALLED, STOPPED, STARTING, RUNNING or STOPPING."""
+    if sys.platform != "win32":
+        return NOT_INSTALLED
     import pywintypes
     import win32service
     import win32serviceutil
@@ -179,6 +181,8 @@ def close_firewall(rule=FIREWALL_RULE):
 def register(spec):
     """Create the service (or point it at this copy of NOMAD again), starting with Windows and restarting if it
     fails. Returns the command line."""
+    if sys.platform != "win32":
+        return ""
     import win32service
     if status(spec) in (RUNNING, STARTING):
         stop(spec)  # So the exe can be replaced
@@ -212,6 +216,8 @@ def register(spec):
 
 def install(port=None):
     """Install (or update) and start the service. Returns the server's config."""
+    if sys.platform != "win32":
+        return None
     directory = server_dir()
     directory.mkdir(parents=True, exist_ok=True)
     secure_folder(directory)  # First, so it also repairs a folder whose files can't be read
@@ -227,6 +233,8 @@ def install(port=None):
 
 
 def start(spec=IPAM):
+    if sys.platform != "win32":
+        return
     import win32serviceutil
     win32serviceutil.StartService(spec.name)
     deadline = time.monotonic() + START_WAIT_SECONDS
@@ -241,6 +249,8 @@ def start(spec=IPAM):
 
 
 def stop(spec=IPAM):
+    if sys.platform != "win32":
+        return
     import win32serviceutil
     try:
         win32serviceutil.StopServiceWithDeps(spec.name, waitSecs=START_WAIT_SECONDS)
@@ -249,6 +259,8 @@ def stop(spec=IPAM):
 
 
 def remove(spec):
+    if sys.platform != "win32":
+        return
     import win32serviceutil
     stop(spec)
     win32serviceutil.RemoveService(spec.name)

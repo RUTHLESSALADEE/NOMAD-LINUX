@@ -11,7 +11,10 @@ from hashlib import sha1
 
 import paramiko
 from cryptography.hazmat.primitives import hashes
-from paramiko.auth_handler import AuthOnlyHandler
+try:
+    from paramiko.auth_handler import AuthOnlyHandler
+except ImportError:
+    from paramiko.auth_handler import AuthHandler as AuthOnlyHandler
 from paramiko.common import cMSG_SERVICE_REQUEST, cMSG_USERAUTH_REQUEST
 from paramiko.kex_gex import KexGexSHA256
 from paramiko.kex_group14 import KexGroup14SHA256

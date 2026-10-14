@@ -440,12 +440,25 @@ Run the included install script on Ubuntu, Debian, Arch Linux, or Omarchy:
 
     sudo ./install.sh
 
+On Ubuntu / Debian systems, you can also run the automated 0-to-hero installer:
+
+    ./install_nomad_ubuntu.sh
+
+This automatically installs required system dependencies (including `python3-pyqt5.qtsvg` and `libqt5svg5` for icon rendering), downloads the pre-built standalone binary for your architecture (x86_64 or aarch64/ARM64), and configures PolicyKit elevation and desktop application entries.
+
+### Linux Compatibility & Architecture Support
+
+- **pywintypes / Windows Service Guard**: Windows service management routines (`nomad/ipam/service.py`, `nomad/netmap/watch_service.py`) are guarded against missing `pywintypes` on Linux, returning `NOT_INSTALLED` cleanly so Tools > Tribe Management and Map Watcher operate without crashes.
+- **Ubuntu 22.04 LTS Paramiko Compatibility**: SSH authentication handles older Paramiko (<3.2) releases via graceful fallback to `AuthHandler`.
+- **Dynamic Architecture Detection**: Build (`build.sh`) and installer scripts automatically detect the target architecture (`uname -m`), producing and deploying binaries for both x86_64 and ARM64 (e.g. Dell GB10 Linux ARM64).
+- **QtSvg Packaging**: PyInstaller builds bundle `PyQt5.QtSvg` (`--hidden-import "PyQt5.QtSvg"`) so toolbar and action icons display correctly across all desktop environments.
+
 ### Running from source
 
     pip install -r requirements.txt
     python3 main.py
 
-Tests, and a standalone Linux executable (`dist/NOMAD-<version>-linux-x86_64`):
+Tests, and a standalone Linux executable (`dist/NOMAD-<version>-linux-<arch>`):
 
     pip install -r requirements-dev.txt
     python3 -m pytest
